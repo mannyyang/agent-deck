@@ -797,6 +797,7 @@ func handleConductorTeardown(_ string, args []string) {
 		condDir, _ := session.ConductorDir()
 		if condDir != "" {
 			_ = os.Remove(filepath.Join(condDir, "bridge.py"))
+			_ = os.RemoveAll(filepath.Join(condDir, "bridge"))
 			_ = os.Remove(filepath.Join(condDir, "bridge.log"))
 			_ = os.Remove(filepath.Join(condDir, "CLAUDE.md"))
 			_ = os.Remove(filepath.Join(condDir, "AGENTS.md"))
