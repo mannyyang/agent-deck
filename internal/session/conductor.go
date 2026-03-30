@@ -1187,8 +1187,7 @@ func MigrateConductorHeartbeatScripts() ([]string, error) {
 	return migrated, nil
 }
 
-// InstallBridgeScript copies bridge.py to the conductor base directory.
-// It writes from the embedded const.
+// InstallBridgeScript installs bridge.py and the bridge/ package to the conductor base directory.
 func InstallBridgeScript() error {
 	dir, err := ConductorDir()
 	if err != nil {
@@ -1199,9 +1198,23 @@ func InstallBridgeScript() error {
 		return fmt.Errorf("failed to create conductor dir: %w", err)
 	}
 
+	// Write thin wrapper bridge.py
 	bridgePath := filepath.Join(dir, "bridge.py")
 	if err := os.WriteFile(bridgePath, []byte(conductorBridgePy), 0o755); err != nil {
 		return fmt.Errorf("failed to write bridge.py: %w", err)
+	}
+
+	// Write bridge/ package modules
+	pkgDir := filepath.Join(dir, "bridge")
+	if err := os.MkdirAll(pkgDir, 0o755); err != nil {
+		return fmt.Errorf("failed to create bridge package dir: %w", err)
+	}
+
+	for filename, content := range conductorBridgePackage {
+		modPath := filepath.Join(pkgDir, filename)
+		if err := os.WriteFile(modPath, []byte(content), 0o644); err != nil {
+			return fmt.Errorf("failed to write bridge/%s: %w", filename, err)
+		}
 	}
 
 	return nil
