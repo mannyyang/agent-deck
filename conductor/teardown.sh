@@ -79,8 +79,9 @@ if [[ "${REMOVE_DIR}" =~ ^[Yy] ]]; then
             ok "Removed ${PROFILE_DIR}"
         fi
     done
-    # Remove bridge.py and bridge.log from base conductor dir
+    # Remove bridge.py, bridge/ package, and bridge.log from base conductor dir
     rm -f "${CONDUCTOR_DIR}/bridge.py" "${CONDUCTOR_DIR}/bridge.log"
+    rm -rf "${CONDUCTOR_DIR}/bridge"
     # Remove conductor dir if empty
     rmdir "${CONDUCTOR_DIR}" 2>/dev/null && ok "Removed empty ${CONDUCTOR_DIR}" || true
 else
