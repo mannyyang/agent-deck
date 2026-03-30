@@ -361,27 +361,57 @@ When you first start (or after a restart):
 6. Reply: "Conductor {NAME} ({PROFILE}) online. N sessions tracked (X running, Y waiting)."
 `
 
-// conductorBridgePy is the Python bridge script that connects Telegram, Slack, and/or Discord to conductor sessions.
-// This is embedded so the binary is self-contained.
-// Updated for multi-conductor: discovers conductors from meta.json files on disk.
-// Supports Telegram (polling), Slack (Socket Mode), and Discord (gateway) concurrently.
+
+// conductorBridgePy is the thin wrapper that delegates to the bridge package.
+// Kept as the entry point for launchd/systemd configs that invoke bridge.py directly.
 const conductorBridgePy = `#!/usr/bin/env python3
 """
-Conductor Bridge: Telegram & Slack & Discord <-> Agent-Deck conductor sessions (multi-conductor).
+Conductor Bridge: Telegram & Slack & Discord <-> Agent-Deck conductor sessions.
 
-A thin bridge that:
-  A) Forwards Telegram/Slack/Discord messages -> conductor session (via agent-deck CLI)
-  B) Forwards conductor responses -> Telegram/Slack/Discord
-  C) Runs a periodic heartbeat to trigger conductor status checks
-
-Discovers conductors dynamically from meta.json files in ~/.agent-deck/conductor/*/
-Each conductor has its own name, profile, and heartbeat settings.
-
-Dependencies: pip3 install toml aiogram slack-bolt slack-sdk discord.py
-  - aiogram is only needed if Telegram is configured
-  - slack-bolt/slack-sdk are only needed if Slack is configured
-  - discord.py is only needed if Discord is configured
+Thin wrapper that delegates to the bridge package.
+Kept for backward compatibility with launchd/systemd configs that invoke bridge.py directly.
 """
+
+import asyncio
+from bridge.main import main
+
+if __name__ == "__main__":
+    asyncio.run(main())
+`
+
+// conductorBridgePackage maps filenames to Python source for the bridge/ package.
+// InstallBridgeScript() writes these to ~/.agent-deck/conductor/bridge/*.py.
+var conductorBridgePackage = map[string]string{
+	"__init__.py": conductorBridgePkgInit,
+	"constants.py": conductorBridgePkgConstants,
+	"config.py": conductorBridgePkgConfig,
+	"cli.py": conductorBridgePkgCli,
+	"formatting.py": conductorBridgePkgFormatting,
+	"telegram_bot.py": conductorBridgePkgTelegramBot,
+	"slack_bot.py": conductorBridgePkgSlackBot,
+	"discord_bot.py": conductorBridgePkgDiscordBot,
+	"heartbeat.py": conductorBridgePkgHeartbeat,
+	"mirror.py": conductorBridgePkgMirror,
+	"main.py": conductorBridgePkgMain,
+}
+
+const conductorBridgePkgInit = `"""Conductor Bridge package.
+
+Modules:
+  constants    - Shared constants, regex patterns, markdown conversion
+  config       - Configuration loading and conductor discovery
+  cli          - Agent-Deck CLI helpers (run_cli, send_to_conductor, etc.)
+  formatting   - Message formatting, splitting, and routing utilities
+  telegram_bot - Telegram bot setup (aiogram)
+  slack_bot    - Slack bot setup (slack-bolt, Socket Mode)
+  discord_bot  - Discord bot setup (discord.py)
+  heartbeat    - Periodic heartbeat loop for conductor status checks
+  mirror       - JSONL-based terminal mirror for Slack sync
+  main         - Entry point: discovers conductors, starts platforms, runs event loop
+"""
+`
+
+const conductorBridgePkgConstants = `"""Shared constants, imports, and formatting utilities."""
 
 import asyncio
 import json
@@ -445,6 +475,94 @@ IMAGE_MARKER_RE = re.compile(r"\[IMAGE:(?P<path>[^\]]+)\]")
 # How long to wait for conductor to respond (seconds)
 RESPONSE_TIMEOUT = 300
 
+# Tool name -> emoji icon for Slack progress messages
+TOOL_LABELS = {
+    "Bash": "\U0001f4bb", "Read": "\U0001f4d6", "Write": "\u270d\ufe0f",
+    "Edit": "\u270d\ufe0f", "Grep": "\U0001f50d", "Glob": "\U0001f50d",
+    "Agent": "\U0001f916", "WebSearch": "\U0001f310", "WebFetch": "\U0001f310",
+    "TaskCreate": "\U0001f4cb", "TaskUpdate": "\U0001f4cb",
+    "Skill": "\u2699\ufe0f", "SendMessage": "\U0001f4e8",
+}
+
+# Strip [from:...] [channel:...] or [dm] prefixes from bridge-enriched messages
+_FROM_PREFIX_RE = re.compile(r"^\[from:[^\]]+\]\s*(?:\[(?:channel:[^\]]+|dm)\]\s*)?")
+
+# Tool result messages to suppress in mirror (noise)
+_SKIP_RESULTS = frozenset({
+    "The file has been updated successfully.",
+    "The file has been updated. All occurrences were successfully replaced.",
+    "File created successfully",
+})
+
+# Code block language -> file extension
+LANG_EXTENSIONS = {
+    "python": "py", "typescript": "ts", "javascript": "js",
+    "bash": "sh", "shell": "sh", "json": "json", "sql": "sql",
+    "yaml": "yaml", "toml": "toml", "go": "go", "rust": "rs",
+}
+
+# ---------------------------------------------------------------------------
+# Markdown -> Slack mrkdwn conversion
+# ---------------------------------------------------------------------------
+
+
+def markdown_to_slack(text: str) -> str:
+    """Convert GitHub-flavored markdown to Slack mrkdwn format."""
+    code_blocks = []
+    def _save_code_block(m):
+        code_blocks.append(m.group(0))
+        return f"__CODE_BLOCK_{len(code_blocks) - 1}__"
+    text = re.sub(r"` + "`" + "" + "`" + "" + "`" + `[\s\S]*?` + "`" + "" + "`" + "" + "`" + `", _save_code_block, text)
+
+    inline_codes = []
+    def _save_inline_code(m):
+        inline_codes.append(m.group(0))
+        return f"__INLINE_CODE_{len(inline_codes) - 1}__"
+    text = re.sub(r"` + "`" + `[^` + "`" + `\n]+` + "`" + `", _save_inline_code, text)
+
+    def _convert_table(m):
+        return "` + "`" + "" + "`" + "" + "`" + `\n" + m.group(0).strip() + "\n` + "`" + "" + "`" + "" + "`" + `"
+    text = re.sub(r"(?:^\|.+\|$\n?){2,}", _convert_table, text, flags=re.MULTILINE)
+
+    text = re.sub(r"^-{3,}$", "\u2500" * 20, text, flags=re.MULTILINE)
+    text = re.sub(r"^#{1,2}\s+(.+)$", r"*\1*", text, flags=re.MULTILINE)
+    text = re.sub(r"^#{3,6}\s+(.+)$", r"*\1*", text, flags=re.MULTILINE)
+    text = re.sub(r"\*\*(.+?)\*\*", r"*\1*", text)
+    text = re.sub(r"~~(.+?)~~", r"~\1~", text)
+    text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"<\2|\1>", text)
+    text = re.sub(r"^(\s*)[-*]\s+", "\\1\u2022 ", text, flags=re.MULTILINE)
+
+    # Escape bare angle brackets so Slack doesn't interpret them as links/mentions.
+    # Preserve valid Slack links (<url|label>, <@U123>, <#C123>) by saving them first.
+    slack_links = []
+    def _save_slack_link(m):
+        slack_links.append(m.group(0))
+        return f"__SLACK_LINK_{len(slack_links) - 1}__"
+    text = re.sub(r"<(?:[a-z]+://[^>]+|[@#!][^>]+)>", _save_slack_link, text)
+    text = text.replace("<", "&lt;").replace(">", "&gt;")
+    for i, link in enumerate(slack_links):
+        text = text.replace(f"__SLACK_LINK_{i}__", link)
+
+    for i, code in enumerate(inline_codes):
+        text = text.replace(f"__INLINE_CODE_{i}__", code)
+    for i, block in enumerate(code_blocks):
+        text = text.replace(f"__CODE_BLOCK_{i}__", block)
+
+    return text
+`
+
+const conductorBridgePkgConfig = `"""Configuration loading and conductor discovery."""
+
+import json
+import logging
+import sys
+import time
+from pathlib import Path
+
+import toml
+
+from .constants import AGENT_DECK_DIR, CONFIG_PATH, CONDUCTOR_DIR, LOG_PATH
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -454,11 +572,9 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
         logging.FileHandler(LOG_PATH, encoding="utf-8"),
-        logging.StreamHandler(sys.stdout),
     ],
 )
 log = logging.getLogger("conductor-bridge")
-
 
 # ---------------------------------------------------------------------------
 # Config loading
@@ -593,12 +709,16 @@ def select_heartbeat_conductors(conductors: list[dict]) -> list[dict]:
             str(c.get("name", "")),
         ),
     )
+`
 
+const conductorBridgePkgCli = `"""Agent-Deck CLI helpers."""
 
-# ---------------------------------------------------------------------------
-# Agent-Deck CLI helpers
-# ---------------------------------------------------------------------------
+import json
+import subprocess
+import time
 
+from .config import log, conductor_session_title, discover_conductors, get_conductor_names, get_unique_profiles
+from .constants import AGENT_DECK_DIR, CONDUCTOR_DIR, RESPONSE_TIMEOUT
 
 def run_cli(
     *args: str, profile: str | None = None, timeout: int = 120
@@ -680,6 +800,17 @@ def send_to_conductor(
         )
         return False, ""
     return True, result.stdout.strip()
+
+
+def get_session_data(session: str, profile: str | None = None) -> dict:
+    """Get full session metadata as a dict from agent-deck."""
+    result = run_cli("session", "show", "--json", session, profile=profile, timeout=10)
+    if result.returncode != 0:
+        return {}
+    try:
+        return json.loads(result.stdout)
+    except (json.JSONDecodeError, KeyError):
+        return {}
 
 
 def get_status_summary(profile: str | None = None) -> dict:
@@ -776,12 +907,21 @@ def ensure_conductor_running(name: str, profile: str) -> bool:
         )
 
     return True
+`
 
+const conductorBridgePkgFormatting = `"""Message formatting, splitting, and routing utilities."""
 
-# ---------------------------------------------------------------------------
-# Message routing
-# ---------------------------------------------------------------------------
+import re
+from pathlib import Path
 
+from .config import log
+from .constants import TG_MAX_LENGTH, DISCORD_MAX_LENGTH, IMAGE_MARKER_RE
+
+# Conditional import for discord.File
+try:
+    import discord
+except ImportError:
+    discord = None
 
 def parse_conductor_prefix(text: str, conductor_names: list[str]) -> tuple[str | None, str]:
     """Parse conductor name prefix from user message.
@@ -913,12 +1053,23 @@ async def send_discord_output(channel, text: str, name_tag: str = ""):
             warning = f"[Failed to upload image: {image_path}]"
             prefixed = f"{prefix}{warning}" if prefix else warning
             await channel.send(prefixed)
+`
 
+const conductorBridgePkgTelegramBot = `"""Telegram bot setup."""
 
-# ---------------------------------------------------------------------------
-# Telegram bot setup
-# ---------------------------------------------------------------------------
+import re
 
+try:
+    from aiogram import Bot, Dispatcher, types
+    from aiogram.filters import Command, CommandStart
+    HAS_AIOGRAM = True
+except ImportError:
+    HAS_AIOGRAM = False
+
+from .config import log, discover_conductors, conductor_session_title, get_conductor_names, get_unique_profiles
+from .cli import run_cli, send_to_conductor, get_status_summary_all, get_sessions_list_all, ensure_conductor_running
+from .formatting import parse_conductor_prefix, split_message, md_to_tg_html
+from .constants import RESPONSE_TIMEOUT
 
 def create_telegram_bot(config: dict):
     """Create and configure the Telegram bot.
@@ -1197,12 +1348,26 @@ def create_telegram_bot(config: dict):
             await message.answer(chunk, parse_mode="HTML")
 
     return bot, dp
+`
 
+const conductorBridgePkgSlackBot = `"""Slack bot setup."""
 
-# ---------------------------------------------------------------------------
-# Slack app setup
-# ---------------------------------------------------------------------------
+import asyncio
+import re
+import time
 
+try:
+    from slack_bolt.async_app import AsyncApp
+    from slack_bolt.authorization import AuthorizeResult
+    from slack_sdk.web.async_client import AsyncWebClient
+    HAS_SLACK = True
+except ImportError:
+    HAS_SLACK = False
+
+from .config import log, discover_conductors, conductor_session_title, get_conductor_names, get_unique_profiles
+from .cli import run_cli, send_to_conductor, get_status_summary_all, get_sessions_list_all, ensure_conductor_running
+from .formatting import parse_conductor_prefix
+from .constants import markdown_to_slack, RESPONSE_TIMEOUT
 
 def create_slack_app(config: dict):
     """Create and configure the Slack app with Socket Mode.
@@ -1328,64 +1493,38 @@ def create_slack_app(config: dict):
         conductors = discover_conductors()
         return conductors[0] if conductors else None
 
-    def _markdown_to_slack(text: str) -> str:
-        """Convert GitHub-flavored markdown to Slack mrkdwn format.
-
-        Preserves code blocks and inline code. Converts:
-        - Headers (# H1 ... ###### H6) -> *bold text*
-        - Bold (**text**) -> *text*
-        - Strikethrough (~~text~~) -> ~text~
-        - Links [text](url) -> <url|text>
-        - Bullet lists (- item, * item) -> bullet_char item
-        """
-        # Protect code blocks: extract fenced blocks, replace with placeholders.
-        code_blocks = []
-        def _save_code_block(m):
-            code_blocks.append(m.group(0))
-            return f"__CODE_BLOCK_{len(code_blocks) - 1}__"
-        text = re.sub(r"` + "```" + `[\s\S]*?` + "```" + `", _save_code_block, text)
-
-        # Protect inline code.
-        inline_codes = []
-        def _save_inline_code(m):
-            inline_codes.append(m.group(0))
-            return f"__INLINE_CODE_{len(inline_codes) - 1}__"
-        text = re.sub(r"` + "`" + `[^` + "`" + `\n]+` + "`" + `", _save_inline_code, text)
-
-        # Headers -> bold
-        text = re.sub(r"^#{1,6}\s+(.+)$", r"*\1*", text, flags=re.MULTILINE)
-        # Bold **text** -> *text*  (must come after headers to avoid double-wrapping)
-        text = re.sub(r"\*\*(.+?)\*\*", r"*\1*", text)
-        # Strikethrough ~~text~~ -> ~text~
-        text = re.sub(r"~~(.+?)~~", r"~\1~", text)
-        # Links [text](url) -> <url|text>
-        text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"<\2|\1>", text)
-        # Bullet lists: - item or * item -> bullet char item
-        text = re.sub(r"^(\s*)[-*]\s+", r"\1\u2022 ", text, flags=re.MULTILINE)
-
-        # Restore inline code.
-        for i, code in enumerate(inline_codes):
-            text = text.replace(f"__INLINE_CODE_{i}__", code)
-        # Restore code blocks.
-        for i, block in enumerate(code_blocks):
-            text = text.replace(f"__CODE_BLOCK_{i}__", block)
-
-        return text
-
     async def _safe_say(say, **kwargs):
         """Wrapper around say() that catches network/API errors and converts markdown."""
         if "text" in kwargs:
-            kwargs["text"] = _markdown_to_slack(kwargs["text"])
+            kwargs["text"] = markdown_to_slack(kwargs["text"])
         try:
-            await say(**kwargs)
+            result = await say(**kwargs)
+            return result
         except Exception as e:
             log.error("Slack say() failed: %s", e)
+            return None
+
+    async def _add_reaction(channel: str, timestamp: str, emoji: str):
+        """Add an emoji reaction to a message."""
+        try:
+            await app.client.reactions_add(channel=channel, timestamp=timestamp, name=emoji)
+        except Exception as e:
+            log.debug("Failed to add reaction %s: %s", emoji, e)
+
+    async def _remove_reaction(channel: str, timestamp: str, emoji: str):
+        """Remove an emoji reaction from a message."""
+        try:
+            await app.client.reactions_remove(channel=channel, timestamp=timestamp, name=emoji)
+        except Exception as e:
+            log.debug("Failed to remove reaction %s: %s", emoji, e)
 
     async def _handle_slack_text(
         text: str, say, thread_ts: str = None,
         user_id: str = None, event_channel: str = None,
     ):
         """Shared handler for Slack messages and mentions."""
+        msg_channel = event_channel or channel_id
+
         conductor_names = get_conductor_names()
         conductors = discover_conductors()
 
@@ -1440,30 +1579,27 @@ def create_slack_app(config: dict):
             return
 
         log.info("Slack message -> [%s]: %s", target["name"], cleaned_msg[:100])
-        ok, response = send_to_conductor(
-            session_title,
-            cleaned_msg,
-            profile=profile,
-            wait_for_reply=True,
-            response_timeout=RESPONSE_TIMEOUT,
+
+        # React to acknowledge receipt
+        msg_ts = thread_ts
+        if msg_ts:
+            await _add_reaction(msg_channel, msg_ts, "eyes")
+
+        # Send to conductor (no-wait). The JSONL mirror handles posting the response.
+        loop = asyncio.get_running_loop()
+        ok, _ = await loop.run_in_executor(
+            None,
+            lambda: send_to_conductor(
+                session_title,
+                cleaned_msg,
+                profile=profile,
+                wait_for_reply=False,
+            ),
         )
-        if not ok:
-            await _safe_say(
-                say,
-                text=f"[Failed to send message to conductor {target['name']}.]",
-                thread_ts=thread_ts,
-            )
-            return
 
-        name_tag = f"[{target['name']}] " if len(conductors) > 1 else ""
-        await _safe_say(say, text=f"{name_tag}...", thread_ts=thread_ts)
-
-        # Response is returned directly by session send --wait.
-        log.info("Conductor [%s] response: %s", target["name"], response[:100])
-
-        for chunk in split_message(response, max_len=SLACK_MAX_LENGTH):
-            prefixed = f"{name_tag}{chunk}" if name_tag else chunk
-            await _safe_say(say, text=prefixed, thread_ts=thread_ts)
+        if not ok and msg_ts:
+            await _remove_reaction(msg_channel, msg_ts, "eyes")
+            await _add_reaction(msg_channel, msg_ts, "warning")
 
     @app.event("message")
     async def handle_slack_message(event, say):
@@ -1642,12 +1778,25 @@ def create_slack_app(config: dict):
 
     log.info("Slack app initialized (Socket Mode, channel=%s)", channel_id)
     return app, channel_id
+`
 
+const conductorBridgePkgDiscordBot = `"""Discord bot setup."""
 
-# ---------------------------------------------------------------------------
-# Discord bot setup
-# ---------------------------------------------------------------------------
+import asyncio
+import re
+import time
 
+try:
+    import discord
+    from discord import app_commands
+    HAS_DISCORD = True
+except ImportError:
+    HAS_DISCORD = False
+
+from .config import log, discover_conductors, conductor_session_title, get_conductor_names, get_unique_profiles
+from .cli import run_cli, send_to_conductor, get_session_status, get_session_output, get_status_summary, get_status_summary_all, get_sessions_list, get_sessions_list_all, ensure_conductor_running
+from .formatting import parse_conductor_prefix, split_message, send_discord_output
+from .constants import RESPONSE_TIMEOUT, DISCORD_MAX_LENGTH
 
 def create_discord_bot(config: dict):
     """Create and configure the Discord bot.
@@ -2012,12 +2161,19 @@ def create_discord_bot(config: dict):
         guild_id, channel_id,
     )
     return bot, channel_id
+`
 
+const conductorBridgePkgHeartbeat = `"""Heartbeat loop for periodic conductor checks."""
 
-# ---------------------------------------------------------------------------
-# Heartbeat loop
-# ---------------------------------------------------------------------------
+import asyncio
+import os
+import time
+from pathlib import Path
 
+from .config import log, discover_conductors, conductor_session_title, select_heartbeat_conductors, get_unique_profiles
+from .cli import run_cli, send_to_conductor, get_session_status, get_sessions_list, get_status_summary_all, get_sessions_list_all, ensure_conductor_running
+from .formatting import split_message, md_to_tg_html, send_discord_output
+from .constants import TG_MAX_LENGTH, SLACK_MAX_LENGTH, DISCORD_MAX_LENGTH, RESPONSE_TIMEOUT
 
 def _os_heartbeat_daemon_installed() -> bool:
     """Check if an OS-level heartbeat daemon (launchd or systemd) is installed."""
@@ -2210,11 +2366,302 @@ async def heartbeat_loop(
 
             except Exception as e:
                 log.error("Heartbeat [%s] error: %s", conductor.get("name", "?"), e)
+`
+
+const conductorBridgePkgMirror = `"""JSONL-based terminal mirror for continuous Slack sync."""
+
+import asyncio
+import json
+import re
+import time
+from pathlib import Path
+
+from .config import log, conductor_session_title
+from .cli import get_session_data
+from .formatting import split_message
+from .constants import TOOL_LABELS, _FROM_PREFIX_RE, _SKIP_RESULTS, SLACK_MAX_LENGTH, markdown_to_slack
+
+# XML tags injected by Claude Code internals — strip entirely from mirror output
+_INTERNAL_XML_RE = re.compile(
+    r"</?(?:system-reminder|task-notification|local-command-caveat|command-name"
+    r"|command-message|command-args|local-command-stdout|fast_mode_info"
+    r"|antml_\w+)(?:\s[^>]*)?>",
+)
+
+def _contains_internal_xml(text: str) -> bool:
+    """Return True if text is predominantly internal XML (skip it)."""
+    return bool(_INTERNAL_XML_RE.search(text))
+
+def _strip_internal_xml(text: str) -> str:
+    """Remove internal XML tags and their content blocks from text."""
+    # Remove full blocks: <tag>...</tag>
+    text = re.sub(
+        r"<(?:system-reminder|task-notification|local-command-caveat|command-name"
+        r"|command-message|command-args|local-command-stdout|fast_mode_info)"
+        r"(?:\s[^>]*)?>.*?</(?:system-reminder|task-notification|local-command-caveat"
+        r"|command-name|command-message|command-args|local-command-stdout|fast_mode_info)>",
+        "", text, flags=re.DOTALL,
+    )
+    # Remove any remaining standalone tags
+    text = _INTERNAL_XML_RE.sub("", text)
+    return text.strip()
+
+def resolve_jsonl_path(session_title: str, profile: str | None = None) -> str:
+    """Resolve the Claude JSONL file path for a session."""
+    data = get_session_data(session_title, profile=profile)
+    claude_id = data.get("claude_session_id", "")
+    if not claude_id:
+        return ""
+    # Search ~/.claude/projects/ for the JSONL file (called once at startup)
+    claude_dir = Path.home() / ".claude" / "projects"
+    if not claude_dir.exists():
+        return ""
+    for d in claude_dir.iterdir():
+        if d.is_dir():
+            jsonl = d / f"{claude_id}.jsonl"
+            if jsonl.exists():
+                return str(jsonl)
+    return ""
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+def format_jsonl_event(entry: dict) -> str | None:
+    """Format a single JSONL entry for Slack. Returns None to skip."""
+    entry_type = entry.get("type", "")
+
+    # Skip progress events (hooks, internal)
+    if entry_type == "progress":
+        return None
+
+    msg = entry.get("message", {})
+    if not msg:
+        return None
+
+    role = msg.get("role", "")
+    content = msg.get("content", "")
+
+    if role == "user":
+        if isinstance(content, str):
+            if not content.strip():
+                return None
+            if _contains_internal_xml(content):
+                return None
+            text = _FROM_PREFIX_RE.sub("", content).strip()
+            if not text:
+                return None
+            return f"> {text[:500]}"
+        elif isinstance(content, list):
+            parts = []
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("type") == "text":
+                    text = item.get("text", "").strip()
+                    if text and not _contains_internal_xml(text):
+                        text = _FROM_PREFIX_RE.sub("", text).strip()
+                        if text:
+                            parts.append(f"> {text[:500]}")
+                elif item.get("type") == "tool_result":
+                    result_content = item.get("content", "")
+                    if isinstance(result_content, str):
+                        stripped = result_content.strip()
+                        # Skip noise like "file updated successfully" or internal XML
+                        if not stripped or any(stripped.startswith(s) for s in _SKIP_RESULTS):
+                            continue
+                        if _contains_internal_xml(stripped):
+                            stripped = _strip_internal_xml(stripped)
+                            if not stripped:
+                                continue
+                        preview = stripped[:2000]
+                        if len(stripped) > 2000:
+                            preview += "\n... (truncated)"
+                        parts.append(f"` + "`" + "" + "`" + "" + "`" + `\n{preview}\n` + "`" + "" + "`" + "" + "`" + `")
+            return "\n".join(parts) if parts else None
+
+    elif role == "assistant":
+        if isinstance(content, list):
+            parts = []
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("type") == "text":
+                    text = item.get("text", "").strip()
+                    if text:
+                        if _contains_internal_xml(text):
+                            text = _strip_internal_xml(text)
+                        if text:
+                            parts.append(text)
+                elif item.get("type") == "tool_use":
+                    tool_name = item.get("name", "unknown")
+                    tool_input = item.get("input", {})
+                    icon = TOOL_LABELS.get(tool_name, "\U0001f527")
+                    if not isinstance(tool_input, dict):
+                        parts.append(f"{icon} ` + "`" + `{tool_name}` + "`" + `")
+                        continue
+
+                    if tool_name == "Bash":
+                        cmd = tool_input.get("command", "")
+                        desc = tool_input.get("description", "")
+                        if desc:
+                            parts.append(f"{icon} *{desc}*")
+                        if cmd:
+                            parts.append(f"` + "`" + "" + "`" + "" + "`" + `\n$ {cmd[:500]}\n` + "`" + "" + "`" + "" + "`" + `")
+                        elif not desc:
+                            parts.append(f"{icon} ` + "`" + `Bash` + "`" + `")
+                    elif tool_name == "Edit":
+                        fp = tool_input.get("file_path", "")
+                        old = tool_input.get("old_string", "")
+                        new = tool_input.get("new_string", "")
+                        old_count = len(old.splitlines()) if old else 0
+                        new_count = len(new.splitlines()) if new else 0
+                        replace_all = tool_input.get("replace_all", False)
+                        desc = f"Edit({fp})"
+                        if replace_all:
+                            desc += " [replace all]"
+                        if old_count or new_count:
+                            desc += f" (-{old_count}/+{new_count} lines)"
+                        parts.append(f"{icon} ` + "`" + `{desc}` + "`" + `")
+                    elif tool_name == "Write":
+                        fp = tool_input.get("file_path", "")
+                        parts.append(f"{icon} ` + "`" + `Write({fp})` + "`" + `")
+                    elif tool_name == "Read":
+                        fp = tool_input.get("file_path", "")
+                        parts.append(f"\U0001f4d6 ` + "`" + `Read({fp})` + "`" + `")
+                    elif tool_name in ("Grep", "Glob"):
+                        pattern = tool_input.get("pattern", "")
+                        parts.append(f"\U0001f50d ` + "`" + `{tool_name}({pattern})` + "`" + `")
+                    else:
+                        # Generic: show first meaningful arg
+                        if "file_path" in tool_input:
+                            parts.append(f"{icon} ` + "`" + `{tool_name}({tool_input['file_path']})` + "`" + `")
+                        elif "query" in tool_input:
+                            parts.append(f"{icon} ` + "`" + `{tool_name}({tool_input['query'][:80]})` + "`" + `")
+                        elif "prompt" in tool_input:
+                            parts.append(f"{icon} ` + "`" + `{tool_name}({tool_input['prompt'][:80]})` + "`" + `")
+                        else:
+                            parts.append(f"{icon} ` + "`" + `{tool_name}` + "`" + `")
+            return "\n".join(parts) if parts else None
+        elif isinstance(content, str) and content.strip():
+            return content.strip()
+
+    return None
+
+
+async def mirror_loop(
+    slack_app,
+    channel_id: str,
+    conductor_name: str,
+    profile: str,
+):
+    """Continuously mirror conductor-chief output to Slack by tailing the JSONL file."""
+    POLL_INTERVAL = 2  # seconds
+    BATCH_INTERVAL = 2  # seconds to accumulate before posting
+
+    session_title = conductor_session_title(conductor_name)
+
+    # Resolve JSONL path
+    jsonl_path = resolve_jsonl_path(session_title, profile=profile)
+    if not jsonl_path:
+        log.warning("Mirror: could not resolve JSONL path for %s, retrying in 30s", conductor_name)
+        await asyncio.sleep(30)
+        jsonl_path = resolve_jsonl_path(session_title, profile=profile)
+        if not jsonl_path:
+            log.error("Mirror: giving up on JSONL resolution for %s", conductor_name)
+            return
+
+    log.info("Mirror: tailing JSONL %s for conductor %s", jsonl_path, conductor_name)
+
+    # Seek to end of file (skip history)
+    file_path = Path(jsonl_path)
+    file_pos = file_path.stat().st_size if file_path.exists() else 0
+    last_inode = file_path.stat().st_ino if file_path.exists() else 0
+
+    pending_messages: list[str] = []
+    last_post_time = time.monotonic()
+
+    async def flush_pending():
+        nonlocal last_post_time
+        if not pending_messages:
+            return
+        batch = markdown_to_slack("\n".join(pending_messages))
+        pending_messages.clear()
+        for chunk in split_message(batch, max_len=SLACK_MAX_LENGTH):
+            try:
+                await slack_app.client.chat_postMessage(channel=channel_id, text=chunk)
+            except Exception as e:
+                log.debug("Mirror: failed to post: %s", e)
+        last_post_time = time.monotonic()
+
+    while True:
+        try:
+            await asyncio.sleep(POLL_INTERVAL)
+
+            if not file_path.exists():
+                continue
+
+            # Detect file rotation (session restart/compact)
+            current_stat = file_path.stat()
+            if current_stat.st_ino != last_inode or current_stat.st_size < file_pos:
+                log.info("Mirror: JSONL file rotated, reseeking")
+                file_pos = current_stat.st_size
+                last_inode = current_stat.st_ino
+                continue
+
+            if current_stat.st_size <= file_pos:
+                if (time.monotonic() - last_post_time) >= BATCH_INTERVAL:
+                    await flush_pending()
+                continue
+
+            # Read new bytes
+            with open(file_path, "r", encoding="utf-8") as f:
+                f.seek(file_pos)
+                new_data = f.read()
+                file_pos = f.tell()
+
+            for line in new_data.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                formatted = format_jsonl_event(entry)
+                if formatted:
+                    pending_messages.append(formatted)
+
+            if (time.monotonic() - last_post_time) >= BATCH_INTERVAL:
+                await flush_pending()
+
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            log.error("Mirror: unexpected error: %s", e)
+            await asyncio.sleep(10)
+`
+
+const conductorBridgePkgMain = `"""Entry point: discovers conductors, starts platform handlers, runs heartbeat loop.
+
+This module replaces the monolithic bridge.py as the authoritative entry point.
+"""
+
+import asyncio
+import sys
+
+from .config import log, load_config, discover_conductors
+from .cli import ensure_conductor_running
+from .constants import AGENT_DECK_DIR, CONFIG_PATH, HAS_AIOGRAM, HAS_SLACK, HAS_DISCORD
+from .telegram_bot import create_telegram_bot
+from .slack_bot import create_slack_app
+from .discord_bot import create_discord_bot
+from .heartbeat import heartbeat_loop
+from .mirror import mirror_loop
+
+# Conditional import for Slack Socket Mode handler
+try:
+    from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
+except ImportError:
+    AsyncSocketModeHandler = None
 
 
 async def main():
@@ -2269,7 +2716,8 @@ async def main():
         result = create_slack_app(config)
         if result:
             slack_app, slack_channel_id = result
-            slack_handler = AsyncSocketModeHandler(slack_app, config["slack"]["app_token"])
+            if AsyncSocketModeHandler:
+                slack_handler = AsyncSocketModeHandler(slack_app, config["slack"]["app_token"])
 
     # Create Discord bot
     discord_bot, discord_channel_id = None, None
@@ -2297,6 +2745,33 @@ async def main():
         )
     )
 
+    # Slack liveness watchdog: track last activity and exit if stale.
+    # launchd KeepAlive=true will restart the process automatically.
+    _slack_last_activity = {"ts": asyncio.get_event_loop().time()}
+    _SLACK_STALE_TIMEOUT = 600  # 10 minutes with no socket activity -> restart
+
+    if slack_handler:
+        _original_handle = slack_handler.handle
+
+        async def _tracked_handle(*args, **kwargs):
+            _slack_last_activity["ts"] = asyncio.get_event_loop().time()
+            return await _original_handle(*args, **kwargs)
+
+        slack_handler.handle = _tracked_handle
+
+    async def slack_liveness_watchdog():
+        """Exit the process if Slack socket goes stale."""
+        while True:
+            await asyncio.sleep(60)
+            elapsed = asyncio.get_event_loop().time() - _slack_last_activity["ts"]
+            if elapsed > _SLACK_STALE_TIMEOUT:
+                log.error(
+                    "Slack socket stale for %.0fs (threshold %ds), exiting for restart",
+                    elapsed, _SLACK_STALE_TIMEOUT,
+                )
+                import os
+                os._exit(1)
+
     # Run all platforms concurrently
     tasks = [heartbeat_task]
     if telegram_dp and telegram_bot:
@@ -2304,7 +2779,15 @@ async def main():
         log.info("Telegram bot polling started")
     if slack_handler:
         tasks.append(asyncio.create_task(slack_handler.start_async()))
+        tasks.append(asyncio.create_task(slack_liveness_watchdog()))
         log.info("Slack Socket Mode handler started")
+        # Start mirror for chief conductor only
+        chief = next((c for c in conductors if c["name"] == "chief"), None)
+        if chief:
+            tasks.append(asyncio.create_task(
+                mirror_loop(slack_app, slack_channel_id, chief["name"], chief["profile"])
+            ))
+            log.info("Mirror started for conductor %s", chief["name"])
     if discord_bot:
         tasks.append(asyncio.create_task(discord_bot.start(config["discord"]["bot_token"])))
         log.info("Discord bot started")
@@ -2319,8 +2802,5 @@ async def main():
             await slack_handler.close_async()
         if discord_bot:
             await discord_bot.close()
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
 `
+
