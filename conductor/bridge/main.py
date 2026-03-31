@@ -106,7 +106,7 @@ async def main():
     # Slack liveness watchdog: track last activity and exit if stale.
     # launchd KeepAlive=true will restart the process automatically.
     _slack_last_activity = {"ts": asyncio.get_event_loop().time()}
-    _SLACK_STALE_TIMEOUT = 600  # 10 minutes with no socket activity -> restart
+    _SLACK_STALE_TIMEOUT = 1800  # 30 minutes with no socket activity -> restart
 
     if slack_handler:
         _original_handle = slack_handler.handle
@@ -116,6 +116,25 @@ async def main():
             return await _original_handle(*args, **kwargs)
 
         slack_handler.handle = _tracked_handle
+
+        # Also track Socket Mode connection events (connect/disconnect/reconnect)
+        # so ping/pong keepalives reset the watchdog even without user messages.
+        _original_connect = getattr(slack_handler, 'connect_async', None)
+        if _original_connect:
+            async def _tracked_connect(*args, **kwargs):
+                _slack_last_activity["ts"] = asyncio.get_event_loop().time()
+                return await _original_connect(*args, **kwargs)
+            slack_handler.connect_async = _tracked_connect
+
+        # Track the underlying client's message handler for ping/pong frames
+        if hasattr(slack_handler, 'client') and slack_handler.client:
+            _sm_client = slack_handler.client
+            _original_recv = getattr(_sm_client, 'receive_messages', None)
+            if _original_recv:
+                async def _tracked_recv(*args, **kwargs):
+                    _slack_last_activity["ts"] = asyncio.get_event_loop().time()
+                    return await _original_recv(*args, **kwargs)
+                _sm_client.receive_messages = _tracked_recv
 
     async def slack_liveness_watchdog():
         """Exit the process if Slack socket goes stale."""
