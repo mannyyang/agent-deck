@@ -58,6 +58,7 @@ def load_config() -> dict:
     sl_channel_id = sl.get("channel_id", "")
     sl_listen_mode = sl.get("listen_mode", "mentions")  # "mentions" or "all"
     sl_allowed_users = sl.get("allowed_user_ids", [])  # List of authorized Slack user IDs
+    sl_conductors = sl.get("conductors", [])  # Explicit list of conductor names for Slack (empty = all)
     sl_configured = bool(sl_bot_token and sl_app_token and sl_channel_id)
 
     # Discord config
@@ -89,6 +90,7 @@ def load_config() -> dict:
             "channel_id": sl_channel_id,
             "listen_mode": sl_listen_mode,
             "allowed_user_ids": sl_allowed_users,
+            "conductors": sl_conductors,
             "configured": sl_configured,
         },
         "discord": {

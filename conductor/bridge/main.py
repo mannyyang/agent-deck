@@ -158,13 +158,18 @@ async def main():
         tasks.append(asyncio.create_task(slack_handler.start_async()))
         tasks.append(asyncio.create_task(slack_liveness_watchdog()))
         log.info("Slack Socket Mode handler started")
-        # Start mirror for chief conductor only
-        chief = next((c for c in conductors if c["name"] == "chief"), None)
-        if chief:
+        # Start mirror for the first Slack-connected conductor (from config)
+        slack_conductors = config["slack"].get("conductors", [])
+        mirror_conductor = None
+        if slack_conductors:
+            mirror_conductor = next((c for c in conductors if c["name"] == slack_conductors[0]), None)
+        else:
+            mirror_conductor = conductors[0] if conductors else None
+        if mirror_conductor:
             tasks.append(asyncio.create_task(
-                mirror_loop(slack_app, slack_channel_id, chief["name"], chief["profile"])
+                mirror_loop(slack_app, slack_channel_id, mirror_conductor["name"], mirror_conductor["profile"])
             ))
-            log.info("Mirror started for conductor %s", chief["name"])
+            log.info("Mirror started for conductor %s", mirror_conductor["name"])
     if discord_bot:
         tasks.append(asyncio.create_task(discord_bot.start(config["discord"]["bot_token"])))
         log.info("Discord bot started")

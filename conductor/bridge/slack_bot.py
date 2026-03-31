@@ -136,10 +136,20 @@ def create_slack_app(config: dict):
             _channel_cache[event_channel] = (tag, time.monotonic() + _NEGATIVE_TTL)
             return tag
 
-    def get_default_conductor() -> dict | None:
-        """Get the first conductor (default target for messages)."""
+    # Conductors allowed for this Slack integration (empty = all)
+    _slack_conductors = config["slack"].get("conductors", [])
+
+    def get_allowed_conductors() -> list[dict]:
+        """Get conductors allowed for this Slack integration."""
         conductors = discover_conductors()
-        return conductors[0] if conductors else None
+        if not _slack_conductors:
+            return conductors
+        return [c for c in conductors if c["name"] in _slack_conductors]
+
+    def get_default_conductor() -> dict | None:
+        """Get the first allowed conductor (default target for messages)."""
+        allowed = get_allowed_conductors()
+        return allowed[0] if allowed else None
 
     async def _safe_say(say, **kwargs):
         """Wrapper around say() that catches network/API errors and converts markdown."""
@@ -173,8 +183,8 @@ def create_slack_app(config: dict):
         """Shared handler for Slack messages and mentions."""
         msg_channel = event_channel or channel_id
 
-        conductor_names = get_conductor_names()
-        conductors = discover_conductors()
+        conductors = get_allowed_conductors()
+        conductor_names = [c["name"] for c in conductors]
 
         target_name, cleaned_msg = parse_conductor_prefix(text, conductor_names)
 
