@@ -15,14 +15,16 @@ run:
 
 # Install to /usr/local/bin (requires sudo)
 install: build
-	sudo cp $(BUILD_DIR)/$(BINARY_NAME) /usr/local/bin/$(BINARY_NAME)
+	sudo rm -f /usr/local/bin/$(BINARY_NAME)
+	sudo mv $(BUILD_DIR)/$(BINARY_NAME) /usr/local/bin/$(BINARY_NAME)
 	@echo "✅ Installed to /usr/local/bin/$(BINARY_NAME)"
 	@echo "Run 'agent-deck' to start"
 
 # Install to user's local bin (no sudo required)
 install-user: build
 	mkdir -p $(HOME)/.local/bin
-	cp $(BUILD_DIR)/$(BINARY_NAME) $(HOME)/.local/bin/$(BINARY_NAME)
+	rm -f $(HOME)/.local/bin/$(BINARY_NAME)
+	mv $(BUILD_DIR)/$(BINARY_NAME) $(HOME)/.local/bin/$(BINARY_NAME)
 	@echo "✅ Installed to $(HOME)/.local/bin/$(BINARY_NAME)"
 	@echo "Make sure $(HOME)/.local/bin is in your PATH"
 	@echo "Run 'agent-deck' to start"
