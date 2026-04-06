@@ -555,6 +555,7 @@ const conductorBridgePkgConfig = `"""Configuration loading and conductor discove
 
 import json
 import logging
+import os
 import sys
 import time
 from pathlib import Path
@@ -581,6 +582,40 @@ log = logging.getLogger("conductor-bridge")
 # ---------------------------------------------------------------------------
 
 
+def _resolve_secret(value: str) -> str:
+    """Resolve a config value that may be an env-var reference or a macOS Keychain reference.
+
+    Supports:
+      - "$ENV_VAR" or "${ENV_VAR}" -> os.environ lookup
+      - "keychain:service-name" -> macOS Keychain lookup via /usr/bin/security
+      - Plain strings are returned as-is.
+    """
+    if not value:
+        return value
+    if value.startswith("$"):
+        # Strip ${...} or $... syntax
+        var_name = value.lstrip("$").strip("{}")
+        resolved = os.environ.get(var_name, "")
+        if not resolved:
+            log.warning("Environment variable %s is not set", var_name)
+        return resolved
+    if value.startswith("keychain:"):
+        service_name = value[len("keychain:"):]
+        try:
+            import subprocess
+            result = subprocess.run(
+                ["/usr/bin/security", "find-generic-password", "-s", service_name, "-w"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 0:
+                return result.stdout.strip()
+            log.warning("Keychain lookup failed for service '%s': %s", service_name, result.stderr.strip())
+        except Exception as e:
+            log.warning("Keychain lookup error for service '%s': %s", service_name, e)
+        return ""
+    return value
+
+
 def load_config() -> dict:
     """Load [conductor] section from config.toml.
 
@@ -600,22 +635,23 @@ def load_config() -> dict:
 
     # Telegram config
     tg = conductor_cfg.get("telegram", {})
-    tg_token = tg.get("token", "")
+    tg_token = _resolve_secret(tg.get("token", ""))
     tg_user_id = tg.get("user_id", 0)
     tg_configured = bool(tg_token and tg_user_id)
 
     # Slack config
     sl = conductor_cfg.get("slack", {})
-    sl_bot_token = sl.get("bot_token", "")
-    sl_app_token = sl.get("app_token", "")
+    sl_bot_token = _resolve_secret(sl.get("bot_token", ""))
+    sl_app_token = _resolve_secret(sl.get("app_token", ""))
     sl_channel_id = sl.get("channel_id", "")
     sl_listen_mode = sl.get("listen_mode", "mentions")  # "mentions" or "all"
     sl_allowed_users = sl.get("allowed_user_ids", [])  # List of authorized Slack user IDs
+    sl_conductors = sl.get("conductors", [])  # Explicit list of conductor names for Slack (empty = all)
     sl_configured = bool(sl_bot_token and sl_app_token and sl_channel_id)
 
     # Discord config
     dc = conductor_cfg.get("discord", {})
-    dc_bot_token = dc.get("bot_token", "")
+    dc_bot_token = _resolve_secret(dc.get("bot_token", ""))
     dc_guild_id = dc.get("guild_id", 0)
     dc_channel_id = dc.get("channel_id", 0)
     dc_user_id = dc.get("user_id", 0)
@@ -642,6 +678,7 @@ def load_config() -> dict:
             "channel_id": sl_channel_id,
             "listen_mode": sl_listen_mode,
             "allowed_user_ids": sl_allowed_users,
+            "conductors": sl_conductors,
             "configured": sl_configured,
         },
         "discord": {
@@ -1367,7 +1404,7 @@ except ImportError:
 from .config import log, discover_conductors, conductor_session_title, get_conductor_names, get_unique_profiles
 from .cli import run_cli, send_to_conductor, get_status_summary_all, get_sessions_list_all, ensure_conductor_running
 from .formatting import parse_conductor_prefix
-from .constants import markdown_to_slack, RESPONSE_TIMEOUT
+from .constants import markdown_to_slack, RESPONSE_TIMEOUT, CONDUCTOR_DIR
 
 def create_slack_app(config: dict):
     """Create and configure the Slack app with Socket Mode.
@@ -1488,10 +1525,20 @@ def create_slack_app(config: dict):
             _channel_cache[event_channel] = (tag, time.monotonic() + _NEGATIVE_TTL)
             return tag
 
-    def get_default_conductor() -> dict | None:
-        """Get the first conductor (default target for messages)."""
+    # Conductors allowed for this Slack integration (empty = all)
+    _slack_conductors = config["slack"].get("conductors", [])
+
+    def get_allowed_conductors() -> list[dict]:
+        """Get conductors allowed for this Slack integration."""
         conductors = discover_conductors()
-        return conductors[0] if conductors else None
+        if not _slack_conductors:
+            return conductors
+        return [c for c in conductors if c["name"] in _slack_conductors]
+
+    def get_default_conductor() -> dict | None:
+        """Get the first allowed conductor (default target for messages)."""
+        allowed = get_allowed_conductors()
+        return allowed[0] if allowed else None
 
     async def _safe_say(say, **kwargs):
         """Wrapper around say() that catches network/API errors and converts markdown."""
@@ -1525,8 +1572,8 @@ def create_slack_app(config: dict):
         """Shared handler for Slack messages and mentions."""
         msg_channel = event_channel or channel_id
 
-        conductor_names = get_conductor_names()
-        conductors = discover_conductors()
+        conductors = get_allowed_conductors()
+        conductor_names = [c["name"] for c in conductors]
 
         target_name, cleaned_msg = parse_conductor_prefix(text, conductor_names)
 
@@ -1653,6 +1700,14 @@ def create_slack_app(config: dict):
             event_channel=event.get("channel"),
         )
 
+    def _resolve_conductor(name: str) -> dict | None:
+        """Resolve a conductor by name, falling back to default."""
+        if name:
+            for c in discover_conductors():
+                if c['name'] == name:
+                    return c
+        return get_default_conductor()
+
     @app.command("/ad-status")
     async def slack_cmd_status(ack, respond, command):
         """Handle /ad-status slash command."""
@@ -1752,6 +1807,117 @@ def create_slack_app(config: dict):
         else:
             await respond(f"Restart failed: {result.stderr.strip()}")
 
+    @app.command("/ad-compact")
+    async def slack_cmd_compact(ack, respond, command):
+        """Handle /ad-compact slash command."""
+        await ack()
+        user_id = command.get("user_id", "")
+        if not is_slack_authorized(user_id):
+            await respond("⛔ Unauthorized. Contact your administrator.")
+            return
+        target = _resolve_conductor(command.get("text", "").strip())
+        if target is None:
+            await respond("No conductors found.")
+            return
+        session_title = conductor_session_title(target["name"])
+        await respond(f'Compacting ` + "`" + `{target["name"]}` + "`" + `...')
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(
+            None,
+            lambda t=target: run_cli("session", "restart", session_title, profile=t["profile"], timeout=60),
+        )
+        if result.returncode == 0:
+            await respond(f'` + "`" + `{target["name"]}` + "`" + ` compacted. State recovers from state.json on startup.')
+        else:
+            await respond(f"Compact failed: {result.stderr.strip()}")
+
+    @app.command("/ad-clear")
+    async def slack_cmd_clear(ack, respond, command):
+        """Handle /ad-clear slash command."""
+        await ack()
+        user_id = command.get("user_id", "")
+        if not is_slack_authorized(user_id):
+            await respond("⛔ Unauthorized. Contact your administrator.")
+            return
+        target = _resolve_conductor(command.get("text", "").strip())
+        if target is None:
+            await respond("No conductors found.")
+            return
+        state_path = CONDUCTOR_DIR / target["name"] / "state.json"
+        try:
+            state_path.write_text("{}")
+        except Exception:
+            pass
+        session_title = conductor_session_title(target["name"])
+        await respond(f'Clearing ` + "`" + `{target["name"]}` + "`" + `...')
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(
+            None,
+            lambda t=target: run_cli("session", "restart", session_title, profile=t["profile"], timeout=60),
+        )
+        if result.returncode == 0:
+            await respond(f'` + "`" + `{target["name"]}` + "`" + ` cleared and restarted fresh.')
+        else:
+            await respond(f"Clear failed: {result.stderr.strip()}")
+
+    @app.command("/ad-check")
+    async def slack_cmd_check(ack, respond, command):
+        """Handle /ad-check slash command."""
+        await ack()
+        user_id = command.get("user_id", "")
+        if not is_slack_authorized(user_id):
+            await respond("⛔ Unauthorized. Contact your administrator.")
+            return
+        session_name = command.get("text", "").strip()
+        if not session_name:
+            await respond("Usage: ` + "`" + `/ad-check <session-name>` + "`" + `")
+            return
+        profiles = get_unique_profiles()
+        output = None
+        for profile in profiles:
+            result = run_cli("session", "output", session_name, "-q", profile=profile, timeout=30)
+            if result.returncode == 0 and result.stdout.strip():
+                output = result.stdout.strip()
+                break
+        if output is None:
+            await respond(f"Session ` + "`" + `{session_name}` + "`" + ` not found or has no output.")
+            return
+        max_len = 3000
+        if len(output) > max_len:
+            output = "...(truncated)\n" + output[-max_len:]
+        await respond(f"*{session_name}* last output:\n` + "`" + "" + "`" + "" + "`" + `\n{output}\n` + "`" + "" + "`" + "" + "`" + `")
+
+    @app.command("/ad-send")
+    async def slack_cmd_send(ack, respond, command):
+        """Handle /ad-send slash command."""
+        await ack()
+        user_id = command.get("user_id", "")
+        if not is_slack_authorized(user_id):
+            await respond("⛔ Unauthorized. Contact your administrator.")
+            return
+        text = command.get("text", "").strip()
+        parts = text.split(None, 1)
+        if len(parts) < 2:
+            await respond("Usage: ` + "`" + `/ad-send <session-name> <message>` + "`" + `")
+            return
+        session_name, message = parts[0], parts[1]
+        profiles = get_unique_profiles()
+        sent = False
+        loop = asyncio.get_running_loop()
+        for profile in profiles:
+            result = await loop.run_in_executor(
+                None,
+                lambda p=profile: run_cli("session", "send", session_name, message, "--no-wait", profile=p, timeout=30),
+            )
+            if result.returncode == 0:
+                sent = True
+                break
+        if sent:
+            preview = message[:100] + ("..." if len(message) > 100 else "")
+            await respond(f"Sent to ` + "`" + `{session_name}` + "`" + `: {preview}")
+        else:
+            await respond(f"Failed to send to ` + "`" + `{session_name}` + "`" + `. Session may not exist or is not running.")
+
     @app.command("/ad-help")
     async def slack_cmd_help(ack, respond, command):
         """Handle /ad-help slash command."""
@@ -1766,14 +1932,18 @@ def create_slack_app(config: dict):
         conductors = discover_conductors()
         names = [c["name"] for c in conductors]
         await respond(
-            "Conductor Commands:\n"
-            "/ad-status    - Aggregated status across all profiles\n"
-            "/ad-sessions  - List all sessions (all profiles)\n"
-            "/ad-restart   - Restart a conductor (specify name)\n"
-            "/ad-help      - This message\n\n"
-            f"Conductors: {', '.join(names) if names else 'none'}\n"
-            f"Route: <name>: <message>\n"
-            f"Default: messages go to first conductor"
+            "*Conductor Commands:*\n"
+            "` + "`" + `/ad-status` + "`" + `              - Aggregated status across all profiles\n"
+            "` + "`" + `/ad-sessions` + "`" + `            - List all sessions (all profiles)\n"
+            "` + "`" + `/ad-check <session>` + "`" + `     - Show last output from a session\n"
+            "` + "`" + `/ad-send <session> <msg>` + "`" + ` - Send message directly to a session\n"
+            "` + "`" + `/ad-compact [conductor]` + "`" + ` - Compact conductor (restart, state preserved)\n"
+            "` + "`" + `/ad-clear [conductor]` + "`" + `   - Full reset (wipe state + restart)\n"
+            "` + "`" + `/ad-restart [conductor]` + "`" + ` - Restart a conductor\n"
+            "` + "`" + `/ad-help` + "`" + `                - This message\n\n"
+            f"*Conductors:* {', '.join(names) if names else 'none'}\n"
+            f"*Route:* ` + "`" + `<name>: <message>` + "`" + ` to target a specific conductor\n"
+            f"*Default:* messages go to first conductor"
         )
 
     log.info("Slack app initialized (Socket Mode, channel=%s)", channel_id)

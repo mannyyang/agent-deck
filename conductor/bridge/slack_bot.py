@@ -15,7 +15,7 @@ except ImportError:
 from .config import log, discover_conductors, conductor_session_title, get_conductor_names, get_unique_profiles
 from .cli import run_cli, send_to_conductor, get_status_summary_all, get_sessions_list_all, ensure_conductor_running
 from .formatting import parse_conductor_prefix
-from .constants import markdown_to_slack, RESPONSE_TIMEOUT
+from .constants import markdown_to_slack, RESPONSE_TIMEOUT, CONDUCTOR_DIR
 
 def create_slack_app(config: dict):
     """Create and configure the Slack app with Socket Mode.
@@ -311,6 +311,14 @@ def create_slack_app(config: dict):
             event_channel=event.get("channel"),
         )
 
+    def _resolve_conductor(name: str) -> dict | None:
+        """Resolve a conductor by name, falling back to default."""
+        if name:
+            for c in discover_conductors():
+                if c['name'] == name:
+                    return c
+        return get_default_conductor()
+
     @app.command("/ad-status")
     async def slack_cmd_status(ack, respond, command):
         """Handle /ad-status slash command."""
@@ -410,6 +418,117 @@ def create_slack_app(config: dict):
         else:
             await respond(f"Restart failed: {result.stderr.strip()}")
 
+    @app.command("/ad-compact")
+    async def slack_cmd_compact(ack, respond, command):
+        """Handle /ad-compact slash command."""
+        await ack()
+        user_id = command.get("user_id", "")
+        if not is_slack_authorized(user_id):
+            await respond("⛔ Unauthorized. Contact your administrator.")
+            return
+        target = _resolve_conductor(command.get("text", "").strip())
+        if target is None:
+            await respond("No conductors found.")
+            return
+        session_title = conductor_session_title(target["name"])
+        await respond(f'Compacting `{target["name"]}`...')
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(
+            None,
+            lambda t=target: run_cli("session", "restart", session_title, profile=t["profile"], timeout=60),
+        )
+        if result.returncode == 0:
+            await respond(f'`{target["name"]}` compacted. State recovers from state.json on startup.')
+        else:
+            await respond(f"Compact failed: {result.stderr.strip()}")
+
+    @app.command("/ad-clear")
+    async def slack_cmd_clear(ack, respond, command):
+        """Handle /ad-clear slash command."""
+        await ack()
+        user_id = command.get("user_id", "")
+        if not is_slack_authorized(user_id):
+            await respond("⛔ Unauthorized. Contact your administrator.")
+            return
+        target = _resolve_conductor(command.get("text", "").strip())
+        if target is None:
+            await respond("No conductors found.")
+            return
+        state_path = CONDUCTOR_DIR / target["name"] / "state.json"
+        try:
+            state_path.write_text("{}")
+        except Exception:
+            pass
+        session_title = conductor_session_title(target["name"])
+        await respond(f'Clearing `{target["name"]}`...')
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(
+            None,
+            lambda t=target: run_cli("session", "restart", session_title, profile=t["profile"], timeout=60),
+        )
+        if result.returncode == 0:
+            await respond(f'`{target["name"]}` cleared and restarted fresh.')
+        else:
+            await respond(f"Clear failed: {result.stderr.strip()}")
+
+    @app.command("/ad-check")
+    async def slack_cmd_check(ack, respond, command):
+        """Handle /ad-check slash command."""
+        await ack()
+        user_id = command.get("user_id", "")
+        if not is_slack_authorized(user_id):
+            await respond("⛔ Unauthorized. Contact your administrator.")
+            return
+        session_name = command.get("text", "").strip()
+        if not session_name:
+            await respond("Usage: `/ad-check <session-name>`")
+            return
+        profiles = get_unique_profiles()
+        output = None
+        for profile in profiles:
+            result = run_cli("session", "output", session_name, "-q", profile=profile, timeout=30)
+            if result.returncode == 0 and result.stdout.strip():
+                output = result.stdout.strip()
+                break
+        if output is None:
+            await respond(f"Session `{session_name}` not found or has no output.")
+            return
+        max_len = 3000
+        if len(output) > max_len:
+            output = "...(truncated)\n" + output[-max_len:]
+        await respond(f"*{session_name}* last output:\n```\n{output}\n```")
+
+    @app.command("/ad-send")
+    async def slack_cmd_send(ack, respond, command):
+        """Handle /ad-send slash command."""
+        await ack()
+        user_id = command.get("user_id", "")
+        if not is_slack_authorized(user_id):
+            await respond("⛔ Unauthorized. Contact your administrator.")
+            return
+        text = command.get("text", "").strip()
+        parts = text.split(None, 1)
+        if len(parts) < 2:
+            await respond("Usage: `/ad-send <session-name> <message>`")
+            return
+        session_name, message = parts[0], parts[1]
+        profiles = get_unique_profiles()
+        sent = False
+        loop = asyncio.get_running_loop()
+        for profile in profiles:
+            result = await loop.run_in_executor(
+                None,
+                lambda p=profile: run_cli("session", "send", session_name, message, "--no-wait", profile=p, timeout=30),
+            )
+            if result.returncode == 0:
+                sent = True
+                break
+        if sent:
+            preview = message[:100] + ("..." if len(message) > 100 else "")
+            await respond(f"Sent to `{session_name}`: {preview}")
+        else:
+            await respond(f"Failed to send to `{session_name}`. Session may not exist or is not running.")
+
     @app.command("/ad-help")
     async def slack_cmd_help(ack, respond, command):
         """Handle /ad-help slash command."""
@@ -424,14 +543,18 @@ def create_slack_app(config: dict):
         conductors = discover_conductors()
         names = [c["name"] for c in conductors]
         await respond(
-            "Conductor Commands:\n"
-            "/ad-status    - Aggregated status across all profiles\n"
-            "/ad-sessions  - List all sessions (all profiles)\n"
-            "/ad-restart   - Restart a conductor (specify name)\n"
-            "/ad-help      - This message\n\n"
-            f"Conductors: {', '.join(names) if names else 'none'}\n"
-            f"Route: <name>: <message>\n"
-            f"Default: messages go to first conductor"
+            "*Conductor Commands:*\n"
+            "`/ad-status`              - Aggregated status across all profiles\n"
+            "`/ad-sessions`            - List all sessions (all profiles)\n"
+            "`/ad-check <session>`     - Show last output from a session\n"
+            "`/ad-send <session> <msg>` - Send message directly to a session\n"
+            "`/ad-compact [conductor]` - Compact conductor (restart, state preserved)\n"
+            "`/ad-clear [conductor]`   - Full reset (wipe state + restart)\n"
+            "`/ad-restart [conductor]` - Restart a conductor\n"
+            "`/ad-help`                - This message\n\n"
+            f"*Conductors:* {', '.join(names) if names else 'none'}\n"
+            f"*Route:* `<name>: <message>` to target a specific conductor\n"
+            f"*Default:* messages go to first conductor"
         )
 
     log.info("Slack app initialized (Socket Mode, channel=%s)", channel_id)
