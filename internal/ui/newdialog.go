@@ -16,6 +16,109 @@ import (
 	"github.com/asheshgoplani/agent-deck/internal/statedb"
 )
 
+// overlayDropdown paints `overlay` on top of `base` starting at the given
+// row and column (0-indexed). Lines of the overlay replace the characters
+// underneath while preserving the rest of each base line. This gives a
+// "z-index" effect for floating dropdowns.
+func overlayDropdown(base string, overlay string, row, col int) string {
+	baseLines := strings.Split(base, "\n")
+	overLines := strings.Split(overlay, "\n")
+
+	for i, ol := range overLines {
+		targetRow := row + i
+		if targetRow < 0 || targetRow >= len(baseLines) {
+			continue
+		}
+		bl := baseLines[targetRow]
+		blWidth := lipgloss.Width(bl)
+
+		// Build: [left padding] [overlay line] [right remainder]
+		var result strings.Builder
+
+		if col > 0 {
+			if col <= blWidth {
+				// Truncate base line to col visible chars
+				result.WriteString(truncateVisible(bl, col))
+			} else {
+				// Base line is shorter than col; pad with spaces
+				result.WriteString(bl)
+				result.WriteString(strings.Repeat(" ", col-blWidth))
+			}
+		}
+
+		result.WriteString(ol)
+
+		// Append remaining base chars after the overlay
+		olWidth := lipgloss.Width(ol)
+		afterCol := col + olWidth
+		if afterCol < blWidth {
+			result.WriteString(sliceVisibleFrom(bl, afterCol))
+		}
+
+		baseLines[targetRow] = result.String()
+	}
+
+	return strings.Join(baseLines, "\n")
+}
+
+// truncateVisible returns the prefix of s that spans exactly n visible columns.
+// ANSI escape sequences are preserved for any characters included.
+func truncateVisible(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	visible := 0
+	inEsc := false
+	var buf strings.Builder
+	for _, r := range s {
+		if r == '\x1b' {
+			inEsc = true
+			buf.WriteRune(r)
+			continue
+		}
+		if inEsc {
+			buf.WriteRune(r)
+			if (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') || r == '~' || r == '\\' {
+				inEsc = false
+			}
+			continue
+		}
+		if visible >= n {
+			break
+		}
+		buf.WriteRune(r)
+		visible++
+	}
+	return buf.String()
+}
+
+// sliceVisibleFrom returns the suffix of s starting from visible column n.
+// ANSI sequences attached to skipped characters are dropped.
+func sliceVisibleFrom(s string, n int) string {
+	if n <= 0 {
+		return s
+	}
+	visible := 0
+	inEsc := false
+	for i, r := range s {
+		if r == '\x1b' {
+			inEsc = true
+			continue
+		}
+		if inEsc {
+			if (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') || r == '~' || r == '\\' {
+				inEsc = false
+			}
+			continue
+		}
+		if visible >= n {
+			return s[i:]
+		}
+		visible++
+	}
+	return ""
+}
+
 // focusTarget identifies a focusable element in the new session dialog.
 type focusTarget int
 
@@ -25,6 +128,7 @@ const (
 	focusCommand               // tool/command picker.
 	focusWorktree              // worktree checkbox.
 	focusSandbox               // sandbox checkbox.
+	focusConductor             // conducting parent dropdown (conditional — only when conductors exist).
 	focusMultiRepo             // multi-repo toggle (transforms path into list when enabled).
 	focusInherited             // inherited Docker settings toggle (conditional).
 	focusBranch                // branch input (conditional — only when worktree enabled).
@@ -65,13 +169,15 @@ type NewDialog struct {
 	branchInput     textinput.Model
 	branchAutoSet   bool   // true if branch was auto-derived from session name.
 	branchPrefix    string // configured prefix for auto-generated branch names.
+	branchPicker    *BranchPickerDialog
 	// Docker sandbox support.
 	sandboxEnabled    bool
 	inheritedExpanded bool             // whether the inherited settings section is expanded.
 	inheritedSettings []settingDisplay // non-default Docker config values to display.
 	// Inline validation error displayed inside the dialog.
-	validationErr string
-	pathCycler    session.CompletionCycler // Path autocomplete state.
+	validationErr          string
+	pathCycler             session.CompletionCycler // Path autocomplete state.
+	suggestionsLineOffset  int                      // Content line where suggestions overlay should appear.
 	// Multi-repo mode.
 	multiRepoEnabled    bool
 	multiRepoPaths      []string // All paths when multi-repo is active.
@@ -82,6 +188,9 @@ type NewDialog struct {
 	recentSessionCursor int
 	showRecentPicker    bool
 	recentSnapshot      *dialogSnapshot // saved state to restore on Esc
+	// Conducting parent selector.
+	conductorSessions []*session.Instance // nil when no conductors; populated by ShowInGroup
+	conductorCursor   int                 // 0 = "None", 1..N index into conductorSessions
 }
 
 // dialogSnapshot captures form state so the recent picker can restore on cancel.
@@ -99,6 +208,7 @@ type dialogSnapshot struct {
 	codexYolo        bool
 	multiRepoEnabled bool
 	multiRepoPaths   []string
+	conductorCursor  int
 }
 
 // buildPresetCommands returns the list of commands for the picker,
@@ -180,6 +290,7 @@ func NewNewDialog() *NewDialog {
 		pathInput:       pathInput,
 		commandInput:    commandInput,
 		branchInput:     branchInput,
+		branchPicker:    NewBranchPickerDialog(),
 		claudeOptions:   NewClaudeOptionsPanel(),
 		geminiOptions:   NewYoloOptionsPanel("Gemini", "YOLO mode - auto-approve all"),
 		codexOptions:    NewYoloOptionsPanel("Codex", "YOLO mode - bypass approvals and sandbox"),
@@ -196,8 +307,9 @@ func NewNewDialog() *NewDialog {
 	return dlg
 }
 
-// ShowInGroup shows the dialog with a pre-selected parent group and optional default path
-func (d *NewDialog) ShowInGroup(groupPath, groupName, defaultPath string) {
+// ShowInGroup shows the dialog with a pre-selected parent group and optional default path.
+// conductors is the list of active conductor sessions available as parent options.
+func (d *NewDialog) ShowInGroup(groupPath, groupName, defaultPath string, conductors []*session.Instance, suggestedParentID string) {
 	if groupPath == "" {
 		groupPath = "default"
 		groupName = "default"
@@ -214,17 +326,33 @@ func (d *NewDialog) ShowInGroup(groupPath, groupName, defaultPath string) {
 	d.pathCycler.Reset()          // clear stale autocomplete matches from previous show
 	d.showRecentPicker = false    // reset recent picker
 	d.recentSessionCursor = 0
+	d.conductorSessions = conductors
+	d.conductorCursor = 0
+	for i, c := range conductors {
+		if c.ID == suggestedParentID {
+			d.conductorCursor = i + 1 // +1 because 0 = "None"
+			break
+		}
+	}
 	d.pathInput.Blur()
 	d.claudeOptions.Blur()
 	d.geminiOptions.Blur()
 	d.codexOptions.Blur()
+	if d.branchPicker != nil {
+		d.branchPicker.Hide()
+	}
 	// Keep commandCursor at previously set default (don't reset to 0)
 	d.updateToolOptions()
-	// Reset worktree fields.
+	// Reset worktree fields from global config defaults.
 	d.worktreeEnabled = false
 	d.branchInput.SetValue("")
 	d.branchAutoSet = false
 	d.branchPrefix = "feature/" // default; overridden below if config provides one.
+	// Reset multi-repo fields (ephemeral, never pre-filled).
+	d.multiRepoEnabled = false
+	d.multiRepoPaths = nil
+	d.multiRepoPathCursor = 0
+	d.multiRepoEditing = false
 	// Reset sandbox from global config default.
 	d.sandboxEnabled = false
 	d.inheritedExpanded = false
@@ -247,6 +375,7 @@ func (d *NewDialog) ShowInGroup(groupPath, groupName, defaultPath string) {
 		d.codexOptions.SetDefaults(userConfig.Codex.YoloMode)
 		d.claudeOptions.SetDefaults(userConfig)
 		d.sandboxEnabled = userConfig.Docker.DefaultEnabled
+		d.worktreeEnabled = userConfig.Worktree.DefaultEnabled
 		d.inheritedSettings = buildInheritedSettings(userConfig.Docker)
 		d.branchPrefix = userConfig.Worktree.Prefix()
 	}
@@ -285,6 +414,9 @@ func (d *NewDialog) GetSelectedGroup() string {
 func (d *NewDialog) SetSize(width, height int) {
 	d.width = width
 	d.height = height
+	if d.branchPicker != nil {
+		d.branchPicker.SetSize(width, height)
+	}
 }
 
 // SetPathSuggestions sets the available path suggestions for autocomplete
@@ -297,6 +429,11 @@ func (d *NewDialog) SetPathSuggestions(paths []string) {
 // IsRecentPickerOpen returns whether the recent sessions picker is visible.
 func (d *NewDialog) IsRecentPickerOpen() bool {
 	return d.showRecentPicker && len(d.recentSessions) > 0
+}
+
+// IsBranchPickerOpen returns whether the inline branch result list is visible.
+func (d *NewDialog) IsBranchPickerOpen() bool {
+	return d.branchPicker != nil && d.branchPicker.IsVisible()
 }
 
 // SetRecentSessions sets the list of recently deleted session configs.
@@ -328,6 +465,7 @@ func (d *NewDialog) saveSnapshot() *dialogSnapshot {
 		codexYolo:        d.codexOptions.GetYoloMode(),
 		multiRepoEnabled: d.multiRepoEnabled,
 		multiRepoPaths:   append([]string{}, d.multiRepoPaths...),
+		conductorCursor:  d.conductorCursor,
 	}
 }
 
@@ -350,6 +488,7 @@ func (d *NewDialog) restoreSnapshot(s *dialogSnapshot) {
 	d.multiRepoPaths = append([]string{}, s.multiRepoPaths...)
 	d.multiRepoPathCursor = 0
 	d.multiRepoEditing = false
+	d.conductorCursor = s.conductorCursor
 	d.updateToolOptions()
 	d.rebuildFocusTargets()
 }
@@ -446,12 +585,15 @@ func (d *NewDialog) filterPathSuggestions() {
 
 // Show makes the dialog visible (uses default group)
 func (d *NewDialog) Show() {
-	d.ShowInGroup("default", "default", "")
+	d.ShowInGroup("default", "default", "", nil, "")
 }
 
 // Hide hides the dialog
 func (d *NewDialog) Hide() {
 	d.visible = false
+	if d.branchPicker != nil {
+		d.branchPicker.Hide()
+	}
 }
 
 // IsVisible returns whether the dialog is visible
@@ -712,6 +854,9 @@ func (d *NewDialog) rebuildFocusTargets() {
 	} else {
 		targets = []focusTarget{focusName, focusMultiRepo, focusPath, focusCommand, focusWorktree, focusSandbox}
 	}
+	if len(d.conductorSessions) > 0 {
+		targets = append(targets, focusConductor)
+	}
 	if d.sandboxEnabled && len(d.inheritedSettings) > 0 {
 		targets = append(targets, focusInherited)
 	}
@@ -773,8 +918,8 @@ func (d *NewDialog) updateFocus() {
 		if d.commandCursor == 0 { // shell.
 			d.commandInput.Focus()
 		}
-	case focusWorktree, focusSandbox, focusInherited:
-		// Checkbox/toggle rows — no text input to focus.
+	case focusWorktree, focusSandbox, focusConductor, focusInherited:
+		// Checkbox/toggle rows and conductor dropdown — no text input to focus.
 	case focusBranch:
 		d.branchInput.Focus()
 	case focusOptions:
@@ -811,6 +956,21 @@ func (d *NewDialog) Update(msg tea.Msg) (*NewDialog, tea.Cmd) {
 
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
+		if d.branchPicker != nil && d.branchPicker.IsVisible() {
+			if selected, handled := d.branchPicker.Update(msg); handled {
+				if d.branchPicker == nil || !d.branchPicker.IsVisible() {
+					d.branchInput.Focus()
+				}
+				if selected != "" {
+					d.branchInput.SetValue(selected)
+					d.branchInput.SetCursor(len(selected))
+					d.branchAutoSet = false
+					d.ClearError()
+				}
+				return d, nil
+			}
+		}
+
 		// Recent sessions picker handling
 		if d.showRecentPicker && len(d.recentSessions) > 0 {
 			switch msg.String() {
@@ -954,7 +1114,29 @@ func (d *NewDialog) Update(msg tea.Msg) (*NewDialog, tea.Cmd) {
 				return d, nil
 			}
 
+		case "ctrl+f":
+			if cur == focusBranch {
+				if d.branchPicker == nil {
+					d.branchPicker = NewBranchPickerDialog()
+				}
+				d.branchPicker.SetSize(d.width, d.height)
+				if err := d.branchPicker.Show(strings.Trim(strings.TrimSpace(d.pathInput.Value()), "'\""), d.branchInput.Value()); err != nil {
+					d.SetError(err.Error())
+				} else {
+					d.ClearError()
+					d.branchInput.Focus()
+				}
+				return d, nil
+			}
+
 		case "down":
+			if cur == focusConductor {
+				total := len(d.conductorSessions) + 1 // +1 for "None"
+				if d.conductorCursor < total-1 {
+					d.conductorCursor++
+					return d, nil
+				}
+			}
 			if cur == focusMultiRepo && d.multiRepoEnabled && !d.multiRepoEditing {
 				if d.multiRepoPathCursor < len(d.multiRepoPaths)-1 {
 					d.multiRepoPathCursor++
@@ -970,6 +1152,12 @@ func (d *NewDialog) Update(msg tea.Msg) (*NewDialog, tea.Cmd) {
 			return d, nil
 
 		case "shift+tab", "up":
+			if cur == focusConductor {
+				if d.conductorCursor > 0 {
+					d.conductorCursor--
+					return d, nil
+				}
+			}
 			if cur == focusMultiRepo && d.multiRepoEnabled && !d.multiRepoEditing {
 				if d.multiRepoPathCursor > 0 {
 					d.multiRepoPathCursor--
@@ -1197,13 +1385,16 @@ func (d *NewDialog) Update(msg tea.Msg) (*NewDialog, tea.Cmd) {
 				d.filterPathSuggestions()
 			}
 		}
-	case focusWorktree, focusSandbox, focusInherited:
-		// Checkbox/toggle rows — no text input to update.
+	case focusWorktree, focusSandbox, focusConductor, focusInherited:
+		// Checkbox/toggle rows and conductor dropdown — no text input to update.
 	case focusBranch:
 		oldBranch := d.branchInput.Value()
 		d.branchInput, cmd = d.branchInput.Update(msg)
 		if d.branchInput.Value() != oldBranch {
 			d.branchAutoSet = false
+			if d.branchPicker != nil && d.branchPicker.IsVisible() {
+				d.branchPicker.SetQuery(d.branchInput.Value())
+			}
 		}
 	case focusOptions:
 		if d.toolOptions != nil {
@@ -1339,7 +1530,7 @@ func (d *NewDialog) View() string {
 	if cur == focusCommand {
 		multiRepoLabel = "Multi-repo mode (m)"
 	}
-	content.WriteString(renderCheckboxLine(multiRepoLabel, d.multiRepoEnabled, cur == focusMultiRepo && !d.multiRepoEnabled))
+	content.WriteString(renderCheckboxLine(multiRepoLabel, d.multiRepoEnabled, cur == focusMultiRepo))
 
 	if d.multiRepoEnabled {
 		// Multi-repo path list replaces the single path field.
@@ -1379,62 +1570,8 @@ func (d *NewDialog) View() string {
 			}
 			content.WriteString(dimStyle.Render("    [a: add, d: remove, enter: edit, ↑↓: navigate]"))
 			content.WriteString("\n")
-			// Show path suggestions dropdown when editing a multi-repo path
-			if d.multiRepoEditing && len(d.pathSuggestions) > 0 {
-				suggestionStyle := lipgloss.NewStyle().
-					Foreground(ColorComment)
-				selectedStyle := lipgloss.NewStyle().
-					Foreground(ColorCyan).
-					Bold(true)
-
-				maxShow := 5
-				total := len(d.pathSuggestions)
-				startIdx := 0
-				endIdx := total
-				if total > maxShow {
-					startIdx = d.pathSuggestionCursor - maxShow/2
-					if startIdx < 0 {
-						startIdx = 0
-					}
-					endIdx = startIdx + maxShow
-					if endIdx > total {
-						endIdx = total
-						startIdx = endIdx - maxShow
-					}
-				}
-
-				var headerText string
-				if len(d.pathSuggestions) < len(d.allPathSuggestions) {
-					headerText = fmt.Sprintf("─ recent paths (%d/%d matching, ^N/^P: cycle, Tab: accept) ─",
-						len(d.pathSuggestions), len(d.allPathSuggestions))
-				} else {
-					headerText = "─ recent paths (^N/^P: cycle, Tab: accept) ─"
-				}
-				content.WriteString("  ")
-				content.WriteString(lipgloss.NewStyle().Foreground(ColorComment).Render(headerText))
-				content.WriteString("\n")
-
-				if startIdx > 0 {
-					content.WriteString(suggestionStyle.Render(fmt.Sprintf("    ↑ %d more above", startIdx)))
-					content.WriteString("\n")
-				}
-
-				for i := startIdx; i < endIdx; i++ {
-					style := suggestionStyle
-					prefix := "    "
-					if i == d.pathSuggestionCursor {
-						style = selectedStyle
-						prefix = "  ▶ "
-					}
-					content.WriteString(style.Render(prefix + d.pathSuggestions[i]))
-					content.WriteString("\n")
-				}
-
-				if endIdx < total {
-					content.WriteString(suggestionStyle.Render(fmt.Sprintf("    ↓ %d more below", total-endIdx)))
-					content.WriteString("\n")
-				}
-			}
+			// Record line offset for suggestions overlay (rendered after dialog is placed).
+			d.suggestionsLineOffset = strings.Count(content.String(), "\n")
 		} else {
 			for i, p := range d.multiRepoPaths {
 				display := p
@@ -1464,62 +1601,8 @@ func (d *NewDialog) View() string {
 		}
 		content.WriteString("\n")
 
-		// Show path suggestions dropdown when path field is focused
-		if cur == focusPath && len(d.pathSuggestions) > 0 {
-			suggestionStyle := lipgloss.NewStyle().
-				Foreground(ColorComment)
-			selectedStyle := lipgloss.NewStyle().
-				Foreground(ColorCyan).
-				Bold(true)
-
-			maxShow := 5
-			total := len(d.pathSuggestions)
-			startIdx := 0
-			endIdx := total
-			if total > maxShow {
-				startIdx = d.pathSuggestionCursor - maxShow/2
-				if startIdx < 0 {
-					startIdx = 0
-				}
-				endIdx = startIdx + maxShow
-				if endIdx > total {
-					endIdx = total
-					startIdx = endIdx - maxShow
-				}
-			}
-
-			var headerText string
-			if len(d.pathSuggestions) < len(d.allPathSuggestions) {
-				headerText = fmt.Sprintf("─ recent paths (%d/%d matching, ^N/^P: cycle, Tab: accept) ─",
-					len(d.pathSuggestions), len(d.allPathSuggestions))
-			} else {
-				headerText = "─ recent paths (^N/^P: cycle, Tab: accept) ─"
-			}
-			content.WriteString("  ")
-			content.WriteString(lipgloss.NewStyle().Foreground(ColorComment).Render(headerText))
-			content.WriteString("\n")
-
-			if startIdx > 0 {
-				content.WriteString(suggestionStyle.Render(fmt.Sprintf("    ↑ %d more above", startIdx)))
-				content.WriteString("\n")
-			}
-
-			for i := startIdx; i < endIdx; i++ {
-				style := suggestionStyle
-				prefix := "    "
-				if i == d.pathSuggestionCursor {
-					style = selectedStyle
-					prefix = "  ▶ "
-				}
-				content.WriteString(style.Render(prefix + d.pathSuggestions[i]))
-				content.WriteString("\n")
-			}
-
-			if endIdx < total {
-				content.WriteString(suggestionStyle.Render(fmt.Sprintf("    ↓ %d more below", total-endIdx)))
-				content.WriteString("\n")
-			}
-		}
+		// Record line offset for suggestions overlay (rendered after dialog is placed).
+		d.suggestionsLineOffset = strings.Count(content.String(), "\n")
 	}
 	content.WriteString("\n")
 
@@ -1628,6 +1711,49 @@ func (d *NewDialog) View() string {
 		content.WriteString("\n")
 	}
 
+	// Conducting parent selector (only visible when conductor sessions exist).
+	if len(d.conductorSessions) > 0 {
+		focused := cur == focusConductor
+		if focused {
+			content.WriteString(activeLabelStyle.Render("▶ Conducting parent:"))
+		} else {
+			content.WriteString(labelStyle.Render("  Conducting parent:"))
+		}
+		content.WriteString("\n")
+
+		selectedStyle := lipgloss.NewStyle().Foreground(ColorCyan).Bold(true)
+		itemStyle := lipgloss.NewStyle().Foreground(ColorComment)
+
+		// Build item list: "None" + one entry per conductor session.
+		type conductorItem struct {
+			label string
+			idx   int // 0 = None, 1..N = session index
+		}
+		items := make([]conductorItem, 0, len(d.conductorSessions)+1)
+		items = append(items, conductorItem{label: "None", idx: 0})
+		for i, inst := range d.conductorSessions {
+			name := strings.TrimPrefix(inst.Title, "conductor-")
+			shortPath := inst.ProjectPath
+			if home, err := os.UserHomeDir(); err == nil {
+				shortPath = strings.Replace(shortPath, home, "~", 1)
+			}
+			label := name
+			if shortPath != "" {
+				label = fmt.Sprintf("%s  (%s)", name, shortPath)
+			}
+			items = append(items, conductorItem{label: label, idx: i + 1})
+		}
+
+		for _, item := range items {
+			if item.idx == d.conductorCursor {
+				content.WriteString(selectedStyle.Render("  ▶ " + item.label))
+			} else {
+				content.WriteString(itemStyle.Render("    " + item.label))
+			}
+			content.WriteString("\n")
+		}
+	}
+
 	// Branch input (only visible when worktree is enabled).
 	if d.worktreeEnabled {
 		content.WriteString("\n")
@@ -1640,6 +1766,11 @@ func (d *NewDialog) View() string {
 		content.WriteString("  ")
 		content.WriteString(d.branchInput.View())
 		content.WriteString("\n")
+		if d.branchPicker != nil && d.branchPicker.IsVisible() {
+			content.WriteString("  ")
+			content.WriteString(strings.ReplaceAll(d.branchPicker.View(), "\n", "\n  "))
+			content.WriteString("\n")
+		}
 	}
 
 	// Tool options panel
@@ -1672,6 +1803,12 @@ func (d *NewDialog) View() string {
 		} else {
 			helpText = "Tab autocomplete │ ^N/^P recent │ ↑↓ navigate │ Enter create │ Esc cancel"
 		}
+	} else if cur == focusBranch {
+		if d.branchPicker != nil && d.branchPicker.IsVisible() {
+			helpText = "Type filter │ ↑↓ navigate │ Enter select │ Esc close"
+		} else {
+			helpText = "^F branch search │ Tab next │ Enter create │ Esc cancel"
+		}
 	} else if cur == focusCommand {
 		selectedCmd := d.GetSelectedCommand()
 		if selectedCmd == "gemini" || selectedCmd == "codex" {
@@ -1679,6 +1816,8 @@ func (d *NewDialog) View() string {
 		} else {
 			helpText = "←→ command │ w worktree │ s sandbox │ Tab next │ Enter create │ Esc cancel"
 		}
+	} else if cur == focusConductor {
+		helpText = "↑↓ select parent │ Tab next │ Enter create │ Esc cancel"
 	} else if cur == focusWorktree || cur == focusSandbox {
 		helpText = "Space toggle │ ↑↓ navigate │ Enter create │ Esc cancel"
 	} else if cur == focusInherited {
@@ -1692,11 +1831,139 @@ func (d *NewDialog) View() string {
 	dialog := dialogStyle.Render(content.String())
 
 	// Center the dialog
-	return lipgloss.Place(
+	placed := lipgloss.Place(
 		d.width,
 		d.height,
 		lipgloss.Center,
 		lipgloss.Center,
 		dialog,
 	)
+
+	// Overlay path suggestions dropdown if visible.
+	// Rendered as a floating bordered menu over the placed dialog so it
+	// doesn't shift the layout when it appears/disappears.
+	if suggestionsOverlay := d.renderSuggestionsDropdown(); suggestionsOverlay != "" {
+		// Find where to place the overlay:
+		// The dialog is centered, so we need the dialog's top-left position
+		// within the placed output, plus the line offset to the path input.
+		dialogHeight := lipgloss.Height(dialog)
+		dialogWidth := lipgloss.Width(dialog)
+		topRow := (d.height - dialogHeight) / 2
+		leftCol := (d.width - dialogWidth) / 2
+
+		// suggestionsLineOffset is the content line where the dropdown should appear.
+		// Add border (1) + top padding (2) to get the actual row within the dialog box.
+		overlayRow := topRow + 1 + 2 + d.suggestionsLineOffset
+		// Align with the path input: border (1) + padding (4)
+		overlayCol := leftCol + 1 + 4
+
+		placed = overlayDropdown(placed, suggestionsOverlay, overlayRow, overlayCol)
+	}
+
+	return placed
+}
+
+// renderSuggestionsDropdown renders the path suggestions as a standalone block
+// for overlay positioning. Returns empty string if no suggestions to show.
+// dropdownMenuBg returns a slightly elevated background color for floating menus.
+// Dark theme: one step brighter than Surface. Light theme: one step darker.
+func dropdownMenuBg() lipgloss.Color {
+	if currentTheme == ThemeLight {
+		return lipgloss.Color("#dcdde2")
+	}
+	return lipgloss.Color("#292e42")
+}
+
+func (d *NewDialog) renderSuggestionsDropdown() string {
+	cur := d.currentTarget()
+
+	// Single-path mode: show when path focused
+	showSingle := !d.multiRepoEnabled && cur == focusPath && len(d.pathSuggestions) > 0
+	// Multi-repo mode: show when editing a path entry
+	showMulti := d.multiRepoEnabled && cur == focusMultiRepo && d.multiRepoEditing && len(d.pathSuggestions) > 0
+
+	if !showSingle && !showMulti {
+		return ""
+	}
+
+	menuBg := dropdownMenuBg()
+	suggestionStyle := lipgloss.NewStyle().Foreground(ColorComment).Background(menuBg)
+	selectedStyle := lipgloss.NewStyle().Foreground(ColorCyan).Bold(true).Background(menuBg)
+
+	maxShow := 5
+	total := len(d.pathSuggestions)
+	startIdx := 0
+	endIdx := total
+	if total > maxShow {
+		startIdx = d.pathSuggestionCursor - maxShow/2
+		if startIdx < 0 {
+			startIdx = 0
+		}
+		endIdx = startIdx + maxShow
+		if endIdx > total {
+			endIdx = total
+			startIdx = endIdx - maxShow
+		}
+	}
+
+	var b strings.Builder
+
+	if startIdx > 0 {
+		b.WriteString(suggestionStyle.Render(fmt.Sprintf("  ↑ %d more above", startIdx)))
+		b.WriteString("\n")
+	}
+
+	for i := startIdx; i < endIdx; i++ {
+		if i > startIdx {
+			b.WriteString("\n")
+		}
+		style := suggestionStyle
+		prefix := "  "
+		if i == d.pathSuggestionCursor {
+			style = selectedStyle
+			prefix = "▶ "
+		}
+		b.WriteString(style.Render(prefix + d.pathSuggestions[i]))
+	}
+
+	if endIdx < total {
+		b.WriteString("\n")
+		b.WriteString(suggestionStyle.Render(fmt.Sprintf("  ↓ %d more below", total-endIdx)))
+	}
+
+	// Footer with keybinding hints
+	var footerText string
+	if len(d.pathSuggestions) < len(d.allPathSuggestions) {
+		footerText = fmt.Sprintf(" %d/%d matching │ ^N/^P cycle │ Tab accept ",
+			len(d.pathSuggestions), len(d.allPathSuggestions))
+	} else {
+		footerText = " ^N/^P cycle │ Tab accept "
+	}
+	b.WriteString("\n")
+	b.WriteString(lipgloss.NewStyle().Foreground(ColorBorder).Background(menuBg).Render(footerText))
+
+	// Wrap in a bordered menu box
+	menuStyle := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(ColorBorder).
+		Background(menuBg).
+		Padding(0, 1)
+
+	return menuStyle.Render(b.String())
+}
+
+// GetParentSessionID returns the selected conducting parent session ID, or "" for None.
+func (d *NewDialog) GetParentSessionID() string {
+	if d.conductorCursor == 0 || len(d.conductorSessions) == 0 {
+		return ""
+	}
+	return d.conductorSessions[d.conductorCursor-1].ID
+}
+
+// GetParentProjectPath returns the selected conductor's project path, or "".
+func (d *NewDialog) GetParentProjectPath() string {
+	if d.conductorCursor == 0 || len(d.conductorSessions) == 0 {
+		return ""
+	}
+	return d.conductorSessions[d.conductorCursor-1].ProjectPath
 }
