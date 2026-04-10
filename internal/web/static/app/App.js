@@ -4,6 +4,7 @@
 import { html } from 'htm/preact'
 import { useEffect } from 'preact/hooks'
 import { AppShell } from './AppShell.js'
+import { KeyboardShortcutsOverlay } from './KeyboardShortcutsOverlay.js'
 import { selectedIdSignal } from './state.js'
 
 export function App() {
@@ -22,7 +23,10 @@ export function App() {
           return
         }
       }
-      // Don't clear selection on popstate to root: user may still want it
+      // Clearing on popstate to / lets the empty dashboard render when the user navigates back.
+      if (path === '/') {
+        selectedIdSignal.value = null
+      }
     }
     window.addEventListener('popstate', onPopState)
     return () => window.removeEventListener('popstate', onPopState)
@@ -38,5 +42,8 @@ export function App() {
     }
   }, [selectedIdSignal.value])
 
-  return html`<${AppShell} />`
+  return html`
+    <${AppShell} />
+    <${KeyboardShortcutsOverlay} />
+  `
 }
