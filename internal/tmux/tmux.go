@@ -19,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+	"al.essio.dev/pkg/shellescape"
 	"golang.org/x/sync/singleflight"
 
 	"github.com/BurntSushi/toml"
@@ -33,6 +34,13 @@ var (
 	mcpLog     = logging.ForComponent(logging.CompMCP)
 	perfLog    = logging.ForComponent(logging.CompPerf)
 )
+
+// execCommand is a swappable seam that defaults to exec.Command. Tests
+// override it to inject failure into specific launcher names without
+// mutating host PATH or systemd state. Production callers always read
+// the default. See TestStartCommandSpec_FallsBackToDirect in
+// tmux_fallback_test.go for the contract.
+var execCommand = exec.Command
 
 type tmuxThemeStyle struct {
 	windowStyle       string
@@ -790,28 +798,39 @@ func sanitizeSystemdUnitComponent(raw string) string {
 }
 
 // bashCWrap returns the given command wrapped in `bash -c '…'` with
-// single quotes safely escaped via the POSIX `'\''` pattern. The result
+// single quotes safely escaped using the POSIX shell quote-break pattern. The result
 // is a single shell word that can be passed to any `sh -c` invocation
 // (e.g. tmux's default shell-command delivery) and will always be
 // executed under bash, giving consistent semantics regardless of the
 // user's login shell.
 func bashCWrap(command string) string {
 	escaped := strings.ReplaceAll(command, `'`, `'\''`)
-	return "bash -c '" + escaped + "'"
+	return bashCPrefix + escaped + "'"
 }
+
+func isBashCWrapped(command string) bool {
+	trimmed := strings.TrimSpace(command)
+	return strings.HasPrefix(trimmed, bashCPrefix)
+}
+
+const (
+	bashBinary  = "bash"
+	bashCPrefix = "bash -c '"
+)
 
 func (s *Session) startCommandSpec(workDir, command string) (string, []string) {
 	startWithInitialProcess := command != "" && s.RunCommandAsInitialProcess
 	args := []string{"new-session", "-d", "-s", s.Name, "-c", workDir}
 	if startWithInitialProcess {
-		// Always wrap the command in `bash -c '…'` so it runs under bash
-		// regardless of the user's default-shell. This guarantees fish users
-		// can launch sessions whose commands use bash syntax (inline env
-		// vars, `&&`, `$(...)`, etc.) — previously the wrapping was gated
-		// on `$(` or `session_id=` appearing in the command, which missed
-		// simple compound commands like `export COLORFGBG='0;15' && claude …`
-		// and caused those sessions to die immediately on fish (#526).
-		args = append(args, bashCWrap(command))
+		// Keep commands under bash for fish/zsh compatibility, but avoid
+		// double-wrapping payloads that are already `bash -c '…'`.
+		// wrapIgnoreSuspend() already returns that shape; re-wrapping it can
+		// corrupt quoting for nested payloads like docker exec bash -c ... .
+		if isBashCWrapped(command) {
+			args = append(args, command)
+		} else {
+			args = append(args, bashCWrap(command))
+		}
 	}
 
 	if !s.LaunchInUserScope {
@@ -822,6 +841,28 @@ func (s *Session) startCommandSpec(workDir, command string) (string, []string) {
 	scopeArgs := []string{"--user", "--scope", "--quiet", "--collect", "--unit", unitName, "tmux"}
 	scopeArgs = append(scopeArgs, args...)
 	return "systemd-run", scopeArgs
+}
+
+// stripSystemdRunPrefix removes the leading systemd-run --user --scope wrap
+// from args produced by startCommandSpec when LaunchInUserScope is true,
+// returning the bare tmux args. Returns args unchanged if the shape doesn't
+// match — defensive against future startCommandSpec changes.
+//
+// Expected shape (matches startCommandSpec above):
+//
+//	[0]   "--user"
+//	[1]   "--scope"
+//	[2]   "--quiet"
+//	[3]   "--collect"
+//	[4]   "--unit"
+//	[5]   "<unit name>"
+//	[6]   "tmux"
+//	[7..] tmux args
+func stripSystemdRunPrefix(args []string) []string {
+	if len(args) >= 7 && args[6] == "tmux" {
+		return args[7:]
+	}
+	return args
 }
 
 // invalidateCache clears the CapturePane cache.
@@ -1335,7 +1376,7 @@ func (s *Session) Start(command string) error {
 	// process. This avoids the slow shell-wait-sendkeys path (~2s pane ready poll).
 	// Commands containing bash-specific syntax are wrapped for fish compatibility.
 	launcher, args := s.startCommandSpec(workDir, command)
-	cmd := exec.Command(launcher, args...)
+	cmd := execCommand(launcher, args...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		if launcher == "tmux" {
@@ -1348,14 +1389,32 @@ func (s *Session) Start(command string) error {
 				statusLog.Warn("tmux_start_retry_after_socket_recovery",
 					slog.String("session", s.Name),
 				)
-				output, err = exec.Command(launcher, args...).CombinedOutput()
+				output, err = execCommand(launcher, args...).CombinedOutput()
 			}
 		}
 	}
-	if err != nil {
-		if launcher == "systemd-run" {
-			return fmt.Errorf("failed to create tmux session via systemd user scope: %w (output: %s)", err, string(output))
+	if err != nil && launcher == "systemd-run" {
+		// systemd-run detection said yes but invocation failed (e.g. dbus
+		// down, lingering disabled, broken user manager). Log a structured
+		// warning and retry ONCE with the direct tmux launcher so session
+		// creation is never blocked. If the direct retry also fails, wrap
+		// both diagnostics in the returned error so operators can see why
+		// isolation was attempted and how the fallback broke.
+		statusLog.Warn("tmux_systemd_run_fallback",
+			slog.String("session", s.Name),
+			slog.String("error", err.Error()),
+			slog.String("output", string(output)))
+		directArgs := stripSystemdRunPrefix(args)
+		retryOutput, retryErr := execCommand("tmux", directArgs...).CombinedOutput()
+		if retryErr == nil {
+			output = retryOutput
+			err = nil
+		} else {
+			return fmt.Errorf("failed to create tmux session: systemd-run path: %w (output: %s); direct retry: %v (output: %s)",
+				err, string(output), retryErr, string(retryOutput))
 		}
+	}
+	if err != nil {
 		return fmt.Errorf("failed to create tmux session: %w (output: %s)", err, string(output))
 	}
 
@@ -1818,25 +1877,11 @@ func (s *Session) RespawnPane(command string) error {
 	target := s.Name + ":" // Append colon to target the active pane
 	args := []string{"respawn-pane", "-k", "-t", target}
 	if command != "" {
-		// Wrap command in interactive shell to ensure aliases and shell configs are available
-		// tmux respawn-pane runs commands directly without loading ~/.bashrc or ~/.zshrc,
-		// so shell aliases (like 'cdw' for claude) won't work without this wrapper
-		shell := os.Getenv("SHELL")
-		if shell == "" {
-			shell = "/bin/bash"
+		wrapped, wrapErr := wrapRespawnCommand(command)
+		if wrapErr != nil {
+			return wrapErr
 		}
-
-		// IMPORTANT: Commands containing bash-specific syntax (like `session_id=$(...)`)
-		// must use bash, regardless of user's shell. This fixes fish shell compatibility (#47).
-		// Fish uses different syntax: `set var (...)` instead of `var=$(...)`.
-		// We detect bash-specific constructs and force bash for those commands.
-		if strings.Contains(command, "$(") || strings.Contains(command, "session_id=") {
-			shell = "/bin/bash"
-		}
-
-		// Use -i for interactive (loads aliases) and -c for command
-		wrappedCmd := fmt.Sprintf("%s -ic %q", shell, command)
-		args = append(args, wrappedCmd)
+		args = append(args, wrapped)
 	}
 
 	mcpLog.Debug("respawn_pane_executing", slog.Any("args", args))
@@ -1879,6 +1924,22 @@ func (s *Session) RespawnPane(command string) error {
 	s.mu.Unlock()
 
 	return nil
+}
+
+func wrapRespawnCommand(command string) (string, error) {
+	return wrapRespawnCommandWithResolver(command, exec.LookPath)
+}
+
+func wrapRespawnCommandWithResolver(command string, lookPath func(string) (string, error)) (string, error) {
+	bashPath, err := lookPath(bashBinary)
+	if err != nil {
+		return "", fmt.Errorf("bash not found in PATH: %w", err)
+	}
+	return buildBashLCCommand(bashPath, command), nil
+}
+
+func buildBashLCCommand(bashPath, command string) string {
+	return fmt.Sprintf("%s -lc %s", bashPath, shellescape.Quote(command))
 }
 
 // GetWindowActivity returns Unix timestamp of last tmux window activity

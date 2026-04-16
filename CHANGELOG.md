@@ -5,7 +5,88 @@ All notable changes to Agent Deck will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.5.4] - 2026-04-16
+
+### Added
+- Per-group Claude config overrides (`[groups."<name>".claude]`). (Base implementation by @alec-pinson in [PR #578](https://github.com/asheshgoplani/agent-deck/pull/578))
+- In-product feedback feature: CLI `agent-deck feedback`, TUI `Ctrl+E`, three-tier submit (GraphQL, clipboard, browser).
+
+### Fixed
+- Session persistence: tmux servers now survive SSH logout on Linux+systemd hosts via `launch_in_user_scope` default (v1.5.2 hotfix). ([docs/SESSION-PERSISTENCE-SPEC.md](docs/SESSION-PERSISTENCE-SPEC.md))
+- Custom-command Claude sessions (conductors) now resume from latest JSONL on restart.
+
+## [1.6.0] - 2026-04-16
+
+v1.6.0 is the Watcher Framework milestone. Event-driven automation via five adapter types (webhook, ntfy, GitHub, Slack, Gmail), a self-improving routing engine, health alerts bridge, and conductor-style on-disk layout.
+
+### Added
+- **Watcher engine** — event-driven automation framework with five adapters (webhook, ntfy, GitHub, Slack, Gmail), SQLite-backed dedup, HMAC-SHA256 verification, and self-improving routing via triage sessions. See `internal/watcher/`.
+- **Watcher health alerts bridge** — opt-in `[watcher.alerts]` config block wires engine health state to Telegram/Slack/Discord with per-(watcher x trigger) 15-minute debounce. See `internal/watcher/health_bridge.go`. Closes REQ-WF-3.
+- **Watcher folder hierarchy** — on-disk state reorganized to `~/.agent-deck/watcher/` (singular) mirroring the conductor folder pattern. Shared files (CLAUDE.md, POLICY.md, LEARNINGS.md, clients.json) at root, per-watcher subdirs (meta.json, state.json, task-log.md). Closes REQ-WF-6.
+- **Per-watcher health fields** — `agent-deck watcher list --json` now exposes `last_event_ts`, `error_count`, `health_status` per watcher.
+- **Watcher CLI** — 8 subcommands: create, start, stop, status, list, logs, import, install-skill.
+
+### Changed
+- **BREAKING: Watcher data directory renamed** — `~/.agent-deck/watchers/` is now `~/.agent-deck/watcher/` (singular). A compatibility symlink `watchers -> watcher/` is created automatically on first boot so existing scripts continue to work. The symlink will be removed in v1.7.0. Update any hardcoded paths.
+
+## [1.5.1] - 2026-04-13
+
+Patch release fixing 7 bugs reported by users and merging 3 community PRs.
+
+### Fixed
+- Clear host terminal scrollback on session detach. ([#419](https://github.com/asheshgoplani/agent-deck/issues/419))
+- Web terminal resize now uses pty.Setsize + tmux resize-window for correct dimensions. ([#568](https://github.com/asheshgoplani/agent-deck/pull/568))
+- Narrow controlSeqTimeout to ESC-only and ignore SIGINT during attach, fixing Ctrl+C forwarding. ([#571](https://github.com/asheshgoplani/agent-deck/pull/571))
+- Allow underscore character in TUI dialog text inputs. ([#573](https://github.com/asheshgoplani/agent-deck/pull/573))
+- Allow Esc to dismiss setup wizard on welcome step. ([#564](https://github.com/asheshgoplani/agent-deck/issues/564), [#566](https://github.com/asheshgoplani/agent-deck/pull/566))
+- Initialize branchAutoSet when worktree default_enabled is true. ([#561](https://github.com/asheshgoplani/agent-deck/issues/561), [#562](https://github.com/asheshgoplani/agent-deck/pull/562))
+- Harden sandbox runtime probes and respawn bash wrapping. ([#575](https://github.com/asheshgoplani/agent-deck/pull/575))
+- Preserve existing OpenCode session binding on restart. ([#576](https://github.com/asheshgoplani/agent-deck/pull/576))
+
+### Added
+- Arrow-key navigation for confirm dialogs. ([#557](https://github.com/asheshgoplani/agent-deck/pull/557))
+
+## [1.5.0] - 2026-04-10
+
+v1.5.0 is the Premium Web App milestone. The web interface gets P0/P1 bug fixes, performance optimization (first-load wire size from 668 KB to under 150 KB gzipped), UX polish, and automated visual regression testing.
+
+### Fixed
+- [Phase 5, v1.4.1] Six critical regressions: Shift+letter key drops (CSI u), tmux scrollback clearing, mousewheel [0/0], conductor heartbeat on Linux, tmux PATH detection, bash -c quoting. (REG-01..06)
+- [Phase 6] Mobile hamburger menu clickable at all viewports <=768px with systematic 7-level z-index scale. (WEB-P0-1)
+- [Phase 6] Profile switcher: single profile shows read-only label; multi profile shows non-interactive list with help text for CLI switching. (WEB-P0-2)
+- [Phase 6] Session title truncation: action buttons use absolute positioning with hover-reveal, no longer reserving 90px of space. (WEB-P0-3)
+- [Phase 6] Write-protected mode: mutationsEnabled=false hides all write buttons; toast auto-dismisses at 5s with stack cap of 3 and history drawer for dismissed toasts. (WEB-P0-4, POL-7)
+- [Phase 7] Terminal panel fills container on attach, no empty gray space below terminal. (WEB-P1-1)
+- [Phase 7] Sidebar width fluid via clamp(260px, 22vw, 380px) on screens >=1280px. (WEB-P1-2)
+- [Phase 7] Sidebar row density increased to 40px per row (from ~52px); 20+ sessions visible at 1080p. (WEB-P1-3)
+- [Phase 7] Empty-state dashboard uses centered card layout with max-width 1024px. (WEB-P1-4)
+- [Phase 7] Mobile topbar overflow menu for controls on viewports <600px. (WEB-P1-5)
+
+### Performance
+- [Phase 8] gzip compression on static file handler via klauspost/compress/gzhttp; ~518 KB saved per cold load. (PERF-A)
+- [Phase 8] Chart.js script tag deferred to unblock HTML parser. (PERF-B)
+- [Phase 8] xterm canvas addon removed (dead code); fallback chain is now WebGL then DOM only. (PERF-C)
+- [Phase 8] WebGL addon lazy-loaded on desktop only; mobile skips import entirely, saving 126 KB. (PERF-D)
+- [Phase 8] Event listener leak fixed via AbortController; listener count at rest drops from 290 to ~50. (PERF-E)
+- [Phase 8] Search input debounced at 250ms; typing lag drops from 33ms to <8ms. (PERF-F)
+- [Phase 8] SessionRow memoized; group collapse no longer rerenders 152 unrelated components. (PERF-G)
+- [Phase 8] ES modules bundled via esbuild with code splitting and cache-busted filenames. (PERF-H)
+- [Phase 8] Cost batch endpoint converted from GET to POST, preventing 414 URI Too Long. (PERF-I)
+- [Phase 8] Immutable cache headers on hashed assets (1-year max-age). (PERF-J)
+- [Phase 8] SessionList virtualized for 50+ sessions via hand-rolled useVirtualList hook. (PERF-K)
+
+### Added
+- [Phase 9] Skeleton loading state with CSS-only animate-pulse during initial sidebar render. (POL-1)
+- [Phase 9] Action button 120ms opacity fade transitions with prefers-reduced-motion support. (POL-2)
+- [Phase 9] Profile dropdown filters out _* test profiles, scrollable at 300px max-height. (POL-3)
+- [Phase 9] Group divider gap reduced from 48px to 12-16px for tighter sidebar density. (POL-4)
+- [Phase 9] Cost dashboard uses locale-aware currency formatting via Intl.NumberFormat. (POL-5)
+- [Phase 9] Light theme re-audited across all surfaces for contrast and consistency. (POL-6)
+- [Phase 10] Playwright visual regression tests with committed baselines; CI blocks merge on >0.1% pixel diff. (TEST-A)
+- [Phase 10] Lighthouse CI on every PR with byte-weight hard gates and soft performance thresholds. (TEST-B)
+- [Phase 10] Functional E2E tests for session lifecycle and group CRUD. (TEST-C)
+- [Phase 10] Mobile E2E at 3 viewports: iPhone SE, iPhone 14, iPad. (TEST-D)
+- [Phase 10] Weekly regression alerting workflow: runs visual + Lighthouse, posts issue on failure. (TEST-E)
 
 ## [1.4.2] - 2026-04-09
 

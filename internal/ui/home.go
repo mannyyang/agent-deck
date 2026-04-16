@@ -28,6 +28,7 @@ import (
 
 	"github.com/asheshgoplani/agent-deck/internal/clipboard"
 	"github.com/asheshgoplani/agent-deck/internal/costs"
+	"github.com/asheshgoplani/agent-deck/internal/feedback"
 	"github.com/asheshgoplani/agent-deck/internal/git"
 	"github.com/asheshgoplani/agent-deck/internal/logging"
 	"github.com/asheshgoplani/agent-deck/internal/session"
@@ -35,6 +36,7 @@ import (
 	"github.com/asheshgoplani/agent-deck/internal/sysinfo"
 	"github.com/asheshgoplani/agent-deck/internal/tmux"
 	"github.com/asheshgoplani/agent-deck/internal/update"
+	"github.com/asheshgoplani/agent-deck/internal/watcher"
 	"github.com/asheshgoplani/agent-deck/internal/web"
 )
 
@@ -55,16 +57,6 @@ type CreatingSession struct {
 	Tool      string
 	GroupPath string
 	StartTime time.Time
-}
-
-// isCreatingPlaceholder returns true if the currently selected flat item is a
-// worktree-creation placeholder (not a real session). Actions like attach,
-// delete, fork, and restart must be suppressed for these items.
-func (h *Home) isCreatingPlaceholder() bool {
-	if h.cursor < 0 || h.cursor >= len(h.flatItems) {
-		return false
-	}
-	return h.flatItems[h.cursor].CreatingID != ""
 }
 
 // Structured loggers for UI components
@@ -210,6 +202,11 @@ type Home struct {
 	geminiModelDialog    *GeminiModelDialog    // For selecting Gemini model
 	sessionPickerDialog  *SessionPickerDialog  // For sending output to another session
 	worktreeFinishDialog *WorktreeFinishDialog // For finishing worktree sessions (merge + cleanup)
+	feedbackDialog       *FeedbackDialog       // For in-app feedback popup (Phase 2)
+	feedbackState        *feedback.State       // Loaded at first show, avoids repeated disk I/O
+	feedbackSender       *feedback.Sender      // Sender constructed once in NewHome (Phase 3, per D-05)
+	watcherPanel         *WatcherPanel         // For showing watcher status and events
+	watcherEngine        *watcher.Engine       // nil until Init (D-07: lifecycle tied to TUI startup)
 
 	// Configurable hotkeys
 	hotkeys        map[string]string // action -> configured key
@@ -627,6 +624,12 @@ type worktreeFinishResultMsg struct {
 	err          error
 }
 
+// watcherEventMsg is produced by listenForWatcherEvent when a new event arrives from the engine.
+type watcherEventMsg struct{ event watcher.Event }
+
+// watcherHealthMsg is produced by listenForWatcherHealth when the engine emits a health state update.
+type watcherHealthMsg struct{ state watcher.HealthState }
+
 // statusUpdateRequest is sent to the background worker with current viewport info
 type statusUpdateRequest struct {
 	viewOffset    int      // Current scroll position
@@ -701,6 +704,9 @@ func NewHomeWithProfileAndMode(profile string) *Home {
 		geminiModelDialog:    NewGeminiModelDialog(),
 		sessionPickerDialog:  NewSessionPickerDialog(),
 		worktreeFinishDialog: NewWorktreeFinishDialog(),
+		feedbackDialog:       NewFeedbackDialog(),
+		feedbackSender:       feedback.NewSender(),
+		watcherPanel:         NewWatcherPanel(),
 		cursor:               0,
 		initialLoading:       true, // Show splash until sessions load
 		ctx:                  ctx,
@@ -1662,6 +1668,9 @@ func (h *Home) Init() tea.Cmd {
 		cmds = append(cmds, listenForThemeChange(h.themeWatcher))
 	}
 
+	// Start watcher engine (D-07: lifecycle tied to TUI startup)
+	cmds = append(cmds, h.startWatcherEngine())
+
 	return tea.Batch(cmds...)
 }
 
@@ -1699,6 +1708,30 @@ func listenForThemeChange(tw *ThemeWatcher) tea.Cmd {
 	}
 }
 
+// listenForWatcherEvent waits for the next event from the engine's EventCh.
+// Must be re-issued after each event to keep listening (Bubble Tea cmd pattern).
+func listenForWatcherEvent(ch <-chan watcher.Event) tea.Cmd {
+	return func() tea.Msg {
+		evt, ok := <-ch
+		if !ok {
+			return nil
+		}
+		return watcherEventMsg{event: evt}
+	}
+}
+
+// listenForWatcherHealth waits for the next health state from the engine's HealthCh.
+// Must be re-issued after each state to keep listening.
+func listenForWatcherHealth(ch <-chan watcher.HealthState) tea.Cmd {
+	return func() tea.Msg {
+		state, ok := <-ch
+		if !ok {
+			return nil
+		}
+		return watcherHealthMsg{state: state}
+	}
+}
+
 func (h *Home) stopThemeWatcher() {
 	if h.themeWatcher != nil {
 		h.themeWatcher.Close()
@@ -1713,6 +1746,81 @@ func (h *Home) startThemeWatcher() tea.Cmd {
 		return nil
 	}
 	return listenForThemeChange(h.themeWatcher)
+}
+
+// startWatcherEngine initialises and starts the watcher engine from statedb state.
+// Watchers marked status="running" are registered as adapters before Start() is called.
+// Returns a tea.Batch of channel listener commands, or nil if no watchers exist.
+func (h *Home) startWatcherEngine() tea.Cmd {
+	db := statedb.GetGlobal()
+	if db == nil {
+		return nil
+	}
+
+	rows, err := db.LoadWatchers()
+	if err != nil || len(rows) == 0 {
+		return nil
+	}
+
+	// Load user config for watcher settings.
+	cfg, _ := session.LoadUserConfig()
+	var watcherCfg session.WatcherSettings
+	if cfg != nil {
+		watcherCfg = cfg.Watcher
+	}
+
+	// Build engine config.
+	router, _ := watcher.LoadFromWatcherDir() // nil on error (no clients.json yet)
+	healthInterval := time.Duration(watcherCfg.GetHealthCheckIntervalSeconds()) * time.Second
+
+	engineCfg := watcher.EngineConfig{
+		DB:                  db,
+		Router:              router,
+		MaxEventsPerWatcher: watcherCfg.GetMaxEventsPerWatcher(),
+		HealthCheckInterval: healthInterval,
+	}
+	eng := watcher.NewEngine(engineCfg)
+
+	maxSilenceMinutes := watcherCfg.GetMaxSilenceMinutes()
+
+	// Register all running watchers as adapters.
+	for _, row := range rows {
+		if row.Status != "running" {
+			continue
+		}
+		var adapter watcher.WatcherAdapter
+		switch row.Type {
+		case "webhook":
+			adapter = &watcher.WebhookAdapter{}
+		case "ntfy":
+			adapter = &watcher.NtfyAdapter{}
+		case "slack":
+			adapter = &watcher.SlackAdapter{}
+		case "github":
+			adapter = &watcher.GitHubAdapter{}
+		default:
+			continue
+		}
+
+		adapterCfg := watcher.AdapterConfig{
+			Type:     row.Type,
+			Name:     row.Name,
+			Settings: map[string]string{},
+		}
+		eng.RegisterAdapter(row.ID, adapter, adapterCfg, maxSilenceMinutes)
+	}
+
+	if err := eng.Start(); err != nil {
+		uiLog.Warn("watcher_engine_start_failed", "error", err.Error())
+		return nil
+	}
+
+	h.watcherEngine = eng
+
+	return tea.Batch(
+		listenForWatcherEvent(eng.EventCh()),
+		listenForWatcherHealth(eng.HealthCh()),
+	)
 }
 
 // propagateThemeToSessions updates COLORFGBG in all running tmux sessions
@@ -2942,6 +3050,7 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		h.syncViewport() // Recalculate viewport when window size changes
 		h.setupWizard.SetSize(msg.Width, msg.Height)
 		h.settingsPanel.SetSize(msg.Width, msg.Height)
+		h.watcherPanel.SetSize(msg.Width, msg.Height)
 		h.geminiModelDialog.SetSize(msg.Width, msg.Height)
 		return h, nil
 
@@ -3017,6 +3126,18 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if h.pendingHooksPrompt && !h.setupWizard.IsVisible() {
 			h.confirmDialog.ShowInstallHooks()
 			h.confirmDialog.SetSize(h.width, h.height)
+		}
+
+		// Show feedback popup if user has a new version and hasn't rated yet (D-11/D-12)
+		if h.feedbackDialog != nil && !h.feedbackDialog.IsVisible() {
+			fbState, _ := feedback.LoadState()
+			if feedback.ShouldShow(fbState, Version) {
+				feedback.RecordShown(fbState)
+				_ = feedback.SaveState(fbState)
+				h.feedbackState = fbState
+				h.feedbackDialog.Show(Version, fbState, h.feedbackSender)
+				h.feedbackDialog.SetSize(h.width, h.height)
+			}
 		}
 
 		if msg.err != nil {
@@ -3613,6 +3734,17 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		h.maintenanceMsg = ""
 		return h, nil
 
+	case feedbackSentMsg:
+		// Send completed (best-effort). Dialog auto-dismisses via feedbackDismissMsg timer.
+		return h, nil
+
+	case feedbackDismissMsg:
+		// Auto-dismiss timer fired after stepSent confirmation.
+		if h.feedbackDialog != nil && h.feedbackDialog.IsVisible() {
+			h.feedbackDialog.Hide()
+		}
+		return h, nil
+
 	case modelsFetchedMsg:
 		if h.geminiModelDialog != nil && h.geminiModelDialog.IsVisible() {
 			h.geminiModelDialog.HandleModelsFetched(msg)
@@ -4002,6 +4134,39 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return h, nil
 
+	case watcherEventMsg:
+		// Refresh watcher panel data on new events and re-register listener.
+		h.refreshWatcherPanel()
+		if h.watcherEngine != nil {
+			return h, listenForWatcherEvent(h.watcherEngine.EventCh())
+		}
+		return h, nil
+
+	case watcherHealthMsg:
+		// Update health display and re-register listener.
+		h.refreshWatcherPanel()
+		// Dispatch health alert to conductor session on warning/error transitions (D-22, D-23).
+		if msg.state.Status == watcher.HealthStatusWarning || msg.state.Status == watcher.HealthStatusError {
+			h.dispatchHealthAlert(msg.state)
+		}
+		if h.watcherEngine != nil {
+			return h, listenForWatcherHealth(h.watcherEngine.HealthCh())
+		}
+		return h, nil
+
+	case WatcherActionMsg:
+		db := statedb.GetGlobal()
+		if db != nil {
+			switch msg.Action {
+			case "start":
+				_ = db.UpdateWatcherStatus(msg.WatcherID, "running")
+			case "stop":
+				_ = db.UpdateWatcherStatus(msg.WatcherID, "stopped")
+			}
+		}
+		h.refreshWatcherPanel()
+		return h, nil
+
 	case tickMsg:
 		var remoteFetchCmd tea.Cmd
 
@@ -4146,15 +4311,6 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return h, nil
 
 	case tea.KeyMsg:
-		// Temporary key diagnostic — writes directly to /tmp/agentdeck-keys.log
-		if f, err := os.OpenFile("/tmp/agentdeck-keys.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644); err == nil {
-			fmt.Fprintf(f, "key raw=%q type=%d runes=%q jump=%v wizard=%v settings=%v help=%v search=%v newdlg=%v costdash=%v notes=%v skill=%v\n",
-				msg.String(), msg.Type, string(msg.Runes),
-				h.jumpMode, h.setupWizard.IsVisible(), h.settingsPanel.IsVisible(),
-				h.helpOverlay.IsVisible(), h.search.IsVisible(), h.newDialog.IsVisible(),
-				h.showCostDashboard, h.notesEditing, h.skillDialog.IsVisible())
-			f.Close()
-		}
 		// Track user activity for adaptive status updates
 		h.lastUserInputTime = time.Now()
 
@@ -4167,8 +4323,8 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if h.setupWizard.IsVisible() {
 			var cmd tea.Cmd
 			h.setupWizard, cmd = h.setupWizard.Update(msg)
-			// Check if user pressed Enter on final step
-			if msg.String() == "enter" && h.setupWizard.IsComplete() {
+			// Check if wizard completed (Enter on final step, or Esc on welcome to use defaults)
+			if h.setupWizard.IsComplete() {
 				// Save config and close wizard
 				config := h.setupWizard.GetConfig()
 				if err := session.SaveUserConfig(config); err != nil {
@@ -4184,6 +4340,13 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					h.newDialog.SetDefaultTool(defaultTool)
 				}
 			}
+			return h, cmd
+		}
+
+		// Handle watcher panel (before settings panel)
+		if h.watcherPanel.IsVisible() {
+			var cmd tea.Cmd
+			h.watcherPanel, cmd = h.watcherPanel.Update(msg)
 			return h, cmd
 		}
 
@@ -4264,6 +4427,11 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if h.worktreeFinishDialog.IsVisible() {
 			return h.handleWorktreeFinishDialogKey(msg)
+		}
+		if h.feedbackDialog.IsVisible() {
+			d, cmd := h.feedbackDialog.Update(msg)
+			h.feedbackDialog = d
+			return h, cmd
 		}
 
 		if h.showCostDashboard {
@@ -4419,8 +4587,8 @@ func (h *Home) createSessionFromGlobalSearch(result *GlobalSearchResult) tea.Cmd
 		// This is critical for WSL and other environments where users have
 		// CLAUDE_CONFIG_DIR set in their .bashrc/.zshrc
 		var cmdBuilder strings.Builder
-		if session.IsClaudeConfigDirExplicit() {
-			configDir := session.GetClaudeConfigDir()
+		if session.IsClaudeConfigDirExplicitForGroup(inst.GroupPath) {
+			configDir := session.GetClaudeConfigDirForGroup(inst.GroupPath)
 			cmdBuilder.WriteString(fmt.Sprintf("CLAUDE_CONFIG_DIR=%s ", configDir))
 		}
 		cmdBuilder.WriteString("claude --resume ")
@@ -4750,6 +4918,7 @@ func (h *Home) handleJumpKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (h *Home) hasModalVisible() bool {
 	return h.initialLoading || h.isQuitting || h.notesEditing || h.jumpMode ||
 		h.setupWizard.IsVisible() || h.settingsPanel.IsVisible() ||
+		h.watcherPanel.IsVisible() || // hotkeyWatcherPanel overlay
 		h.helpOverlay.IsVisible() || h.search.IsVisible() || h.globalSearch.IsVisible() ||
 		h.newDialog.IsVisible() || h.groupDialog.IsVisible() || h.forkDialog.IsVisible() ||
 		h.confirmDialog.IsVisible() || h.mcpDialog.IsVisible() || h.skillDialog.IsVisible() ||
@@ -5409,6 +5578,13 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		h.settingsPanel.SetSize(h.width, h.height)
 		return h, nil
 
+	case "w":
+		// Open watcher panel
+		h.refreshWatcherPanel()
+		h.watcherPanel.Show()
+		h.watcherPanel.SetSize(h.width, h.height)
+		return h, nil
+
 	case "E":
 		// Exec an interactive shell inside the sandbox container.
 		if selected := h.getSelectedSession(); selected != nil && selected.IsSandboxed() &&
@@ -5764,6 +5940,32 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 		return h, cmd
 
+	case "ctrl+e":
+		// Open feedback dialog on demand (per D-11: bypasses ShouldShow -- user-initiated)
+		if h.feedbackDialog != nil {
+			st := h.feedbackState
+			if st == nil {
+				// Lazy-load state: h.feedbackState may be nil if the user already rated
+				// this version (auto-popup path skips loading state in that case).
+				// If load fails, create a safe default so Show() receives a non-nil pointer.
+				loaded, err := feedback.LoadState()
+				if err == nil {
+					h.feedbackState = loaded
+					st = loaded
+				} else {
+					uiLog.Warn("feedback: failed to load state for on-demand shortcut", "err", err)
+					h.feedbackState = &feedback.State{FeedbackEnabled: true, MaxShows: 3}
+					st = h.feedbackState
+				}
+			}
+			if h.feedbackSender == nil {
+				h.feedbackSender = feedback.NewSender()
+			}
+			h.feedbackDialog.Show(Version, st, h.feedbackSender)
+			h.feedbackDialog.SetSize(h.width, h.height)
+		}
+		return h, nil
+
 	case "1", "2", "3", "4", "5", "6", "7", "8", "9":
 		// Quick jump to Nth root group (1-indexed)
 		targetNum := int(key[0] - '0') // Convert "1" -> 1, "2" -> 2, etc.
@@ -5838,6 +6040,9 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 // handleConfirmDialogKey handles keys when confirmation dialog is visible
 func (h *Home) handleConfirmDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// Let the dialog handle arrow/tab navigation first.
+	h.confirmDialog.Update(msg)
+
 	switch h.confirmDialog.GetConfirmType() {
 	case ConfirmQuitWithPool:
 		switch msg.String() {
@@ -5849,6 +6054,12 @@ func (h *Home) handleConfirmDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			h.confirmDialog.Hide()
 			h.isQuitting = true
 			return h, h.performQuit(true)
+		case "enter":
+			// Activate focused button: 0=keep, 1=shutdown
+			shutdown := h.confirmDialog.GetFocusedButton() == 1
+			h.confirmDialog.Hide()
+			h.isQuitting = true
+			return h, h.performQuit(shutdown)
 		case "esc":
 			h.confirmDialog.Hide()
 			h.isQuitting = false
@@ -5859,29 +6070,13 @@ func (h *Home) handleConfirmDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case ConfirmCreateDirectory:
 		switch msg.String() {
 		case "y", "Y":
-			name, path, command, groupPath, pendingToolOpts, parentSessionID, parentProjectPath := h.confirmDialog.GetPendingSession()
-			h.confirmDialog.Hide()
-			if err := os.MkdirAll(path, 0o755); err != nil {
-				h.setError(fmt.Errorf("failed to create directory: %w", err))
-				return h, nil
+			return h, h.confirmCreateDirectory()
+		case "enter":
+			if h.confirmDialog.GetFocusedButton() == 0 {
+				return h, h.confirmCreateDirectory()
 			}
-			return h, h.createSessionInGroupWithWorktreeAndOptions(
-				name,
-				path,
-				command,
-				groupPath,
-				"",
-				"",
-				"",
-				false,
-				false,
-				pendingToolOpts,
-				false,
-				nil,
-				parentSessionID,
-				parentProjectPath,
-				"", // no placeholder — non-worktree sessions are fast
-			)
+			h.confirmDialog.Hide()
+			return h, nil
 		case "n", "N", "esc":
 			h.confirmDialog.Hide()
 			return h, nil
@@ -5891,88 +6086,138 @@ func (h *Home) handleConfirmDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case ConfirmInstallHooks:
 		switch msg.String() {
 		case "y", "Y":
-			h.confirmDialog.Hide()
-			h.pendingHooksPrompt = false
-			configDir := session.GetClaudeConfigDir()
-			if _, err := session.InjectClaudeHooks(configDir); err != nil {
-				uiLog.Warn("hook_install_failed", slog.String("error", err.Error()))
-			} else {
-				uiLog.Info("claude_hooks_installed", slog.String("config_dir", configDir))
+			return h, h.confirmInstallHooks()
+		case "enter":
+			if h.confirmDialog.GetFocusedButton() == 0 {
+				return h, h.confirmInstallHooks()
 			}
-			// Start the status file watcher
-			hookWatcher, err := session.NewStatusFileWatcher(nil)
-			if err != nil {
-				uiLog.Warn("hook_watcher_init_failed", slog.String("error", err.Error()))
-			} else {
-				h.hookWatcher = hookWatcher
-				go hookWatcher.Start()
-			}
-			// Remember user's choice
-			if db := statedb.GetGlobal(); db != nil {
-				_ = db.SetMeta("hooks_prompted", "accepted")
-			}
-			return h, nil
+			return h, h.declineInstallHooks()
 		case "n", "N", "esc":
-			h.confirmDialog.Hide()
-			h.pendingHooksPrompt = false
-			// Remember user declined
-			if db := statedb.GetGlobal(); db != nil {
-				_ = db.SetMeta("hooks_prompted", "declined")
-			}
-			return h, nil
+			return h, h.declineInstallHooks()
 		}
 		return h, nil
 
 	default:
-		// Handle delete confirmations (session/group)
+		// Handle delete/close confirmations (session/group/remote)
 		switch msg.String() {
 		case "y", "Y":
-			// User confirmed - perform the deletion
-			switch h.confirmDialog.GetConfirmType() {
-			case ConfirmDeleteSession:
-				sessionID := h.confirmDialog.GetTargetID()
-				if inst := h.getInstanceByID(sessionID); inst != nil {
-					h.confirmDialog.Hide()
-					return h, h.deleteSession(inst)
-				}
-			case ConfirmCloseSession:
-				sessionID := h.confirmDialog.GetTargetID()
-				if inst := h.getInstanceByID(sessionID); inst != nil {
-					h.confirmDialog.Hide()
-					return h, h.closeSession(inst)
-				}
-			case ConfirmDeleteGroup:
-				groupPath := h.confirmDialog.GetTargetID()
-				h.groupTree.DeleteGroup(groupPath)
-				h.instancesMu.Lock()
-				h.instances = h.groupTree.GetAllInstances()
-				h.instancesMu.Unlock()
-				h.rebuildFlatItems()
-				h.saveInstances()
-			case ConfirmDeleteRemoteSession:
-				sessionID := h.confirmDialog.GetTargetID()
-				remoteName := h.confirmDialog.GetRemoteName()
-				title := h.confirmDialog.targetName
-				h.confirmDialog.Hide()
-				return h, h.deleteRemoteSession(remoteName, sessionID, title)
-			case ConfirmCloseRemoteSession:
-				sessionID := h.confirmDialog.GetTargetID()
-				remoteName := h.confirmDialog.GetRemoteName()
-				title := h.confirmDialog.targetName
-				h.confirmDialog.Hide()
-				return h, h.closeRemoteSession(remoteName, sessionID, title)
+			return h, h.confirmAction()
+		case "enter":
+			if h.confirmDialog.GetFocusedButton() == 0 {
+				return h, h.confirmAction()
 			}
 			h.confirmDialog.Hide()
 			return h, nil
-
 		case "n", "N", "esc":
-			// User cancelled
 			h.confirmDialog.Hide()
 			return h, nil
 		}
 	}
 
 	return h, nil
+}
+
+// confirmAction executes the confirmed destructive action.
+func (h *Home) confirmAction() tea.Cmd {
+	switch h.confirmDialog.GetConfirmType() {
+	case ConfirmDeleteSession:
+		sessionID := h.confirmDialog.GetTargetID()
+		if inst := h.getInstanceByID(sessionID); inst != nil {
+			h.confirmDialog.Hide()
+			return h.deleteSession(inst)
+		}
+	case ConfirmCloseSession:
+		sessionID := h.confirmDialog.GetTargetID()
+		if inst := h.getInstanceByID(sessionID); inst != nil {
+			h.confirmDialog.Hide()
+			return h.closeSession(inst)
+		}
+	case ConfirmDeleteGroup:
+		groupPath := h.confirmDialog.GetTargetID()
+		h.groupTree.DeleteGroup(groupPath)
+		h.instancesMu.Lock()
+		h.instances = h.groupTree.GetAllInstances()
+		h.instancesMu.Unlock()
+		h.rebuildFlatItems()
+		h.saveInstances()
+	case ConfirmDeleteRemoteSession:
+		sessionID := h.confirmDialog.GetTargetID()
+		remoteName := h.confirmDialog.GetRemoteName()
+		title := h.confirmDialog.targetName
+		h.confirmDialog.Hide()
+		return h.deleteRemoteSession(remoteName, sessionID, title)
+	case ConfirmCloseRemoteSession:
+		sessionID := h.confirmDialog.GetTargetID()
+		remoteName := h.confirmDialog.GetRemoteName()
+		title := h.confirmDialog.targetName
+		h.confirmDialog.Hide()
+		return h.closeRemoteSession(remoteName, sessionID, title)
+	}
+	h.confirmDialog.Hide()
+	return nil
+}
+
+// confirmCreateDirectory handles the "yes" action for ConfirmCreateDirectory.
+func (h *Home) confirmCreateDirectory() tea.Cmd {
+	name, path, command, groupPath, pendingToolOpts, parentSessionID, parentProjectPath := h.confirmDialog.GetPendingSession()
+	h.confirmDialog.Hide()
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		h.setError(fmt.Errorf("failed to create directory: %w", err))
+		return nil
+	}
+	return h.createSessionInGroupWithWorktreeAndOptions(
+		name,
+		path,
+		command,
+		groupPath,
+		"",
+		"",
+		"",
+		false,
+		false,
+		pendingToolOpts,
+		false,
+		nil,
+		parentSessionID,
+		parentProjectPath,
+		"", // no placeholder — non-worktree sessions are fast
+	)
+}
+
+// confirmInstallHooks handles the "yes" action for ConfirmInstallHooks.
+func (h *Home) confirmInstallHooks() tea.Cmd {
+	h.confirmDialog.Hide()
+	h.pendingHooksPrompt = false
+	configDir := session.GetClaudeConfigDir()
+	if _, err := session.InjectClaudeHooks(configDir); err != nil {
+		uiLog.Warn("hook_install_failed", slog.String("error", err.Error()))
+	} else {
+		uiLog.Info("claude_hooks_installed", slog.String("config_dir", configDir))
+	}
+	// Start the status file watcher
+	hookWatcher, err := session.NewStatusFileWatcher(nil)
+	if err != nil {
+		uiLog.Warn("hook_watcher_init_failed", slog.String("error", err.Error()))
+	} else {
+		h.hookWatcher = hookWatcher
+		go hookWatcher.Start()
+	}
+	// Remember user's choice
+	if db := statedb.GetGlobal(); db != nil {
+		_ = db.SetMeta("hooks_prompted", "accepted")
+	}
+	return nil
+}
+
+// declineInstallHooks handles the "no" action for ConfirmInstallHooks.
+func (h *Home) declineInstallHooks() tea.Cmd {
+	h.confirmDialog.Hide()
+	h.pendingHooksPrompt = false
+	// Remember user declined
+	if db := statedb.GetGlobal(); db != nil {
+		_ = db.SetMeta("hooks_prompted", "declined")
+	}
+	return nil
 }
 
 // tryQuit checks if MCP pool is running and shows confirmation dialog, or quits directly
@@ -6049,6 +6294,11 @@ func (h *Home) performFinalShutdown(shutdownPool bool) tea.Cmd {
 		if h.globalSearchIndex != nil {
 			h.globalSearchIndex.Close()
 		}
+		// Stop watcher engine (D-07: lifecycle tied to TUI)
+		if h.watcherEngine != nil {
+			h.watcherEngine.Stop()
+			h.watcherEngine = nil
+		}
 		// Shutdown or disconnect from MCP pool based on user choice
 		if err := session.ShutdownGlobalPool(shutdownPool); err != nil {
 			mcpUILog.Warn("pool_shutdown_error", slog.String("error", err.Error()))
@@ -6066,6 +6316,115 @@ func (h *Home) performFinalShutdown(shutdownPool bool) tea.Cmd {
 		h.saveInstances()
 
 		return tea.Quit()
+	}
+}
+
+// refreshWatcherPanel loads watcher and event data from statedb and updates the panel.
+// Safe to call when watcherPanel is hidden; data is preloaded for when the panel opens.
+func (h *Home) refreshWatcherPanel() {
+	db := statedb.GetGlobal()
+	if db == nil {
+		return
+	}
+
+	watchers, err := db.LoadWatchers()
+	if err != nil {
+		return
+	}
+
+	items := make([]WatcherDisplayItem, len(watchers))
+	for i, w := range watchers {
+		healthStatus := w.Status // default: same as status
+		if w.Status == "running" {
+			healthStatus = "healthy"
+		}
+		items[i] = WatcherDisplayItem{
+			ID:           w.ID,
+			Name:         w.Name,
+			Type:         w.Type,
+			Status:       w.Status,
+			HealthStatus: healthStatus,
+			Conductor:    w.Conductor,
+		}
+
+		// Count events in the last hour to compute events-per-hour rate.
+		events, evtErr := db.LoadWatcherEvents(w.ID, 100)
+		if evtErr == nil {
+			cutoff := time.Now().Add(-time.Hour)
+			count := 0
+			for _, e := range events {
+				if e.CreatedAt.After(cutoff) {
+					count++
+				}
+			}
+			items[i].EventsPerHour = float64(count)
+		}
+	}
+	h.watcherPanel.SetWatchers(items)
+
+	// If a watcher is selected in detail mode, load its recent events.
+	if sel := h.watcherPanel.SelectedWatcher(); sel != nil {
+		events, evtErr := db.LoadWatcherEvents(sel.ID, 10)
+		if evtErr == nil {
+			displayEvents := make([]WatcherEventDisplay, len(events))
+			for i, e := range events {
+				displayEvents[i] = WatcherEventDisplay{
+					Timestamp: e.CreatedAt,
+					Sender:    e.Sender,
+					Subject:   e.Subject,
+					RoutedTo:  e.RoutedTo,
+					SessionID: e.SessionID,
+				}
+			}
+			h.watcherPanel.SetEvents(displayEvents)
+		}
+	}
+}
+
+// dispatchHealthAlert sends a health alert message to the conductor session associated
+// with the watcher that entered warning or error state (D-22, D-23, TUI-03).
+func (h *Home) dispatchHealthAlert(state watcher.HealthState) {
+	db := statedb.GetGlobal()
+	if db == nil {
+		return
+	}
+
+	watchers, err := db.LoadWatchers()
+	if err != nil {
+		return
+	}
+
+	var conductorName string
+	for _, w := range watchers {
+		if w.Name == state.WatcherName && w.Conductor != "" {
+			conductorName = w.Conductor
+			break
+		}
+	}
+	if conductorName == "" {
+		return // No conductor configured, skip alert.
+	}
+
+	// Build alert message (D-23): include name, status, reason, and suggested action.
+	alertMsg := fmt.Sprintf("[WATCHER HEALTH ALERT] Watcher %q transitioned to %s: %s. Suggested action: check watcher configuration and source connectivity.",
+		state.WatcherName, state.Status, state.Message)
+
+	// Find the conductor session by title and deliver via tmux send-keys (T-16-08).
+	sessionTitle := session.ConductorSessionTitle(conductorName)
+	h.instancesMu.RLock()
+	instances := h.instances
+	h.instancesMu.RUnlock()
+	for _, inst := range instances {
+		if inst.Title == sessionTitle {
+			ts := inst.GetTmuxSession()
+			if ts != nil && ts.Name != "" {
+				tmuxName := ts.Name
+				go func() {
+					_ = exec.Command("tmux", "send-keys", "-t", tmuxName, alertMsg, "Enter").Run()
+				}()
+			}
+			break
+		}
 	}
 }
 
@@ -7766,6 +8125,9 @@ func (h *Home) updateSizes() {
 	h.confirmDialog.SetSize(h.width, h.height)
 	h.geminiModelDialog.SetSize(h.width, h.height)
 	h.worktreeFinishDialog.SetSize(h.width, h.height)
+	if h.feedbackDialog != nil {
+		h.feedbackDialog.SetSize(h.width, h.height)
+	}
 }
 
 // View renders the UI
@@ -7815,6 +8177,11 @@ func (h *Home) View() string {
 		return h.setupWizard.View()
 	}
 
+	// Watcher panel is modal (before settings panel)
+	if h.watcherPanel.IsVisible() {
+		return h.watcherPanel.View()
+	}
+
 	// Settings panel is modal
 	if h.settingsPanel.IsVisible() {
 		return h.settingsPanel.View()
@@ -7856,6 +8223,9 @@ func (h *Home) View() string {
 	}
 	if h.worktreeFinishDialog.IsVisible() {
 		return h.worktreeFinishDialog.View()
+	}
+	if h.feedbackDialog.IsVisible() {
+		return h.feedbackDialog.View()
 	}
 	if h.showCostDashboard {
 		return h.costDashboard.View()

@@ -175,9 +175,9 @@ type NewDialog struct {
 	inheritedExpanded bool             // whether the inherited settings section is expanded.
 	inheritedSettings []settingDisplay // non-default Docker config values to display.
 	// Inline validation error displayed inside the dialog.
-	validationErr          string
-	pathCycler             session.CompletionCycler // Path autocomplete state.
-	suggestionsLineOffset  int                      // Content line where suggestions overlay should appear.
+	validationErr         string
+	pathCycler            session.CompletionCycler // Path autocomplete state.
+	suggestionsLineOffset int                      // Content line where suggestions overlay should appear.
 	// Multi-repo mode.
 	multiRepoEnabled    bool
 	multiRepoPaths      []string // All paths when multi-repo is active.
@@ -376,6 +376,9 @@ func (d *NewDialog) ShowInGroup(groupPath, groupName, defaultPath string, conduc
 		d.claudeOptions.SetDefaults(userConfig)
 		d.sandboxEnabled = userConfig.Docker.DefaultEnabled
 		d.worktreeEnabled = userConfig.Worktree.DefaultEnabled
+		if d.worktreeEnabled {
+			d.branchAutoSet = true
+		}
 		d.inheritedSettings = buildInheritedSettings(userConfig.Docker)
 		d.branchPrefix = userConfig.Worktree.Prefix()
 	}

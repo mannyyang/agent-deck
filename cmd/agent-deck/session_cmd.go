@@ -739,6 +739,13 @@ func handleSessionShow(profile string, args []string) {
 		if mcps := mcpInfoForJSON(mcpInfo); mcps != nil {
 			jsonData["mcps"] = mcps
 		}
+
+		// Always include channels for claude sessions — omitting when empty
+		// would make absence-of-field ambiguous with absence-of-value. Match
+		// the `list --json` emitter which surfaces this field unconditionally.
+		if len(inst.Channels) > 0 {
+			jsonData["channels"] = inst.Channels
+		}
 	}
 
 	if tmuxSession := inst.GetTmuxSession(); tmuxSession != nil {
@@ -839,6 +846,7 @@ func handleSessionSet(profile string, args []string) {
 		fmt.Println("  command            Command to run")
 		fmt.Println("  tool               Tool type (claude, gemini, shell, etc.)")
 		fmt.Println("  wrapper            Wrapper command (use {command} to include tool command)")
+		fmt.Println("  channels           Comma-separated plugin channel ids (claude only)")
 		fmt.Println("  claude-session-id  Claude conversation ID")
 		fmt.Println("  gemini-session-id  Gemini conversation ID")
 		fmt.Println()
@@ -874,6 +882,7 @@ func handleSessionSet(profile string, args []string) {
 		"command":           true,
 		"tool":              true,
 		"wrapper":           true,
+		"channels":          true,
 		"claude-session-id": true,
 		"gemini-session-id": true,
 	}
@@ -881,7 +890,7 @@ func handleSessionSet(profile string, args []string) {
 	if !validFields[field] {
 		out.Error(
 			fmt.Sprintf(
-				"invalid field: %s\nValid fields: title, path, command, tool, wrapper, claude-session-id, gemini-session-id",
+				"invalid field: %s\nValid fields: title, path, command, tool, wrapper, channels, claude-session-id, gemini-session-id",
 				field,
 			),
 			ErrCodeInvalidOperation,
@@ -928,6 +937,24 @@ func handleSessionSet(profile string, args []string) {
 	case "wrapper":
 		oldValue = inst.Wrapper
 		inst.Wrapper = value
+	case "channels":
+		// channels is a Claude Code CLI flag; only meaningful for claude sessions.
+		if inst.Tool != "claude" {
+			out.Error(
+				fmt.Sprintf("channels only supported for claude sessions (this session's tool is %q); requires --channels on the claude binary", inst.Tool),
+				ErrCodeInvalidOperation,
+			)
+			os.Exit(1)
+		}
+		oldValue = strings.Join(inst.Channels, ",")
+		// Parse CSV value: trim whitespace, drop empties.
+		parsed := []string{}
+		for _, raw := range strings.Split(value, ",") {
+			if s := strings.TrimSpace(raw); s != "" {
+				parsed = append(parsed, s)
+			}
+		}
+		inst.Channels = parsed
 	case "claude-session-id":
 		oldValue = inst.ClaudeSessionID
 		inst.ClaudeSessionID = value

@@ -1098,9 +1098,15 @@ func TestGetTmuxSettings_LaunchInUserScope_Default(t *testing.T) {
 	}
 	ClearUserConfigCache()
 
+	// Phase 2 / Plan 02: LaunchInUserScope migrated from bool to *bool.
+	// "Field absent" must decode to nil so GetLaunchInUserScope() can fall
+	// back to isSystemdUserScopeAvailable(). The host-aware default value
+	// itself is covered by TestPersistence_LinuxDefaultIsUserScope (TEST-03)
+	// and TestPersistence_MacOSDefaultIsDirect (TEST-04); this test only
+	// pins the decoder contract.
 	settings := GetTmuxSettings()
-	if settings.GetLaunchInUserScope() {
-		t.Error("GetLaunchInUserScope should default to false when not set")
+	if settings.LaunchInUserScope != nil {
+		t.Errorf("LaunchInUserScope should be nil when not set in config; got non-nil pointing to %v", *settings.LaunchInUserScope)
 	}
 }
 
@@ -1127,5 +1133,199 @@ launch_in_user_scope = true
 	settings := GetTmuxSettings()
 	if !settings.GetLaunchInUserScope() {
 		t.Error("GetLaunchInUserScope should be true when set to true")
+	}
+}
+
+func TestUserConfig_GroupClaudeConfigDir(t *testing.T) {
+	tmpDir := t.TempDir()
+	configContent := `
+[claude]
+config_dir = "~/.claude-global"
+
+[groups."team-a".claude]
+config_dir = "~/.claude-team-a"
+
+[groups."team-b".claude]
+config_dir = "~/.claude-team-b"
+`
+	configPath := filepath.Join(tmpDir, "config.toml")
+	if err := os.WriteFile(configPath, []byte(configContent), 0600); err != nil {
+		t.Fatalf("Failed to write config file: %v", err)
+	}
+
+	var config UserConfig
+	if _, err := toml.DecodeFile(configPath, &config); err != nil {
+		t.Fatalf("Failed to decode: %v", err)
+	}
+
+	if got := config.GetGroupClaudeConfigDir("team-a"); got == "" {
+		t.Fatal("GetGroupClaudeConfigDir(team-a) returned empty string")
+	}
+
+	if got, want := config.Groups["team-a"].Claude.ConfigDir, "~/.claude-team-a"; got != want {
+		t.Errorf("Groups[team-a].Claude.ConfigDir = %q, want %q", got, want)
+	}
+	if got, want := config.Groups["team-b"].Claude.ConfigDir, "~/.claude-team-b"; got != want {
+		t.Errorf("Groups[team-b].Claude.ConfigDir = %q, want %q", got, want)
+	}
+}
+
+func TestUserConfig_GroupClaudeConfigDir_Empty(t *testing.T) {
+	var config UserConfig
+	if got := config.GetGroupClaudeConfigDir("nonexistent"); got != "" {
+		t.Errorf("GetGroupClaudeConfigDir(nonexistent) = %q, want empty", got)
+	}
+	if got := config.GetGroupClaudeConfigDir(""); got != "" {
+		t.Errorf("GetGroupClaudeConfigDir('') = %q, want empty", got)
+	}
+}
+
+func TestUserConfig_GroupClaudeConfigDir_NestedPath(t *testing.T) {
+	tmpDir := t.TempDir()
+	configContent := `
+[groups."projects/team-a".claude]
+config_dir = "~/.claude-team-a"
+`
+	configPath := filepath.Join(tmpDir, "config.toml")
+	if err := os.WriteFile(configPath, []byte(configContent), 0600); err != nil {
+		t.Fatalf("Failed to write config file: %v", err)
+	}
+
+	var config UserConfig
+	if _, err := toml.DecodeFile(configPath, &config); err != nil {
+		t.Fatalf("Failed to decode: %v", err)
+	}
+
+	if got, want := config.Groups["projects/team-a"].Claude.ConfigDir, "~/.claude-team-a"; got != want {
+		t.Errorf("Groups[projects/team-a].Claude.ConfigDir = %q, want %q", got, want)
+	}
+}
+
+func TestUserConfig_GroupClaudeEnvFile(t *testing.T) {
+	tmpDir := t.TempDir()
+	configContent := `
+[claude]
+env_file = "~/.claude-global.env"
+
+[groups."team-a".claude]
+env_file = "~/.claude-team-a.env"
+
+[groups."team-b".claude]
+config_dir = "~/.claude-team-b"
+`
+	configPath := filepath.Join(tmpDir, "config.toml")
+	if err := os.WriteFile(configPath, []byte(configContent), 0600); err != nil {
+		t.Fatalf("Failed to write config file: %v", err)
+	}
+
+	var config UserConfig
+	if _, err := toml.DecodeFile(configPath, &config); err != nil {
+		t.Fatalf("Failed to decode: %v", err)
+	}
+
+	// Group with env_file set
+	if got, want := config.GetGroupClaudeEnvFile("team-a"), "~/.claude-team-a.env"; got != want {
+		t.Errorf("GetGroupClaudeEnvFile(team-a) = %q, want %q", got, want)
+	}
+
+	// Group without env_file (only config_dir)
+	if got := config.GetGroupClaudeEnvFile("team-b"); got != "" {
+		t.Errorf("GetGroupClaudeEnvFile(team-b) = %q, want empty", got)
+	}
+
+	// Nonexistent group
+	if got := config.GetGroupClaudeEnvFile("unknown"); got != "" {
+		t.Errorf("GetGroupClaudeEnvFile(unknown) = %q, want empty", got)
+	}
+
+	// Empty group path
+	if got := config.GetGroupClaudeEnvFile(""); got != "" {
+		t.Errorf("GetGroupClaudeEnvFile('') = %q, want empty", got)
+	}
+}
+
+func TestWatcherSettingsDefaults(t *testing.T) {
+	// Zero-value WatcherSettings (as if no [watcher] section in config.toml)
+	var ws WatcherSettings
+
+	if got := ws.GetMaxEventsPerWatcher(); got != 500 {
+		t.Errorf("GetMaxEventsPerWatcher() default = %d, want 500", got)
+	}
+	if got := ws.GetMaxSilenceMinutes(); got != 60 {
+		t.Errorf("GetMaxSilenceMinutes() default = %d, want 60", got)
+	}
+	if got := ws.GetHealthCheckIntervalSeconds(); got != 30 {
+		t.Errorf("GetHealthCheckIntervalSeconds() default = %d, want 30", got)
+	}
+
+	// Explicitly set values override defaults
+	ws = WatcherSettings{
+		MaxEventsPerWatcher:        1000,
+		MaxSilenceMinutes:          120,
+		HealthCheckIntervalSeconds: 15,
+	}
+	if got := ws.GetMaxEventsPerWatcher(); got != 1000 {
+		t.Errorf("GetMaxEventsPerWatcher() override = %d, want 1000", got)
+	}
+	if got := ws.GetMaxSilenceMinutes(); got != 120 {
+		t.Errorf("GetMaxSilenceMinutes() override = %d, want 120", got)
+	}
+	if got := ws.GetHealthCheckIntervalSeconds(); got != 15 {
+		t.Errorf("GetHealthCheckIntervalSeconds() override = %d, want 15", got)
+	}
+}
+
+func TestWatcherSettingsFromEmptyConfig(t *testing.T) {
+	// Simulate loading a config.toml with no [watcher] section
+	var cfg UserConfig
+	ws := cfg.Watcher
+
+	if got := ws.GetMaxEventsPerWatcher(); got != 500 {
+		t.Errorf("empty config: GetMaxEventsPerWatcher() = %d, want 500", got)
+	}
+	if got := ws.GetMaxSilenceMinutes(); got != 60 {
+		t.Errorf("empty config: GetMaxSilenceMinutes() = %d, want 60", got)
+	}
+	if got := ws.GetHealthCheckIntervalSeconds(); got != 30 {
+		t.Errorf("empty config: GetHealthCheckIntervalSeconds() = %d, want 30", got)
+	}
+}
+
+func TestWatcherAlertsSettingsDefaults(t *testing.T) {
+	ClearUserConfigCache()
+
+	// Zero-value WatcherAlertsSettings (as if no [watcher.alerts] section in config.toml)
+	var as WatcherAlertsSettings
+
+	if got := as.GetDebounceMinutes(); got != 15 {
+		t.Errorf("GetDebounceMinutes() default = %d, want 15", got)
+	}
+	if as.Enabled {
+		t.Error("Enabled default should be false")
+	}
+	if len(as.Channels) != 0 {
+		t.Errorf("Channels default should be empty, got %v", as.Channels)
+	}
+
+	// Explicit override values override defaults
+	as = WatcherAlertsSettings{
+		Enabled:         true,
+		DebounceMinutes: 30,
+		Channels:        []string{"telegram", "slack"},
+	}
+	if got := as.GetDebounceMinutes(); got != 30 {
+		t.Errorf("GetDebounceMinutes() override = %d, want 30", got)
+	}
+	if !as.Enabled {
+		t.Error("Enabled override should be true")
+	}
+	if len(as.Channels) != 2 || as.Channels[0] != "telegram" || as.Channels[1] != "slack" {
+		t.Errorf("Channels override = %v, want [telegram slack]", as.Channels)
+	}
+
+	// Empty-config path: accessing via a zero-value UserConfig
+	var cfg UserConfig
+	if got := cfg.Watcher.Alerts.GetDebounceMinutes(); got != 15 {
+		t.Errorf("empty config: cfg.Watcher.Alerts.GetDebounceMinutes() = %d, want 15", got)
 	}
 }

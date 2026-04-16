@@ -32,7 +32,7 @@ import (
 	"github.com/asheshgoplani/agent-deck/internal/web"
 )
 
-var Version = "1.4.2" // overridden at build time via -ldflags "-X main.Version=..."
+var Version = "1.7.1" // overridden at build time via -ldflags "-X main.Version=..."
 
 // Table column widths for list command output
 const (
@@ -253,6 +253,9 @@ func main() {
 		case "conductor":
 			handleConductor(profile, args[1:])
 			return
+		case "watcher":
+			handleWatcher(profile, args[1:])
+			return
 		case "openclaw", "oc":
 			handleOpenClaw(profile, args[1:])
 			return
@@ -289,6 +292,9 @@ func main() {
 			return
 		case "notify-daemon":
 			handleNotifyDaemon(args[1:])
+			return
+		case "feedback":
+			handleFeedback(args[1:])
 			return
 		case "debug-dump":
 			handleDebugDump()
@@ -431,6 +437,12 @@ func main() {
 		logging.Init(logCfg)
 		defer logging.Shutdown()
 
+		// OBS-01: emit the cgroup-isolation decision exactly once on TUI
+		// startup. The line lands in ~/.agent-deck/debug.log via the
+		// dynamicHandler + lumberjack pipeline that logging.Init wires up.
+		// See internal/session/userconfig.go LogCgroupIsolationDecision.
+		session.LogCgroupIsolationDecision()
+
 		if debugMode {
 			logging.ForComponent(logging.CompUI).Info("instance_started",
 				slog.Int("pid", os.Getpid()))
@@ -455,7 +467,7 @@ func main() {
 
 	// Extract --group / -g flag here (TUI-only path; subcommands consume their own -g)
 	var groupScope string
-	groupScope, args = extractGroupFlag(args)
+	groupScope, _ = extractGroupFlag(args)
 
 	// Start TUI with the specified profile
 	homeModel := ui.NewHomeWithProfileAndMode(profile)
@@ -601,9 +613,16 @@ func main() {
 	// Disable the Kitty keyboard protocol before starting the TUI.
 	// Wayland terminals (Ghostty, Foot, Alacritty) send keys using CSI u
 	// encoding by default; Bubble Tea v1.3.10 does not parse those sequences,
-	// so uppercase shortcuts and uppercase text input are silently dropped.
-	// Pushing keyboard mode 0 (legacy) restores standard key reporting.
-	// Terminals that don't support the protocol ignore this sequence safely.
+	// so uppercase shortcuts and uppercase text input (including '_') are
+	// silently dropped. Pushing keyboard mode 0 (legacy) restores standard
+	// key reporting. Terminals that don't support the protocol ignore this
+	// sequence safely.
+	//
+	// As a belt-and-suspenders fallback, we also wrap os.Stdin with
+	// NewCSIuReader, which translates any remaining CSI u sequences (including
+	// Shift+hyphen → '_', codepoint 95) to their legacy byte equivalents
+	// before Bubble Tea sees them. This handles terminals that send CSI u
+	// sequences even after the disable request (e.g. tmux with extended-keys).
 	ui.DisableKittyKeyboard(os.Stdout)
 	defer ui.RestoreKittyKeyboard(os.Stdout)
 
@@ -611,6 +630,7 @@ func main() {
 		homeModel,
 		tea.WithAltScreen(),
 		tea.WithMouseCellMotion(),
+		tea.WithInput(ui.NewCSIuReader(os.Stdin)),
 	)
 
 	// Start maintenance worker (background goroutine, respects config toggle)
@@ -712,6 +732,7 @@ func reorderArgsForFlagParsing(args []string) []string {
 		"-m": true, "--message": true,
 		"-p": true, "--parent": true,
 		"--mcp":     true,
+		"--channel": true,
 		"--wrapper": true,
 		"-w":        true, "--worktree": true,
 		"--location":       true,
@@ -895,6 +916,15 @@ func handleAdd(profile string, args []string) {
 		return nil
 	})
 
+	// Plugin channel flag - can be specified multiple times; requires -c claude.
+	// Persisted on Instance.Channels and emitted as --channels <csv> on every
+	// claude Start/Restart so plugin channels deliver inbound messages.
+	var channelFlags []string
+	fs.Func("channel", "Plugin channel id (can specify multiple times); requires -c claude", func(s string) error {
+		channelFlags = append(channelFlags, s)
+		return nil
+	})
+
 	// Sandbox flags
 	sandbox := fs.Bool("sandbox", false, "Run session in Docker sandbox")
 	sandboxImage := fs.String("sandbox-image", "", "Docker image for sandbox (overrides config default)")
@@ -927,6 +957,7 @@ func handleAdd(profile string, args []string) {
 		fmt.Println("  agent-deck -p work add               # Add to 'work' profile")
 		fmt.Println("  agent-deck add -t \"Sub-task\" --parent \"Main Project\"  # Create sub-session")
 		fmt.Println("  agent-deck add -t \"Research\" -c claude --mcp memory --mcp sequential-thinking /tmp/x")
+		fmt.Println("  agent-deck add -t \"Bot\" -c claude --channel plugin:telegram@user/repo .  # subscribe to plugin channel")
 		fmt.Println("  agent-deck add -c opencode --wrapper \"nvim +'terminal {command}' +'startinsert'\" .")
 		fmt.Println("  agent-deck add -c \"codex --dangerously-bypass-approvals-and-sandbox\" .")
 		fmt.Println("  agent-deck add -c gemini --yolo .")
@@ -1207,6 +1238,15 @@ func handleAdd(profile string, args []string) {
 		newInstance.Command = sessionCommandResolved
 	}
 
+	// Apply --channel flags (claude only — channels is a Claude Code CLI flag).
+	if len(channelFlags) > 0 {
+		if newInstance.Tool != "claude" {
+			fmt.Println("Error: --channel only supported for claude sessions (use -c claude); requires --channels on the claude binary")
+			os.Exit(1)
+		}
+		newInstance.Channels = channelFlags
+	}
+
 	// Set wrapper if provided
 	if sessionWrapperResolved != "" {
 		newInstance.Wrapper = sessionWrapperResolved
@@ -1451,6 +1491,7 @@ func handleList(profile string, args []string) {
 			CreatedAt     time.Time `json:"created_at"`
 			SSHHost       string    `json:"ssh_host,omitempty"`
 			SSHRemotePath string    `json:"ssh_remote_path,omitempty"`
+			Channels      []string  `json:"channels,omitempty"`
 		}
 		sessions := make([]sessionJSON, len(instances))
 		for i, inst := range instances {
@@ -1467,6 +1508,7 @@ func handleList(profile string, args []string) {
 				CreatedAt:     inst.CreatedAt,
 				SSHHost:       inst.SSHHost,
 				SSHRemotePath: inst.SSHRemotePath,
+				Channels:      inst.Channels,
 			}
 			if tmuxSess := inst.GetTmuxSession(); tmuxSess != nil {
 				sj.TmuxSession = tmuxSess.Name
