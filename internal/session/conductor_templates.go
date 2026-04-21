@@ -361,7 +361,6 @@ When you first start (or after a restart):
 6. Reply: "Conductor {NAME} ({PROFILE}) online. N sessions tracked (X running, Y waiting)."
 `
 
-
 // conductorBridgePy is the thin wrapper that delegates to the bridge package.
 // Kept as the entry point for launchd/systemd configs that invoke bridge.py directly.
 const conductorBridgePy = `#!/usr/bin/env python3
@@ -382,17 +381,19 @@ if __name__ == "__main__":
 // conductorBridgePackage maps filenames to Python source for the bridge/ package.
 // InstallBridgeScript() writes these to ~/.agent-deck/conductor/bridge/*.py.
 var conductorBridgePackage = map[string]string{
-	"__init__.py": conductorBridgePkgInit,
-	"constants.py": conductorBridgePkgConstants,
-	"config.py": conductorBridgePkgConfig,
-	"cli.py": conductorBridgePkgCli,
-	"formatting.py": conductorBridgePkgFormatting,
+	"__init__.py":     conductorBridgePkgInit,
+	"constants.py":    conductorBridgePkgConstants,
+	"config.py":       conductorBridgePkgConfig,
+	"cli.py":          conductorBridgePkgCli,
+	"formatting.py":   conductorBridgePkgFormatting,
 	"telegram_bot.py": conductorBridgePkgTelegramBot,
-	"slack_bot.py": conductorBridgePkgSlackBot,
-	"discord_bot.py": conductorBridgePkgDiscordBot,
-	"heartbeat.py": conductorBridgePkgHeartbeat,
-	"mirror.py": conductorBridgePkgMirror,
-	"main.py": conductorBridgePkgMain,
+	"slack_bot.py":    conductorBridgePkgSlackBot,
+	"discord_bot.py":  conductorBridgePkgDiscordBot,
+	"heartbeat.py":    conductorBridgePkgHeartbeat,
+	"mirror.py":       conductorBridgePkgMirror,
+	"main.py":         conductorBridgePkgMain,
+	"stt.py":          conductorBridgePkgStt,
+	"stt_worker.py":   conductorBridgePkgSttWorker,
 }
 
 const conductorBridgePkgInit = `"""Conductor Bridge package.
@@ -408,6 +409,7 @@ Modules:
   heartbeat    - Periodic heartbeat loop for conductor status checks
   mirror       - JSONL-based terminal mirror for Slack sync
   main         - Entry point: discovers conductors, starts platforms, runs event loop
+  stt          - Voice transcription (opt-in, parakeet-mlx via subprocess)
 """
 `
 
@@ -552,6 +554,8 @@ def markdown_to_slack(text: str) -> str:
 `
 
 const conductorBridgePkgConfig = `"""Configuration loading and conductor discovery."""
+
+from __future__ import annotations
 
 import json
 import logging
@@ -750,7 +754,11 @@ def select_heartbeat_conductors(conductors: list[dict]) -> list[dict]:
 
 const conductorBridgePkgCli = `"""Agent-Deck CLI helpers."""
 
+from __future__ import annotations
+
 import json
+import os
+import signal
 import subprocess
 import time
 
@@ -770,13 +778,31 @@ def run_cli(
     cmd += list(args)
     log.debug("CLI: %s", " ".join(cmd))
     try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout
+        # Use Popen + communicate(timeout=) so we have the proc object available
+        # when TimeoutExpired fires — subprocess.run() does NOT set exc.proc.
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,  # own process group → killpg kills grandchildren too
         )
-        return result
-    except subprocess.TimeoutExpired:
-        log.warning("CLI timeout: %s", " ".join(cmd))
-        return subprocess.CompletedProcess(cmd, 1, "", "timeout")
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+            return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
+        except subprocess.TimeoutExpired:
+            log.warning("CLI timeout: %s", " ".join(cmd))
+            try:
+                # Kill the entire process group so grandchildren (e.g. tmux send-keys)
+                # don't survive as orphans and jam the pane's input queue.
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except OSError:
+                proc.kill()  # fallback: kill direct child only
+            try:
+                proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+            return subprocess.CompletedProcess(cmd, 1, "", "timeout")
     except FileNotFoundError:
         log.error("agent-deck not found in PATH")
         return subprocess.CompletedProcess(cmd, 1, "", "not found")
@@ -948,6 +974,8 @@ def ensure_conductor_running(name: str, profile: str) -> bool:
 
 const conductorBridgePkgFormatting = `"""Message formatting, splitting, and routing utilities."""
 
+from __future__ import annotations
+
 import re
 from pathlib import Path
 
@@ -1094,6 +1122,8 @@ async def send_discord_output(channel, text: str, name_tag: str = ""):
 
 const conductorBridgePkgTelegramBot = `"""Telegram bot setup."""
 
+from __future__ import annotations
+
 import re
 
 try:
@@ -1106,7 +1136,20 @@ except ImportError:
 from .config import log, discover_conductors, conductor_session_title, get_conductor_names, get_unique_profiles
 from .cli import run_cli, send_to_conductor, get_status_summary_all, get_sessions_list_all, ensure_conductor_running
 from .formatting import parse_conductor_prefix, split_message, md_to_tg_html
+from .stt import BRIDGE_STT_ENABLED, transcribe_voice_file
 from .constants import RESPONSE_TIMEOUT
+
+
+async def _transcribe_telegram_voice(voice, bot) -> str | None:
+    """Download a Telegram voice message and run it through the STT worker."""
+    try:
+        file = await bot.get_file(voice.file_id)
+        bio = await bot.download_file(file.file_path)
+        return await transcribe_voice_file(bio.read(), suffix=".ogg")
+    except Exception as e:
+        log.error("Voice download error: %s", e)
+        return None
+
 
 def create_telegram_bot(config: dict):
     """Create and configure the Telegram bot.
@@ -1306,17 +1349,33 @@ def create_telegram_bot(config: dict):
 
     @dp.message()
     async def handle_message(message: types.Message):
-        """Forward any text message to the conductor and return its response."""
+        """Forward text or voice messages to the conductor and return its response."""
         if not is_authorized(message):
             return
-        if not message.text:
+
+        text = message.text
+
+        # Transcribe voice messages (only when STT is enabled)
+        if message.voice and not text and BRIDGE_STT_ENABLED:
+            await ensure_bot_info(message.bot)
+            if not is_bot_addressed(message):
+                return
+            await message.answer("Transcribing...")
+            text = await _transcribe_telegram_voice(message.voice, message.bot)
+            if not text:
+                await message.answer(
+                    "[Could not transcribe voice message.]"
+                )
+                return
+
+        if not text:
             return
         await ensure_bot_info(message.bot)
         if not is_bot_addressed(message):
             return
 
         # Strip @botname mention from group messages
-        text = strip_bot_mention(message.text)
+        text = strip_bot_mention(text)
         if not text:
             return
 
@@ -1388,6 +1447,8 @@ def create_telegram_bot(config: dict):
 `
 
 const conductorBridgePkgSlackBot = `"""Slack bot setup."""
+
+from __future__ import annotations
 
 import asyncio
 import re
@@ -1952,6 +2013,8 @@ def create_slack_app(config: dict):
 
 const conductorBridgePkgDiscordBot = `"""Discord bot setup."""
 
+from __future__ import annotations
+
 import asyncio
 import re
 import time
@@ -2335,6 +2398,8 @@ def create_discord_bot(config: dict):
 
 const conductorBridgePkgHeartbeat = `"""Heartbeat loop for periodic conductor checks."""
 
+from __future__ import annotations
+
 import asyncio
 import os
 import time
@@ -2539,6 +2604,8 @@ async def heartbeat_loop(
 `
 
 const conductorBridgePkgMirror = `"""JSONL-based terminal mirror for continuous Slack sync."""
+
+from __future__ import annotations
 
 import asyncio
 import json
@@ -2815,6 +2882,8 @@ const conductorBridgePkgMain = `"""Entry point: discovers conductors, starts pla
 This module replaces the monolithic bridge.py as the authoritative entry point.
 """
 
+from __future__ import annotations
+
 import asyncio
 import sys
 
@@ -2974,3 +3043,167 @@ async def main():
             await discord_bot.close()
 `
 
+const conductorBridgePkgStt = `"""Voice transcription (local parakeet-mlx via subprocess).
+
+Opt-in via BRIDGE_STT_ENABLED=true. Isolated in a subprocess so inference
+doesn't block the bridge event loop.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import os
+import tempfile
+from pathlib import Path
+
+from .config import log
+
+# Opt-in: voice STT is disabled unless BRIDGE_STT_ENABLED=true
+BRIDGE_STT_ENABLED = os.environ.get("BRIDGE_STT_ENABLED", "").lower() in (
+    "true", "1", "yes",
+)
+
+# Path to the STT worker script (sibling in the bridge package)
+STT_WORKER = Path(__file__).parent / "stt_worker.py"
+# Python interpreter: prefer the bridge venv, fall back to system python3
+_venv_python = Path(__file__).parent.parent / ".venv" / "bin" / "python3"
+VENV_PYTHON = str(_venv_python) if _venv_python.exists() else "python3"
+
+
+async def transcribe_voice_file(audio_bytes: bytes, suffix: str = ".ogg") -> str | None:
+    """Transcribe raw audio bytes by writing to a temp file and invoking stt_worker.py.
+
+    Returns the transcribed text, or None on failure/timeout.
+    """
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            suffix=suffix, prefix="voice_", delete=False
+        ) as tmp:
+            tmp.write(audio_bytes)
+            tmp_path = tmp.name
+
+        proc = await asyncio.create_subprocess_exec(
+            str(VENV_PYTHON), str(STT_WORKER), tmp_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=60
+            )
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            log.error("STT worker timed out (60s)")
+            return None
+
+        if proc.returncode != 0:
+            log.error("STT worker failed: %s", stderr.decode().strip())
+            return None
+
+        text = stdout.decode().strip()
+        return text if text else None
+
+    except Exception as e:
+        log.error("Voice transcription error: %s", e)
+        return None
+    finally:
+        if tmp_path:
+            Path(tmp_path).unlink(missing_ok=True)
+`
+
+const conductorBridgePkgSttWorker = `#!/usr/bin/env python3
+"""
+STT worker: transcribes an audio file using parakeet-mlx CLI.
+Runs as a subprocess to isolate inference from the bridge event loop.
+
+Usage:
+    python stt_worker.py /path/to/audio.ogg
+    python stt_worker.py --warmup
+"""
+
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+
+def _find_parakeet_cli() -> str:
+    """Locate parakeet-mlx CLI binary.
+
+    Priority:
+      1. PARAKEET_CLI_PATH env var (explicit override)
+      2. shutil.which('parakeet-mlx') (on PATH)
+      3. Error
+    """
+    env_path = os.environ.get("PARAKEET_CLI_PATH", "")
+    if env_path:
+        return env_path
+
+    found = shutil.which("parakeet-mlx")
+    if found:
+        return found
+
+    print(
+        "parakeet-mlx not found. Install it or set PARAKEET_CLI_PATH.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+
+PARAKEET_CLI = _find_parakeet_cli()
+
+
+def transcribe(audio_path: str) -> str:
+    """Transcribe audio file using parakeet-mlx CLI."""
+    with tempfile.TemporaryDirectory(prefix="stt_") as tmp_dir:
+        result = subprocess.run(
+            [
+                PARAKEET_CLI, audio_path,
+                "--output-format", "txt",
+                "--output-dir", tmp_dir,
+            ],
+            capture_output=True, text=True, timeout=60,
+        )
+        if result.returncode != 0:
+            print(f"parakeet-mlx error: {result.stderr}", file=sys.stderr)
+            sys.exit(1)
+
+        txt_files = list(Path(tmp_dir).glob("*.txt"))
+        if not txt_files:
+            print("No transcription output file found", file=sys.stderr)
+            sys.exit(1)
+        return txt_files[0].read_text().strip()
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: stt_worker.py <audio_file> | --warmup", file=sys.stderr)
+        sys.exit(1)
+
+    if sys.argv[1] == "--warmup":
+        print("Warming up parakeet-mlx...", file=sys.stderr)
+        result = subprocess.run(
+            [PARAKEET_CLI, "--help"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0:
+            print("CLI accessible.", file=sys.stderr)
+        print("")
+        return
+
+    audio_path = sys.argv[1]
+    if not Path(audio_path).exists():
+        print(f"File not found: {audio_path}", file=sys.stderr)
+        sys.exit(1)
+
+    text = transcribe(audio_path)
+    print(text)
+
+
+if __name__ == "__main__":
+    main()
+`

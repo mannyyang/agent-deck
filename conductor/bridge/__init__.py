@@ -11,4 +11,5 @@ Modules:
   heartbeat    - Periodic heartbeat loop for conductor status checks
   mirror       - JSONL-based terminal mirror for Slack sync
   main         - Entry point: discovers conductors, starts platforms, runs event loop
+  stt          - Voice transcription (opt-in, parakeet-mlx via subprocess)
 """

@@ -1,5 +1,7 @@
 """Slack bot setup."""
 
+from __future__ import annotations
+
 import asyncio
 import re
 import time

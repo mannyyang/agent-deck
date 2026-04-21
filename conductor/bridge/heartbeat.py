@@ -1,5 +1,7 @@
 """Heartbeat loop for periodic conductor checks."""
 
+from __future__ import annotations
+
 import asyncio
 import os
 import time

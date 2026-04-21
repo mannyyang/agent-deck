@@ -1,5 +1,7 @@
 """Telegram bot setup."""
 
+from __future__ import annotations
+
 import re
 
 try:
@@ -12,7 +14,19 @@ except ImportError:
 from .config import log, discover_conductors, conductor_session_title, get_conductor_names, get_unique_profiles
 from .cli import run_cli, send_to_conductor, get_status_summary_all, get_sessions_list_all, ensure_conductor_running
 from .formatting import parse_conductor_prefix, split_message, md_to_tg_html
+from .stt import BRIDGE_STT_ENABLED, transcribe_voice_file
 from .constants import RESPONSE_TIMEOUT
+
+
+async def _transcribe_telegram_voice(voice, bot) -> str | None:
+    """Download a Telegram voice message and run it through the STT worker."""
+    try:
+        file = await bot.get_file(voice.file_id)
+        bio = await bot.download_file(file.file_path)
+        return await transcribe_voice_file(bio.read(), suffix=".ogg")
+    except Exception as e:
+        log.error("Voice download error: %s", e)
+        return None
 
 def create_telegram_bot(config: dict):
     """Create and configure the Telegram bot.
@@ -212,17 +226,33 @@ def create_telegram_bot(config: dict):
 
     @dp.message()
     async def handle_message(message: types.Message):
-        """Forward any text message to the conductor and return its response."""
+        """Forward text or voice messages to the conductor and return its response."""
         if not is_authorized(message):
             return
-        if not message.text:
+
+        text = message.text
+
+        # Transcribe voice messages (only when STT is enabled)
+        if message.voice and not text and BRIDGE_STT_ENABLED:
+            await ensure_bot_info(message.bot)
+            if not is_bot_addressed(message):
+                return
+            await message.answer("Transcribing...")
+            text = await _transcribe_telegram_voice(message.voice, message.bot)
+            if not text:
+                await message.answer(
+                    "[Could not transcribe voice message.]"
+                )
+                return
+
+        if not text:
             return
         await ensure_bot_info(message.bot)
         if not is_bot_addressed(message):
             return
 
         # Strip @botname mention from group messages
-        text = strip_bot_mention(message.text)
+        text = strip_bot_mention(text)
         if not text:
             return
 

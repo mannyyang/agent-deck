@@ -3,6 +3,8 @@
 This module replaces the monolithic bridge.py as the authoritative entry point.
 """
 
+from __future__ import annotations
+
 import asyncio
 import sys
 

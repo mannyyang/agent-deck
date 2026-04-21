@@ -1,5 +1,7 @@
 """Message formatting, splitting, and routing utilities."""
 
+from __future__ import annotations
+
 import re
 from pathlib import Path
 
