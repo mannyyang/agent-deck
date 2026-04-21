@@ -82,6 +82,16 @@ func TestApplyCreateSessionToolOverrides_NonGeminiNoop(t *testing.T) {
 	}
 }
 
+// Co-credit @masta-g3 (PR #674): TUI session creation must produce
+// Tool="pi" rather than Tool="shell" with Command="pi", matching the
+// tmux/userconfig wiring already present.
+func TestCreateSessionTool_Pi(t *testing.T) {
+	tool, command := createSessionTool("pi")
+	if tool != "pi" || command != "pi" {
+		t.Fatalf("createSessionTool(\"pi\") = (%q, %q), want (\"pi\", \"pi\")", tool, command)
+	}
+}
+
 func TestHomeInit(t *testing.T) {
 	home := NewHome()
 	cmd := home.Init()
@@ -188,6 +198,35 @@ func TestHomeUpdateResize(t *testing.T) {
 	}
 	if h.height != 40 {
 		t.Errorf("Height = %d, want 40", h.height)
+	}
+}
+
+// TestHomeUpdateStatusUpdateMsgBatchesKeyboardRestore is a regression guard for
+// PR #613 (Bug 2 from issue #472). After the user detaches from a tmux attach,
+// statusUpdateMsg's non-reload path must return a tea.Batch that includes the
+// RestoreLegacyKeyboardCmd helper alongside tea.EnableMouseCellMotion. If a
+// future refactor drops the keyboard-restore command, capitals silently break
+// on Ghostty after the first tmux attach/detach cycle, and this test catches
+// that regression.
+func TestHomeUpdateStatusUpdateMsgBatchesKeyboardRestore(t *testing.T) {
+	home := NewHome()
+
+	_, cmd := home.Update(statusUpdateMsg{})
+	if cmd == nil {
+		t.Fatal("statusUpdateMsg returned nil cmd; keyboard-restore batch removed?")
+	}
+
+	msg := cmd()
+	batch, ok := msg.(tea.BatchMsg)
+	if !ok {
+		t.Fatalf(
+			"expected statusUpdateMsg to return a tea.BatchMsg (mouse + keyboard restore); got %T. "+
+				"RestoreLegacyKeyboardCmd was likely dropped from the handler, which will regress capitals on Ghostty after tmux detach.",
+			msg,
+		)
+	}
+	if len(batch) < 2 {
+		t.Fatalf("expected batch of >= 2 commands (EnableMouseCellMotion + RestoreLegacyKeyboardCmd); got %d", len(batch))
 	}
 }
 
@@ -1232,6 +1271,226 @@ func TestRemoteRestartReturnsRemoteCommand(t *testing.T) {
 	_ = h
 }
 
+func TestRemoteSelectionNOpensNewDialog(t *testing.T) {
+	home := NewHome()
+	home.width = 100
+	home.height = 30
+
+	remote := session.RemoteSessionInfo{ID: "remote-123", Title: "remote-session", RemoteName: "myserver"}
+	home.flatItems = []session.Item{{Type: session.ItemTypeRemoteSession, RemoteSession: &remote, RemoteName: "myserver"}}
+	home.cursor = 0
+
+	model, cmd := home.handleMainKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
+	h, ok := model.(*Home)
+	if !ok {
+		t.Fatal("handleMainKey should return *Home")
+	}
+	if cmd != nil {
+		t.Fatal("pressing n on remote selection should not execute remote attach command")
+	}
+	if !h.newDialog.IsVisible() {
+		t.Fatal("pressing n on remote selection should open new session dialog")
+	}
+}
+
+func TestSelectedRemotePreviewTarget(t *testing.T) {
+	home := NewHome()
+	home.width = 100
+	home.height = 30
+
+	remote := session.RemoteSessionInfo{ID: "remote-123", Title: "remote-session", RemoteName: "myserver"}
+	home.flatItems = []session.Item{{Type: session.ItemTypeRemoteSession, RemoteSession: &remote, RemoteName: "myserver"}}
+	home.cursor = 0
+
+	remoteName, sessionID, previewKey, ok := home.selectedRemotePreviewTarget()
+	if !ok {
+		t.Fatal("selectedRemotePreviewTarget should resolve remote selection")
+	}
+	if remoteName != "myserver" {
+		t.Fatalf("remoteName = %q, want %q", remoteName, "myserver")
+	}
+	if sessionID != "remote-123" {
+		t.Fatalf("sessionID = %q, want %q", sessionID, "remote-123")
+	}
+	if previewKey != "remote:myserver:remote-123" {
+		t.Fatalf("previewKey = %q, want %q", previewKey, "remote:myserver:remote-123")
+	}
+}
+
+func TestRemoteSelectionQuickCreateStillRunsRemoteCommand(t *testing.T) {
+	home := NewHome()
+	home.width = 100
+	home.height = 30
+
+	remote := session.RemoteSessionInfo{ID: "remote-123", Title: "remote-session", RemoteName: "myserver"}
+	home.flatItems = []session.Item{{Type: session.ItemTypeRemoteSession, RemoteSession: &remote, RemoteName: "myserver"}}
+	home.cursor = 0
+
+	_, cmd := home.handleMainKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'N'}})
+	if cmd == nil {
+		t.Fatal("pressing N on remote selection should return remote create command")
+	}
+
+	msg := cmd()
+	createMsg, ok := msg.(sessionCreatedMsg)
+	if !ok {
+		t.Fatalf("command returned %T, want sessionCreatedMsg", msg)
+	}
+	if createMsg.err == nil {
+		t.Fatal("expected error when remote config is unavailable")
+	}
+}
+
+func TestRenderRemotePreviewIncludesCachedResponse(t *testing.T) {
+	home := NewHome()
+	home.width = 100
+	home.height = 30
+
+	remote := session.RemoteSessionInfo{
+		ID:     "remote-123",
+		Title:  "remote-session",
+		Status: "waiting",
+		Path:   "/srv/project",
+	}
+	item := session.Item{Type: session.ItemTypeRemoteSession, RemoteSession: &remote, RemoteName: "myserver"}
+
+	home.previewCache[remotePreviewCacheKey("myserver", "remote-123")] = "Remote answer"
+
+	rendered := home.renderRemotePreview(item, 80, 20)
+	if !strings.Contains(rendered, "Last response") {
+		t.Fatalf("rendered preview should include last response header, got: %q", rendered)
+	}
+	if !strings.Contains(rendered, "Remote answer") {
+		t.Fatalf("rendered preview should include cached remote response, got: %q", rendered)
+	}
+}
+
+func TestRemoteGroupSelectionNOpensNewDialog(t *testing.T) {
+	home := NewHome()
+	home.width = 100
+	home.height = 30
+
+	home.flatItems = []session.Item{{Type: session.ItemTypeRemoteGroup, RemoteName: "myserver", Path: "remotes/myserver"}}
+	home.cursor = 0
+
+	model, cmd := home.handleMainKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
+	h, ok := model.(*Home)
+	if !ok {
+		t.Fatal("handleMainKey should return *Home")
+	}
+	if cmd != nil {
+		t.Fatal("pressing n on remote group should not execute remote attach command")
+	}
+	if !h.newDialog.IsVisible() {
+		t.Fatal("pressing n on remote group should open new session dialog")
+	}
+}
+
+func TestRenderRemotePreviewShowsEmptyStateAfterFetch(t *testing.T) {
+	home := NewHome()
+	home.width = 100
+	home.height = 30
+
+	remote := session.RemoteSessionInfo{
+		ID:     "remote-123",
+		Title:  "remote-session",
+		Status: "waiting",
+		Path:   "/srv/project",
+	}
+	item := session.Item{Type: session.ItemTypeRemoteSession, RemoteSession: &remote, RemoteName: "myserver"}
+	key := remotePreviewCacheKey("myserver", "remote-123")
+
+	home.previewCache[key] = ""
+	home.previewCacheTime[key] = time.Now()
+
+	rendered := home.renderRemotePreview(item, 80, 20)
+	if !strings.Contains(rendered, "No response available yet.") {
+		t.Fatalf("rendered preview should show empty-state copy after a fetch, got: %q", rendered)
+	}
+	if strings.Contains(rendered, "Fetching remote preview...") {
+		t.Fatalf("rendered preview should not keep showing the loading state after an empty fetch, got: %q", rendered)
+	}
+}
+
+func TestRenderRemotePreviewTruncatesCachedResponseLines(t *testing.T) {
+	home := NewHome()
+	home.width = 100
+	home.height = 30
+
+	remote := session.RemoteSessionInfo{
+		ID:     "remote-123",
+		Title:  "remote-session",
+		Status: "running",
+		Path:   "/srv/project",
+	}
+	item := session.Item{Type: session.ItemTypeRemoteSession, RemoteSession: &remote, RemoteName: "myserver"}
+
+	lines := make([]string, 250)
+	for i := range lines {
+		lines[i] = fmt.Sprintf("line-%03d", i)
+	}
+	home.previewCache[remotePreviewCacheKey("myserver", "remote-123")] = strings.Join(lines, "\n")
+
+	rendered := home.renderRemotePreview(item, 80, 20)
+	if strings.Contains(rendered, "line-049") {
+		t.Fatalf("rendered preview should drop lines outside the retained tail, got: %q", rendered)
+	}
+	if !strings.Contains(rendered, "line-050") || !strings.Contains(rendered, "line-249") {
+		t.Fatalf("rendered preview should retain the last 200 lines, got: %q", rendered)
+	}
+}
+
+func TestRenderRemotePreviewTruncatesCachedResponseBytes(t *testing.T) {
+	home := NewHome()
+	home.width = 100
+	home.height = 30
+
+	remote := session.RemoteSessionInfo{
+		ID:     "remote-123",
+		Title:  "remote-session",
+		Status: "running",
+		Path:   "/srv/project",
+	}
+	item := session.Item{Type: session.ItemTypeRemoteSession, RemoteSession: &remote, RemoteName: "myserver"}
+
+	prefix := "TRUNCATE-ME"
+	tail := "KEEP-TAIL"
+	content := prefix + strings.Repeat("x", 20*1024) + tail
+	home.previewCache[remotePreviewCacheKey("myserver", "remote-123")] = content
+
+	rendered := home.renderRemotePreview(item, 80, 20)
+	if strings.Contains(rendered, prefix) {
+		t.Fatalf("rendered preview should drop content beyond the byte cap, got: %q", rendered)
+	}
+	if !strings.Contains(rendered, tail) {
+		t.Fatalf("rendered preview should keep the most recent content, got: %q", rendered)
+	}
+}
+
+func TestPreviewFetchedMsgUpdatesCacheTimeOnError(t *testing.T) {
+	home := NewHome()
+	key := remotePreviewCacheKey("myserver", "remote-123")
+	home.previewFetchingID = key
+	before := time.Now()
+
+	model, _ := home.Update(previewFetchedMsg{previewKey: key, err: fmt.Errorf("fetch failed")})
+	updated := model.(*Home)
+
+	if updated.previewFetchingID != "" {
+		t.Fatal("previewFetchingID should be cleared after fetch completion")
+	}
+	cacheTime, ok := updated.previewCacheTime[key]
+	if !ok {
+		t.Fatal("preview cache time should be recorded even when fetch fails")
+	}
+	if cacheTime.Before(before) {
+		t.Fatalf("preview cache time %v should be at or after %v", cacheTime, before)
+	}
+	if _, ok := updated.previewCache[key]; ok {
+		t.Fatal("preview content should not be cached when fetch fails")
+	}
+}
+
 func TestRenderHelpBarTiny(t *testing.T) {
 	home := NewHome()
 	home.width = 45 // Tiny mode (<50 cols)
@@ -1324,6 +1583,27 @@ func TestRenderHelpBarMinimalWithSession(t *testing.T) {
 	// Should NOT contain full descriptions
 	if strings.Contains(result, "Attach") {
 		t.Error("Minimal help bar should not contain full descriptions")
+	}
+}
+
+func TestRenderHelpBarMinimalWithFreshRestartableSession(t *testing.T) {
+	home := NewHome()
+	home.width = 55
+	home.height = 30
+
+	testSession := &session.Instance{
+		ID:              "test-456",
+		Title:           "Fresh Restart Session",
+		Tool:            "claude",
+		ClaudeSessionID: "session-xyz",
+	}
+	home.flatItems = []session.Item{{Type: session.ItemTypeSession, Session: testSession}}
+	home.cursor = 0
+
+	result := home.renderHelpBar()
+
+	if !strings.Contains(result, "T") {
+		t.Error("Minimal help bar should contain T key for fresh restart")
 	}
 }
 
@@ -2072,6 +2352,28 @@ func TestRestartSessionCmdSessionMissingReturnsError(t *testing.T) {
 	}
 }
 
+func TestRestartSessionFreshCmdSessionMissingReturnsError(t *testing.T) {
+	home := NewHome()
+	inst := session.NewInstance("restart-fresh-test", "/tmp/project")
+
+	cmd := home.restartSessionFresh(inst)
+	home.instancesMu.Lock()
+	delete(home.instanceByID, inst.ID)
+	home.instancesMu.Unlock()
+
+	msg := cmd()
+	restarted, ok := msg.(sessionRestartedMsg)
+	if !ok {
+		t.Fatalf("expected sessionRestartedMsg, got %T", msg)
+	}
+	if restarted.err == nil {
+		t.Fatal("expected error when session no longer exists")
+	}
+	if !strings.Contains(restarted.err.Error(), "session no longer exists") {
+		t.Fatalf("unexpected error: %v", restarted.err)
+	}
+}
+
 func TestRebuildFlatItemsAutoClearsEmptyStatusFilter(t *testing.T) {
 	home := NewHome()
 	home.initialLoading = false
@@ -2347,5 +2649,185 @@ func TestScopedGroupPaths(t *testing.T) {
 		if p == "personal" {
 			t.Error("scopedGroupPaths should not include 'personal' when scoped to 'work'")
 		}
+	}
+}
+
+func TestStatusUpdateMsg_PreservesSelectedSessionAcrossRebuild(t *testing.T) {
+	h := newAttachReturnTestHome()
+	s1 := session.NewInstanceWithGroup("first", "/tmp/first", "work")
+	s1.ID = "s1"
+	s2 := session.NewInstanceWithGroup("second", "/tmp/second", "work")
+	s2.ID = "s2"
+	setAttachReturnTestInstances(h, []*session.Instance{s1, s2})
+
+	h.groupTree = session.NewGroupTree([]*session.Instance{s2, s1})
+
+	model, _ := h.Update(statusUpdateMsg{})
+	home := model.(*Home)
+
+	if got := selectedSessionID(home); got != s2.ID {
+		t.Fatalf("selected session = %q, want %q", got, s2.ID)
+	}
+}
+
+func TestStatusUpdateMsg_FollowsNotificationSwitchSession(t *testing.T) {
+	h := newAttachReturnTestHome()
+	s1 := session.NewInstanceWithGroup("first", "/tmp/first", "work")
+	s1.ID = "s1"
+	s2 := session.NewInstanceWithGroup("second", "/tmp/second", "work")
+	s2.ID = "s2"
+	setAttachReturnTestInstances(h, []*session.Instance{s1, s2})
+
+	h.lastNotifSwitchID = s1.ID
+	h.groupTree = session.NewGroupTree([]*session.Instance{s2, s1})
+
+	model, _ := h.Update(statusUpdateMsg{})
+	home := model.(*Home)
+
+	if got := selectedSessionID(home); got != s1.ID {
+		t.Fatalf("selected session = %q, want switched session %q", got, s1.ID)
+	}
+	if home.lastNotifSwitchID != "" {
+		t.Fatalf("lastNotifSwitchID = %q, want cleared", home.lastNotifSwitchID)
+	}
+}
+
+func TestAttachReturnGraceSuppressesPreviewRefresh(t *testing.T) {
+	h := NewHome()
+	now := time.Now()
+	h.beginAttachReturnGrace(now)
+
+	if !h.shouldSuppressPreviewRefresh(now.Add(attachReturnPreviewGrace / 2)) {
+		t.Fatal("expected preview refresh suppression during attach-return grace period")
+	}
+	if h.shouldSuppressPreviewRefresh(now.Add(attachReturnPreviewGrace + 100*time.Millisecond)) {
+		t.Fatal("expected preview refresh suppression to expire after grace period")
+	}
+	if hotUntil := time.Unix(0, h.navigationHotUntil.Load()); !hotUntil.After(now) {
+		t.Fatal("expected navigation hot window after attach return")
+	}
+}
+
+func newAttachReturnTestHome() *Home {
+	h := NewHome()
+	h.width = 100
+	h.height = 30
+	h.initialLoading = false
+	return h
+}
+
+func setAttachReturnTestInstances(h *Home, instances []*session.Instance) {
+	h.instancesMu.Lock()
+	h.instances = instances
+	h.instanceByID = make(map[string]*session.Instance, len(instances))
+	for _, inst := range instances {
+		h.instanceByID[inst.ID] = inst
+	}
+	h.instancesMu.Unlock()
+	h.groupTree = session.NewGroupTree(instances)
+	h.rebuildFlatItems()
+	h.moveCursorToSession(instances[len(instances)-1].ID)
+}
+
+func selectedSessionID(h *Home) string {
+	if h.cursor < 0 || h.cursor >= len(h.flatItems) {
+		return ""
+	}
+	item := h.flatItems[h.cursor]
+	if item.Type == session.ItemTypeSession && item.Session != nil {
+		return item.Session.ID
+	}
+	return ""
+}
+
+// TestHandleMainKeyQuickApproveWaitingSession verifies that pressing the
+// quick-approve hotkey on a waiting session returns the home model without
+// panicking. With no attached tmux session the send is a no-op, which is the
+// behavior we want to confirm for the happy path.
+func TestHandleMainKeyQuickApproveWaitingSession(t *testing.T) {
+	home := NewHome()
+	home.width = 100
+	home.height = 30
+
+	inst := &session.Instance{
+		ID:     "session-waiting",
+		Title:  "Waiting Session",
+		Tool:   "claude",
+		Status: session.StatusWaiting,
+	}
+	home.flatItems = []session.Item{{Type: session.ItemTypeSession, Session: inst}}
+	home.cursor = 0
+	home.instanceByID[inst.ID] = inst
+
+	model, _ := home.handleMainKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
+	if _, ok := model.(*Home); !ok {
+		t.Fatal("handleMainKey should return *Home")
+	}
+}
+
+// TestHandleMainKeyQuickApproveOnRunningSession verifies the handler also
+// works on a running session (no status guard). Bash-tool permission prompts
+// in Claude Code leave the session in StatusRunning, so this is the common
+// case in practice.
+func TestHandleMainKeyQuickApproveOnRunningSession(t *testing.T) {
+	home := NewHome()
+	home.width = 100
+	home.height = 30
+
+	inst := &session.Instance{
+		ID:     "session-running",
+		Title:  "Running Session",
+		Tool:   "claude",
+		Status: session.StatusRunning,
+	}
+	home.flatItems = []session.Item{{Type: session.ItemTypeSession, Session: inst}}
+	home.cursor = 0
+	home.instanceByID[inst.ID] = inst
+
+	model, _ := home.handleMainKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
+	if _, ok := model.(*Home); !ok {
+		t.Fatal("handleMainKey should return *Home")
+	}
+}
+
+// TestHandleMainKeyQuickApproveOnGroupItem verifies the handler does not
+// crash when the cursor is on a non-session item such as a group.
+func TestHandleMainKeyQuickApproveOnGroupItem(t *testing.T) {
+	home := NewHome()
+	home.width = 100
+	home.height = 30
+
+	home.flatItems = []session.Item{
+		{Type: session.ItemTypeGroup, Path: "personal", Group: &session.Group{Name: "Personal"}},
+	}
+	home.cursor = 0
+
+	model, _ := home.handleMainKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
+	if _, ok := model.(*Home); !ok {
+		t.Fatal("handleMainKey should return *Home")
+	}
+}
+
+// TestHandleMainKeyQuickApproveSkipsNonClaudeTool verifies the tool guard:
+// pressing the hotkey on a non-Claude session (e.g. a shell pane) is a
+// silent no-op so a stray press cannot dump a "1" into a vim/shell buffer.
+func TestHandleMainKeyQuickApproveSkipsNonClaudeTool(t *testing.T) {
+	home := NewHome()
+	home.width = 100
+	home.height = 30
+
+	inst := &session.Instance{
+		ID:     "session-shell",
+		Title:  "Shell Session",
+		Tool:   "shell",
+		Status: session.StatusRunning,
+	}
+	home.flatItems = []session.Item{{Type: session.ItemTypeSession, Session: inst}}
+	home.cursor = 0
+	home.instanceByID[inst.ID] = inst
+
+	model, _ := home.handleMainKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
+	if _, ok := model.(*Home); !ok {
+		t.Fatal("handleMainKey should return *Home")
 	}
 }

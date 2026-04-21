@@ -2686,6 +2686,117 @@ func TestBuildStatusBarArgs_InjectDisabled(t *testing.T) {
 	assert.Nil(t, args, "args should be nil when injectStatusLine is false")
 }
 
+func TestBuildTerminalTitleArgs(t *testing.T) {
+	tests := []struct {
+		name            string
+		displayName     string
+		workDir         string
+		optionOverrides map[string]string
+		wantKeys        []string
+		skipKeys        []string
+	}{
+		{
+			name:        "defaults include metadata and title settings",
+			displayName: "tmux session title in terminal tab",
+			workDir:     "/tmp/agent-deck",
+			wantKeys:    []string{"@agentdeck_project_name", "@agentdeck_display_name", "set-titles", "set-titles-string"},
+		},
+		{
+			name:            "set-titles override skips only managed title toggle",
+			displayName:     "feature work",
+			workDir:         "/tmp/agent-deck",
+			optionOverrides: map[string]string{"set-titles": "off"},
+			wantKeys:        []string{"@agentdeck_project_name", "@agentdeck_display_name", "set-titles-string"},
+			skipKeys:        []string{"set-titles"},
+		},
+		{
+			name:            "set-titles-string override skips managed format only",
+			displayName:     "feature work",
+			workDir:         "/tmp/agent-deck",
+			optionOverrides: map[string]string{"set-titles-string": "custom"},
+			wantKeys:        []string{"@agentdeck_project_name", "@agentdeck_display_name", "set-titles"},
+			skipKeys:        []string{"set-titles-string"},
+		},
+		{
+			name:            "all managed title keys overridden still refreshes metadata",
+			displayName:     "feature work",
+			workDir:         "/tmp/agent-deck",
+			optionOverrides: map[string]string{"set-titles": "off", "set-titles-string": "custom"},
+			wantKeys:        []string{"@agentdeck_project_name", "@agentdeck_display_name"},
+			skipKeys:        []string{"set-titles", "set-titles-string"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := &Session{
+				Name:            "test-sess",
+				DisplayName:     tt.displayName,
+				WorkDir:         tt.workDir,
+				OptionOverrides: tt.optionOverrides,
+			}
+
+			args := s.buildTerminalTitleArgs()
+			require.NotEmpty(t, args)
+
+			valuesByKey := make(map[string]string)
+			for i, a := range args {
+				if a == "set-option" && i+4 < len(args) {
+					valuesByKey[args[i+3]] = args[i+4]
+				}
+			}
+
+			for _, key := range tt.wantKeys {
+				assert.Contains(t, valuesByKey, key, "expected key %q in args", key)
+			}
+			for _, key := range tt.skipKeys {
+				assert.NotContains(t, valuesByKey, key, "key %q should be skipped", key)
+			}
+
+			assert.Equal(t, filepath.Base(tt.workDir), valuesByKey["@agentdeck_project_name"])
+			assert.Equal(t, tt.displayName, valuesByKey["@agentdeck_display_name"])
+			if _, ok := valuesByKey["set-titles-string"]; ok {
+				assert.Equal(t, "[#{@agentdeck_project_name}] #{@agentdeck_display_name}", valuesByKey["set-titles-string"])
+			}
+		})
+	}
+}
+
+func TestConfigureTerminalTitle(t *testing.T) {
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("tmux not available")
+	}
+
+	root := t.TempDir()
+	projectDir := filepath.Join(root, "agent-deck")
+	require.NoError(t, os.Mkdir(projectDir, 0o755))
+
+	sessionName := "agentdeck_test_title_" + fmt.Sprintf("%d", time.Now().UnixNano())
+	cmd := exec.Command("tmux", "new-session", "-d", "-s", sessionName, "-c", projectDir)
+	require.NoError(t, cmd.Run())
+	defer func() {
+		_ = exec.Command("tmux", "kill-session", "-t", sessionName).Run()
+	}()
+
+	sess := &Session{
+		Name:        sessionName,
+		DisplayName: "tmux session title in terminal tab",
+		WorkDir:     projectDir,
+	}
+	sess.ConfigureTerminalTitle()
+
+	showOption := func(key string) string {
+		out, err := exec.Command("tmux", "show-option", "-t", sessionName, "-v", key).Output()
+		require.NoError(t, err)
+		return strings.TrimSpace(string(out))
+	}
+
+	assert.Equal(t, "agent-deck", showOption("@agentdeck_project_name"))
+	assert.Equal(t, "tmux session title in terminal tab", showOption("@agentdeck_display_name"))
+	assert.Equal(t, "on", showOption("set-titles"))
+	assert.Equal(t, "[#{@agentdeck_project_name}] #{@agentdeck_display_name}", showOption("set-titles-string"))
+}
+
 func TestStartCommandSpec_Default(t *testing.T) {
 	s := &Session{
 		Name:    "agentdeck_test-session_1234abcd",
@@ -2941,4 +3052,42 @@ func TestResolvedAgentDeckTheme_ExplicitConfigOverridesCOLORFGBG(t *testing.T) {
 	t.Setenv("COLORFGBG", "0;15")
 	got := resolvedAgentDeckTheme()
 	assert.Equal(t, "dark", got, "explicit config should override COLORFGBG")
+}
+
+func TestKillSessionsWithEnvValue(t *testing.T) {
+	skipIfNoTmuxServer(t)
+
+	// Create two sessions with the same CLAUDE_SESSION_ID env var
+	sess1 := createTestSession(t, "dedup-keep")
+	sess2 := createTestSession(t, "dedup-kill")
+
+	testID := "test-dedup-" + generateShortID()
+	require.NoError(t, exec.Command("tmux", "set-environment", "-t", sess1, "CLAUDE_SESSION_ID", testID).Run())
+	require.NoError(t, exec.Command("tmux", "set-environment", "-t", sess2, "CLAUDE_SESSION_ID", testID).Run())
+
+	// Kill duplicates, excluding sess1
+	KillSessionsWithEnvValue("CLAUDE_SESSION_ID", testID, sess1)
+
+	// sess1 should still exist
+	assert.NoError(t, exec.Command("tmux", "has-session", "-t", sess1).Run(), "kept session should still exist")
+
+	// sess2 should be killed
+	assert.Error(t, exec.Command("tmux", "has-session", "-t", sess2).Run(), "duplicate session should have been killed")
+}
+
+func TestKillSessionsWithEnvValue_EmptyID(t *testing.T) {
+	// Should be a no-op when envValue is empty
+	KillSessionsWithEnvValue("CLAUDE_SESSION_ID", "", "anything")
+}
+
+func TestKillSessionsWithEnvValue_NoMatch(t *testing.T) {
+	skipIfNoTmuxServer(t)
+
+	sess := createTestSession(t, "dedup-nomatch")
+	require.NoError(t, exec.Command("tmux", "set-environment", "-t", sess, "CLAUDE_SESSION_ID", "unique-id-xyz").Run())
+
+	// Should not kill anything when looking for a different ID
+	KillSessionsWithEnvValue("CLAUDE_SESSION_ID", "nonexistent-id", "")
+
+	assert.NoError(t, exec.Command("tmux", "has-session", "-t", sess).Run(), "session should not be killed")
 }

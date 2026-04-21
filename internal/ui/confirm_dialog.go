@@ -33,6 +33,7 @@ type ConfirmDialog struct {
 	height      int
 	mcpCount    int  // Number of running MCPs (for quit confirmation)
 	sandboxed   bool // Whether the session uses a Docker sandbox.
+	worktree    bool // Whether the session has an associated git worktree.
 
 	remoteName string // Remote name for remote session confirmations.
 
@@ -49,6 +50,7 @@ type ConfirmDialog struct {
 	pendingSessionCommand    string
 	pendingSessionGroupPath  string
 	pendingToolOptionsJSON   json.RawMessage // Generic tool options (claude, codex, etc.)
+	pendingClaudeExtraArgs   []string        // User-supplied claude CLI tokens
 	pendingParentSessionID   string
 	pendingParentProjectPath string
 }
@@ -59,12 +61,13 @@ func NewConfirmDialog() *ConfirmDialog {
 }
 
 // ShowDeleteSession shows confirmation for session deletion.
-func (c *ConfirmDialog) ShowDeleteSession(sessionID string, sessionName string, sandboxed bool) {
+func (c *ConfirmDialog) ShowDeleteSession(sessionID string, sessionName string, sandboxed, worktree bool) {
 	c.visible = true
 	c.confirmType = ConfirmDeleteSession
 	c.targetID = sessionID
 	c.targetName = sessionName
 	c.sandboxed = sandboxed
+	c.worktree = worktree
 	c.buttonCount = 2
 	c.focusedButton = 1 // default to Cancel
 }
@@ -130,6 +133,7 @@ func (c *ConfirmDialog) ShowCreateDirectory(
 	command string,
 	groupPath string,
 	toolOptionsJSON json.RawMessage,
+	claudeExtraArgs []string,
 	parentSessionID string,
 	parentProjectPath string,
 ) {
@@ -142,6 +146,7 @@ func (c *ConfirmDialog) ShowCreateDirectory(
 	c.pendingSessionCommand = command
 	c.pendingSessionGroupPath = groupPath
 	c.pendingToolOptionsJSON = toolOptionsJSON
+	c.pendingClaudeExtraArgs = claudeExtraArgs
 	c.pendingParentSessionID = parentSessionID
 	c.pendingParentProjectPath = parentProjectPath
 	c.buttonCount = 2
@@ -159,8 +164,8 @@ func (c *ConfirmDialog) ShowInstallHooks() {
 }
 
 // GetPendingSession returns the pending session creation data
-func (c *ConfirmDialog) GetPendingSession() (name, path, command, groupPath string, toolOptionsJSON json.RawMessage, parentSessionID, parentProjectPath string) {
-	return c.pendingSessionName, c.pendingSessionPath, c.pendingSessionCommand, c.pendingSessionGroupPath, c.pendingToolOptionsJSON, c.pendingParentSessionID, c.pendingParentProjectPath
+func (c *ConfirmDialog) GetPendingSession() (name, path, command, groupPath string, toolOptionsJSON json.RawMessage, claudeExtraArgs []string, parentSessionID, parentProjectPath string) {
+	return c.pendingSessionName, c.pendingSessionPath, c.pendingSessionCommand, c.pendingSessionGroupPath, c.pendingToolOptionsJSON, c.pendingClaudeExtraArgs, c.pendingParentSessionID, c.pendingParentProjectPath
 }
 
 // Hide hides the dialog.
@@ -258,6 +263,9 @@ func (c *ConfirmDialog) View() string {
 		title = "⚠  Delete Session?"
 		warning = fmt.Sprintf("This will permanently delete the session:\n\n  \"%s\"", c.targetName)
 		details = "• The tmux session will be terminated\n• Any running processes will be killed\n• Terminal history will be lost"
+		if c.worktree {
+			details += "\n• The git worktree directory will be removed"
+		}
 		if c.sandboxed {
 			details += "\n• The Docker container will be removed"
 		}

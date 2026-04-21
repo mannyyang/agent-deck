@@ -28,6 +28,7 @@ const (
 // zero-subprocess command execution through the stdin/stdout pipe.
 type ControlPipe struct {
 	sessionName string
+	socketName  string // tmux -L value; "" means user's default server
 	cmd         *exec.Cmd
 	stdin       io.WriteCloser
 	stdout      io.ReadCloser
@@ -55,6 +56,12 @@ type ControlPipe struct {
 	// Lifecycle
 	done      chan struct{}
 	closeOnce sync.Once
+
+	// waitOnce guards cmd.Wait() so exactly one of reader() (natural EOF)
+	// and Close() (manual shutdown) reaps the child. Without this, a tmux
+	// subprocess that exited on its own became a zombie until Close() was
+	// eventually called — or forever if it never was (#677).
+	waitOnce sync.Once
 }
 
 type commandResponse struct {
@@ -62,14 +69,17 @@ type commandResponse struct {
 	err    error
 }
 
-// NewControlPipe starts a tmux control mode pipe attached to the given session.
-// Blocks until the initial handshake completes (or a short timeout), so the pipe
-// is ready for SendCommand immediately after return. Retries a few times to
-// smooth over transient tmux/control-mode startup failures.
-func NewControlPipe(sessionName string) (*ControlPipe, error) {
+// NewControlPipe starts a tmux control mode pipe attached to the given session
+// on the given socket. socketName is the tmux `-L <name>` selector captured at
+// session-creation time (Instance.TmuxSocketName / Session.SocketName); pass ""
+// to target the user's default tmux server. Blocks until the initial handshake
+// completes (or a short timeout), so the pipe is ready for SendCommand
+// immediately after return. Retries a few times to smooth over transient
+// tmux/control-mode startup failures.
+func NewControlPipe(sessionName, socketName string) (*ControlPipe, error) {
 	var lastErr error
 	for attempt := 1; attempt <= controlPipeConnectAttempts; attempt++ {
-		cp, err := newControlPipeOnce(sessionName)
+		cp, err := newControlPipeOnce(sessionName, socketName)
 		if err == nil {
 			return cp, nil
 		}
@@ -80,6 +90,7 @@ func NewControlPipe(sessionName string) (*ControlPipe, error) {
 		pipeLog.Debug(
 			"pipe_connect_retry",
 			slog.String("session", sessionName),
+			slog.String("socket", socketName),
 			slog.Int("attempt", attempt),
 			slog.String("error", err.Error()),
 		)
@@ -88,8 +99,8 @@ func NewControlPipe(sessionName string) (*ControlPipe, error) {
 	return nil, lastErr
 }
 
-func newControlPipeOnce(sessionName string) (*ControlPipe, error) {
-	cmd := exec.Command("tmux", "-C", "attach-session", "-t", sessionName)
+func newControlPipeOnce(sessionName, socketName string) (*ControlPipe, error) {
+	cmd := tmuxExec(socketName, "-C", "attach-session", "-t", sessionName)
 	// Put in own process group so we can kill the entire group on shutdown
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
@@ -110,6 +121,7 @@ func newControlPipeOnce(sessionName string) (*ControlPipe, error) {
 
 	cp := &ControlPipe{
 		sessionName:  sessionName,
+		socketName:   socketName,
 		cmd:          cmd,
 		stdin:        stdin,
 		stdout:       stdout,
@@ -146,6 +158,15 @@ func newControlPipeOnce(sessionName string) (*ControlPipe, error) {
 	return cp, nil
 }
 
+// reap calls cmd.Wait() exactly once, harvesting the child's exit status and
+// freeing its process-table entry. Safe to call from any goroutine; extra
+// calls are no-ops. Required to prevent zombie accumulation (#677).
+func (cp *ControlPipe) reap() {
+	cp.waitOnce.Do(func() {
+		_ = cp.cmd.Wait()
+	})
+}
+
 // reader is the goroutine that parses tmux control mode protocol events.
 // It handles %output, %begin/%end/%error for command responses, and
 // silently skips all other %-prefixed control lines.
@@ -154,6 +175,9 @@ func (cp *ControlPipe) reader() {
 		cp.mu.Lock()
 		cp.alive = false
 		cp.mu.Unlock()
+		// Reap the child before signaling done so anyone watching Done()
+		// can rely on the process being fully torn down (#677).
+		cp.reap()
 		close(cp.done)
 		pipeLog.Debug("pipe_reader_exited", slog.String("session", cp.sessionName))
 	}()
@@ -345,8 +369,9 @@ func (cp *ControlPipe) Close() {
 			}
 		}
 
-		// Wait for the process to exit (prevents zombies)
-		_ = cp.cmd.Wait()
+		// Wait for the process to exit (prevents zombies). Routed through
+		// reap() so reader() and Close() cannot double-Wait (#677).
+		cp.reap()
 
 		pipeLog.Debug("pipe_closed", slog.String("session", cp.sessionName))
 	})

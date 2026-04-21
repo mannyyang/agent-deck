@@ -23,6 +23,7 @@ import (
 	"io"
 	"os"
 
+	"github.com/asheshgoplani/agent-deck/internal/termreply"
 	tea "github.com/charmbracelet/bubbletea"
 )
 
@@ -33,6 +34,25 @@ import (
 // that do not support the protocol ignore the sequence.
 func DisableKittyKeyboard(w io.Writer) {
 	_, _ = io.WriteString(w, "\x1b[<u")
+}
+
+// RestoreLegacyKeyboardCmd returns a tea.Cmd that pops the Kitty keyboard
+// protocol stack, restoring legacy key reporting on the given writer.
+//
+// This is the cleanup half of the attach/detach symmetry: when the dashboard
+// hands control to tmux via tea.Exec, tmux's extended-keys setting activates
+// Kitty/modifyOtherKeys on the outer terminal. Those settings persist after
+// the user detaches, so the outer terminal keeps sending CSI u sequences that
+// Bubble Tea v1.3.10 cannot parse, silently dropping shifted keys (capitals)
+// on the dashboard. Dispatching this command after tea.Exec returns undoes the
+// state tmux set.
+//
+// Takes a writer so tests can substitute a buffer for os.Stdout.
+func RestoreLegacyKeyboardCmd(w io.Writer) tea.Cmd {
+	return func() tea.Msg {
+		DisableKittyKeyboard(w)
+		return nil
+	}
 }
 
 // EnableKittyKeyboard writes the escape sequence that pushes Kitty keyboard
@@ -245,10 +265,11 @@ func parseDecimalBytes(b []byte) int {
 // sequences in the byte stream and translates them into legacy byte sequences
 // that Bubble Tea can parse. All other bytes pass through unchanged.
 type csiuReader struct {
-	src    io.Reader
-	outBuf []byte // pending translated bytes to emit
-	inBuf  []byte // buffered input bytes not yet processed
-	err    error  // pending source error to return after draining buffers
+	src         io.Reader
+	outBuf      []byte // pending translated bytes to emit
+	inBuf       []byte // buffered input bytes not yet processed
+	err         error  // pending source error to return after draining buffers
+	replyFilter termreply.Filter
 }
 
 // csiuFileReader wraps a *os.File and overrides Read with CSI u translation.
@@ -306,7 +327,14 @@ func (c *csiuReader) Read(p []byte) (int, error) {
 		tmp := make([]byte, len(p))
 		n, err := c.src.Read(tmp)
 		if n > 0 {
-			c.inBuf = append(c.inBuf, tmp[:n]...)
+			chunk := tmp[:n]
+			if termreply.Active() || c.replyFilter.Active() {
+				chunk = c.replyFilter.Consume(chunk, termreply.Active(), false)
+			}
+			c.inBuf = append(c.inBuf, chunk...)
+		}
+		if err == io.EOF && (termreply.Active() || c.replyFilter.Active()) {
+			c.inBuf = append(c.inBuf, c.replyFilter.Consume(nil, termreply.Active(), true)...)
 		}
 
 		processed := c.translate(err == io.EOF)

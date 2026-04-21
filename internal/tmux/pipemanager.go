@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
-	"os/exec"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -49,7 +49,10 @@ func NewPipeManager(ctx context.Context, onOutput func(sessionName string)) *Pip
 // Connect creates a control mode pipe for the given tmux session.
 // If a pipe already exists and is alive, this is a no-op.
 // Uses reconnecting map to prevent concurrent pipe creation for the same session.
-func (pm *PipeManager) Connect(sessionName string) error {
+// Connect opens a control-mode pipe to sessionName on the tmux server selected
+// by socketName (Session.SocketName). Pass "" to target the user's default
+// server. Safe to call repeatedly; a live pipe short-circuits and returns nil.
+func (pm *PipeManager) Connect(sessionName, socketName string) error {
 	pm.mu.Lock()
 
 	// Already connected and alive?
@@ -80,8 +83,13 @@ func (pm *PipeManager) Connect(sessionName string) error {
 		pm.reconnectMu.Unlock()
 	}()
 
+	// Kill stale control-mode clients left over from previous TUI instances.
+	// Without this, each TUI reconnect accumulates orphan `tmux -C attach-session`
+	// processes that are never cleaned up (#595).
+	killStaleControlClients(sessionName, socketName)
+
 	// Create new pipe (outside lock since it spawns a process)
-	pipe, err := NewControlPipe(sessionName)
+	pipe, err := NewControlPipe(sessionName, socketName)
 	if err != nil {
 		return fmt.Errorf("connect pipe for %s: %w", sessionName, err)
 	}
@@ -385,15 +393,21 @@ func (pm *PipeManager) watchPipe(sessionName string, pipe *ControlPipe) {
 
 		// Check if session still exists before trying to reconnect.
 		// Avoids infinite reconnect loops for deleted/non-existent sessions.
-		if !tmuxSessionExists(sessionName) {
-			pipeLog.Debug("pipe_reconnect_session_gone", slog.String("session", sessionName))
+		// Target the same socket the original pipe lived on — checking the
+		// default server for a session that lives on an isolated agent-deck
+		// socket would answer "no" and silently delete a healthy pipe.
+		reconnectSocket := pipe.socketName
+		if !tmuxSessionExistsOnSocket(reconnectSocket, sessionName) {
+			pipeLog.Debug("pipe_reconnect_session_gone",
+				slog.String("session", sessionName),
+				slog.String("socket", reconnectSocket))
 			pm.mu.Lock()
 			delete(pm.pipes, sessionName)
 			pm.mu.Unlock()
 			return
 		}
 
-		err := pm.Connect(sessionName)
+		err := pm.Connect(sessionName, reconnectSocket)
 		if err == nil {
 			pipeLog.Info("pipe_reconnected", slog.String("session", sessionName))
 			return
@@ -417,9 +431,55 @@ func (pm *PipeManager) watchPipe(sessionName string, pipe *ControlPipe) {
 	pm.mu.Unlock()
 }
 
-// tmuxSessionExists checks if a tmux session exists (lightweight subprocess).
-func tmuxSessionExists(name string) bool {
-	cmd := exec.Command("tmux", "has-session", "-t", name)
+// killStaleControlClients kills control-mode clients attached to a session that
+// are not owned by the current process. These accumulate when the TUI is killed
+// without clean shutdown and restarted — the old `tmux -C attach-session`
+// processes survive because they run in their own process group (#595).
+//
+// Expected to find stale clients after: agent-deck crash/SIGKILL, OOM kill,
+// or any exit that bypasses PipeManager.Close() (which normally tears them down).
+func killStaleControlClients(sessionName, socketName string) {
+	myPID := os.Getpid()
+
+	out, err := tmuxExec(socketName,
+		"list-clients", "-t", sessionName,
+		"-F", "#{client_control_mode} #{client_pid}",
+	).Output()
+	if err != nil {
+		return // session may not exist or no clients attached
+	}
+
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, " ", 2)
+		if len(parts) != 2 || parts[0] != "1" {
+			continue // not a control-mode client
+		}
+		var pid int
+		if _, err := fmt.Sscanf(parts[1], "%d", &pid); err != nil || pid == 0 {
+			continue
+		}
+		if pid == myPID {
+			continue // don't kill our own process
+		}
+		// Kill the stale control-mode client process
+		if proc, err := os.FindProcess(pid); err == nil {
+			_ = proc.Kill()
+			pipeLog.Debug("killed_stale_control_client",
+				slog.String("session", sessionName),
+				slog.Int("pid", pid))
+		}
+	}
+}
+
+// tmuxSessionExistsOnSocket targets an explicit tmux server. socketName is the
+// tmux `-L <name>` selector (Session.SocketName / Instance.TmuxSocketName);
+// pass "" for the default server. All callers (watchPipe reconnect loop,
+// public HasSession/HasSessionOnSocket in tmux.go) go through this.
+func tmuxSessionExistsOnSocket(socketName, name string) bool {
+	cmd := tmuxExec(socketName, "has-session", "-t", name)
 	return cmd.Run() == nil
 }
 

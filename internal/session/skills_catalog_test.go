@@ -77,6 +77,138 @@ func TestLoadSkillSources_DefaultsWhenMissing(t *testing.T) {
 	}
 }
 
+func TestExpandSkillPath_DollarHome(t *testing.T) {
+	homeDir, cleanup := setupSkillTestEnv(t)
+	defer cleanup()
+
+	got := expandSkillPath("$HOME/.agent-deck/skills/pool")
+	want := filepath.Join(homeDir, ".agent-deck", "skills", "pool")
+	if got != want {
+		t.Fatalf("expandSkillPath($HOME/...) = %q, want %q", got, want)
+	}
+}
+
+func TestExpandSkillPath_BracedDollarHome(t *testing.T) {
+	homeDir, cleanup := setupSkillTestEnv(t)
+	defer cleanup()
+
+	got := expandSkillPath("${HOME}/foo")
+	want := filepath.Join(homeDir, "foo")
+	if got != want {
+		t.Fatalf("expandSkillPath(${HOME}/foo) = %q, want %q", got, want)
+	}
+}
+
+func TestExpandSkillPath_BareDollarHome(t *testing.T) {
+	homeDir, cleanup := setupSkillTestEnv(t)
+	defer cleanup()
+
+	if got := expandSkillPath("$HOME"); got != homeDir {
+		t.Fatalf("expandSkillPath($HOME) = %q, want %q", got, homeDir)
+	}
+	if got := expandSkillPath("${HOME}"); got != homeDir {
+		t.Fatalf("expandSkillPath(${HOME}) = %q, want %q", got, homeDir)
+	}
+}
+
+func TestExpandSkillPath_DollarHomeSubstringPreserved(t *testing.T) {
+	_, cleanup := setupSkillTestEnv(t)
+	defer cleanup()
+
+	// $HOMEBREW must NOT match $HOME — env var name is HOMEBREW, not HOME.
+	got := expandSkillPath("/etc/$HOMEBREW/foo")
+	want := filepath.Clean("/etc/$HOMEBREW/foo")
+	if got != want {
+		t.Fatalf("expandSkillPath(/etc/$HOMEBREW/foo) = %q, want %q", got, want)
+	}
+}
+
+func TestExpandSkillPath_UnknownEnvVarPreserved(t *testing.T) {
+	_, cleanup := setupSkillTestEnv(t)
+	defer cleanup()
+
+	// Only $HOME is expanded. Other env refs pass through verbatim so sources.toml
+	// does not silently inherit arbitrary process environment into config paths.
+	got := expandSkillPath("$USER/foo")
+	want := filepath.Clean("$USER/foo")
+	if got != want {
+		t.Fatalf("expandSkillPath($USER/foo) = %q, want %q", got, want)
+	}
+}
+
+func TestLoadSkillSources_ExpandsDollarHomeOnLoad(t *testing.T) {
+	homeDir, cleanup := setupSkillTestEnv(t)
+	defer cleanup()
+
+	sourcesPath, err := GetSkillSourcesPath()
+	if err != nil {
+		t.Fatalf("GetSkillSourcesPath failed: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(sourcesPath), 0o700); err != nil {
+		t.Fatalf("failed to create sources dir: %v", err)
+	}
+
+	toml := "[sources.pool]\n" +
+		`path = "$HOME/.agent-deck/skills/pool"` + "\n" +
+		`description = "sync-from-mac"` + "\n" +
+		"enabled = true\n"
+	if err := os.WriteFile(sourcesPath, []byte(toml), 0o600); err != nil {
+		t.Fatalf("failed to write sources.toml: %v", err)
+	}
+
+	sources, err := LoadSkillSources()
+	if err != nil {
+		t.Fatalf("LoadSkillSources failed: %v", err)
+	}
+
+	pool, ok := sources["pool"]
+	if !ok {
+		t.Fatalf("expected pool source in sources map")
+	}
+	want := filepath.Join(homeDir, ".agent-deck", "skills", "pool")
+	if pool.Path != want {
+		t.Fatalf("pool.Path = %q, want %q (was $HOME expanded on load?)", pool.Path, want)
+	}
+}
+
+func TestLoadSkillSources_DiscoversSkillsViaDollarHome(t *testing.T) {
+	homeDir, cleanup := setupSkillTestEnv(t)
+	defer cleanup()
+
+	poolRoot := filepath.Join(homeDir, ".agent-deck", "skills", "pool")
+	writeSkillDir(t, poolRoot, "demo", "demo", "Demo skill for #617 repro")
+
+	sourcesPath, err := GetSkillSourcesPath()
+	if err != nil {
+		t.Fatalf("GetSkillSourcesPath failed: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(sourcesPath), 0o700); err != nil {
+		t.Fatalf("failed to create sources dir: %v", err)
+	}
+	toml := "[sources.pool]\n" +
+		`path = "$HOME/.agent-deck/skills/pool"` + "\n" +
+		"enabled = true\n"
+	if err := os.WriteFile(sourcesPath, []byte(toml), 0o600); err != nil {
+		t.Fatalf("failed to write sources.toml: %v", err)
+	}
+
+	candidates, err := ListAvailableSkills()
+	if err != nil {
+		t.Fatalf("ListAvailableSkills failed: %v", err)
+	}
+
+	found := false
+	for _, c := range candidates {
+		if c.Source == "pool" && c.Name == "demo" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected to discover pool/demo via $HOME expansion; got %d candidates: %+v", len(candidates), candidates)
+	}
+}
+
 func TestAddAndRemoveSkillSource(t *testing.T) {
 	_, cleanup := setupSkillTestEnv(t)
 	defer cleanup()
@@ -225,7 +357,7 @@ func TestAttachDetachSkillProject(t *testing.T) {
 	}
 	defer os.RemoveAll(projectPath)
 
-	attached, err := AttachSkillToProject(projectPath, "lint", "local")
+	attached, err := AttachSkillToProject(projectPath, "claude", "lint", "local")
 	if err != nil {
 		t.Fatalf("AttachSkillToProject failed: %v", err)
 	}
@@ -246,7 +378,7 @@ func TestAttachDetachSkillProject(t *testing.T) {
 		t.Fatalf("expected 1 manifest skill, got %d", len(manifest.Skills))
 	}
 
-	if _, err := AttachSkillToProject(projectPath, "lint", "local"); !errors.Is(err, ErrSkillAlreadyAttached) {
+	if _, err := AttachSkillToProject(projectPath, "claude", "lint", "local"); !errors.Is(err, ErrSkillAlreadyAttached) {
 		t.Fatalf("expected ErrSkillAlreadyAttached, got %v", err)
 	}
 
@@ -297,7 +429,41 @@ func TestAttachSkillToProject_RejectsLegacyFileSkill(t *testing.T) {
 	}
 	defer os.RemoveAll(projectPath)
 
-	_, err = AttachSkillToProject(projectPath, "legacy", "local")
+	_, err = AttachSkillToProject(projectPath, "claude", "legacy", "local")
+	if !errors.Is(err, ErrSkillUnsupportedKind) {
+		t.Fatalf("expected ErrSkillUnsupportedKind, got %v", err)
+	}
+}
+
+func TestApplyProjectSkills_RejectsLegacyFileSkill(t *testing.T) {
+	_, cleanup := setupSkillTestEnv(t)
+	defer cleanup()
+
+	sourcePath, err := os.MkdirTemp("", "agentdeck-legacy-file-source-*")
+	if err != nil {
+		t.Fatalf("failed to create source path: %v", err)
+	}
+	defer os.RemoveAll(sourcePath)
+
+	legacyPath := filepath.Join(sourcePath, "legacy.skill")
+	if err := os.WriteFile(legacyPath, []byte("legacy"), 0o644); err != nil {
+		t.Fatalf("failed to write legacy .skill file: %v", err)
+	}
+
+	projectPath, err := os.MkdirTemp("", "agentdeck-legacy-project-*")
+	if err != nil {
+		t.Fatalf("failed to create project path: %v", err)
+	}
+	defer os.RemoveAll(projectPath)
+
+	err = ApplyProjectSkills(projectPath, "claude", []SkillCandidate{{
+		ID:         "local/legacy",
+		Name:       "legacy",
+		Source:     "local",
+		SourcePath: legacyPath,
+		EntryName:  "legacy",
+		Kind:       "file",
+	}})
 	if !errors.Is(err, ErrSkillUnsupportedKind) {
 		t.Fatalf("expected ErrSkillUnsupportedKind, got %v", err)
 	}
@@ -326,7 +492,7 @@ func TestAttachSkillToProject_RematerializesBrokenSymlink(t *testing.T) {
 	}
 	defer os.RemoveAll(projectPath)
 
-	if _, err := AttachSkillToProject(projectPath, "lint", "local"); err != nil {
+	if _, err := AttachSkillToProject(projectPath, "claude", "lint", "local"); err != nil {
 		t.Fatalf("initial attach failed: %v", err)
 	}
 
@@ -341,7 +507,7 @@ func TestAttachSkillToProject_RematerializesBrokenSymlink(t *testing.T) {
 		t.Fatalf("expected broken symlink, stat err=%v", err)
 	}
 
-	if _, err := AttachSkillToProject(projectPath, "lint", "local"); err != nil {
+	if _, err := AttachSkillToProject(projectPath, "claude", "lint", "local"); err != nil {
 		t.Fatalf("reattach should rematerialize broken link, got %v", err)
 	}
 
@@ -414,7 +580,7 @@ func TestApplyProjectSkills_SyncsAttachments(t *testing.T) {
 		t.Fatalf("ResolveSkillCandidate(two) failed: %v", err)
 	}
 
-	if err := ApplyProjectSkills(projectPath, []SkillCandidate{*one}); err != nil {
+	if err := ApplyProjectSkills(projectPath, "claude", []SkillCandidate{*one}); err != nil {
 		t.Fatalf("ApplyProjectSkills(one) failed: %v", err)
 	}
 
@@ -422,7 +588,7 @@ func TestApplyProjectSkills_SyncsAttachments(t *testing.T) {
 		t.Fatalf("expected skill one materialized: %v", err)
 	}
 
-	if err := ApplyProjectSkills(projectPath, []SkillCandidate{*two}); err != nil {
+	if err := ApplyProjectSkills(projectPath, "claude", []SkillCandidate{*two}); err != nil {
 		t.Fatalf("ApplyProjectSkills(two) failed: %v", err)
 	}
 

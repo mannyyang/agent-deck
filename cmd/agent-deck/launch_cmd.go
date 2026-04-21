@@ -29,6 +29,7 @@ func handleLaunch(profile string, args []string) {
 	parent := fs.String("parent", "", "Parent session (creates sub-session, inherits group)")
 	parentShort := fs.String("p", "", "Parent session (short)")
 	noParent := fs.Bool("no-parent", false, "Disable automatic parent linking")
+	noTransitionNotify := fs.Bool("no-transition-notify", false, "Suppress transition event notifications to parent session")
 	jsonOutput := fs.Bool("json", false, "Output as JSON")
 	quiet := fs.Bool("quiet", false, "Minimal output")
 	quietShort := fs.Bool("q", false, "Minimal output (short)")
@@ -56,8 +57,23 @@ func handleLaunch(profile string, args []string) {
 		return nil
 	})
 
+	// Extra claude CLI tokens - repeatable; mirrors handleAdd's --extra-arg.
+	// Each invocation contributes one already-tokenised arg; feeds
+	// Instance.ExtraArgs which buildClaudeExtraFlags shellescapes and appends.
+	// Persisted plaintext in state.db — do NOT pass secrets like API keys.
+	var extraArgFlags []string
+	fs.Func("extra-arg", "Extra claude CLI token (can specify multiple times); requires -c claude; persisted plaintext — no secrets", func(s string) error {
+		extraArgFlags = append(extraArgFlags, s)
+		return nil
+	})
+
 	// Resume session flag
 	resumeSession := fs.String("resume-session", "", "Claude session ID to resume")
+
+	// Socket isolation (v1.7.50+, issue #687). Same semantics as
+	// `agent-deck add --tmux-socket`: overrides `[tmux].socket_name` for
+	// this one session, captured once and persisted on the Instance.
+	tmuxSocket := fs.String("tmux-socket", "", "tmux -L socket name for this session (overrides [tmux].socket_name)")
 
 	fs.Usage = func() {
 		fmt.Println("Usage: agent-deck launch [path] [options]")
@@ -164,6 +180,10 @@ func handleLaunch(profile string, args []string) {
 			os.Exit(1)
 		}
 
+		// Apply configured branch prefix before validation/existence checks
+		wtSettings := session.GetWorktreeSettings()
+		wtBranch = wtSettings.ApplyBranchPrefix(wtBranch)
+
 		if err := git.ValidateBranchName(wtBranch); err != nil {
 			out.Error(fmt.Sprintf("invalid branch name: %v", err), ErrCodeInvalidOperation)
 			os.Exit(1)
@@ -175,7 +195,6 @@ func handleLaunch(profile string, args []string) {
 			os.Exit(1)
 		}
 
-		wtSettings := session.GetWorktreeSettings()
 		location := wtSettings.DefaultLocation
 		if *worktreeLocation != "" {
 			location = *worktreeLocation
@@ -275,8 +294,22 @@ func handleLaunch(profile string, args []string) {
 		newInstance = session.NewInstance(sessionTitle, path)
 	}
 
+	// Socket-isolation CLI override (issue #687 phase 1, v1.7.50).
+	// Matches `agent-deck add --tmux-socket`. Whitespace-only flag falls
+	// back to the config default already seeded by NewInstance.
+	if flagSocket := strings.TrimSpace(*tmuxSocket); flagSocket != "" {
+		newInstance.TmuxSocketName = flagSocket
+		if ts := newInstance.GetTmuxSession(); ts != nil {
+			ts.SocketName = flagSocket
+		}
+	}
+
 	if parentInstance != nil {
 		newInstance.SetParentWithPath(parentInstance.ID, parentInstance.ProjectPath)
+	}
+
+	if *noTransitionNotify {
+		newInstance.NoTransitionNotify = true
 	}
 
 	if sessionCommandInput != "" {
@@ -291,6 +324,15 @@ func handleLaunch(profile string, args []string) {
 			os.Exit(1)
 		}
 		newInstance.Channels = channelFlags
+	}
+
+	// Apply --extra-arg flags (claude only; mirror of handleAdd).
+	if len(extraArgFlags) > 0 {
+		if newInstance.Tool != "claude" {
+			out.Error("--extra-arg only supported for claude sessions (use -c claude); claude is the only tool whose builder appends user extra args", ErrCodeInvalidOperation)
+			os.Exit(1)
+		}
+		newInstance.ExtraArgs = extraArgFlags
 	}
 
 	if sessionWrapperResolved != "" {

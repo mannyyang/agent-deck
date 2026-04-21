@@ -57,8 +57,9 @@ agent-deck-test
 
 # Tailwind brute-force diff gate scratch file (make css temp artifact)
 internal/web/static/.brute-tw.src.css
-
 # Python (bridge package caches & venv)
 __pycache__/
 *.pyc
 .venv/
+
+/dist

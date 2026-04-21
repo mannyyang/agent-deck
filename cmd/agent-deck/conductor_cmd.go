@@ -239,6 +239,28 @@ func handleConductorSetup(profile string, args []string) {
 	slackConfigured := settings.Slack.BotToken != ""
 	discordConfigured := settings.Discord.BotToken != ""
 
+	// v1.7.22: warn on the "global telegram enabled in profile settings.json"
+	// anti-pattern that silently leaks pollers to every claude session under
+	// this profile. We detect but do not auto-mutate settings.json (#658).
+	cfgDir := config.GetProfileClaudeConfigDir(resolvedProfile)
+	if cfgDir == "" {
+		cfgDir = session.GetClaudeConfigDirForGroup("")
+	}
+	if globalTelegramEnabled, _ := readTelegramGloballyEnabled(cfgDir); globalTelegramEnabled {
+		emitTelegramWarnings(os.Stderr, session.TelegramValidatorInput{
+			GlobalEnabled: true,
+		})
+		// Issue #666: the v1.7.22 warn-only path was insufficient. Users
+		// missed the warning and kept losing generic child sessions to 409
+		// crashes. Auto-remediate so every profile that setup touches is
+		// left safe.
+		if changed, err := disableTelegramGlobally(cfgDir); err != nil {
+			fmt.Fprintf(os.Stderr, "⚠  could not auto-disable enabledPlugins.telegram in %s/settings.json: %v\n", cfgDir, err)
+		} else if changed {
+			fmt.Fprintf(os.Stdout, "✓ Auto-disabled enabledPlugins.\"%s\" in %s/settings.json (issue #666 remediation)\n", "telegram@claude-plugins-official", cfgDir)
+		}
+	}
+
 	// Step 2: If conductor system not enabled, run first-time setup
 	if !settings.Enabled {
 		fmt.Println("Conductor Setup")
@@ -925,6 +947,9 @@ func handleConductorStatus(_ string, args []string) {
 		if err == nil {
 			instances, _, err := storage.LoadWithGroups()
 			if err == nil {
+				// Warm tmux + hook caches before UpdateStatus so we match
+				// what the TUI and /api/menu show (issue #610).
+				session.RefreshInstancesForCLIStatus(instances)
 				for _, inst := range instances {
 					if inst.Title == sessionTitle {
 						cs.SessionID = inst.ID
@@ -1080,6 +1105,9 @@ func handleConductorList(profile string, args []string) {
 		if err == nil {
 			instances, _, err := storage.LoadWithGroups()
 			if err == nil {
+				// Warm tmux + hook caches before UpdateStatus so conductor
+				// list matches the TUI and /api/menu view (issue #610).
+				session.RefreshInstancesForCLIStatus(instances)
 				found := false
 				for _, inst := range instances {
 					if inst.Title == sessionTitle {

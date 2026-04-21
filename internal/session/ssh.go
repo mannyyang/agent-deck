@@ -14,10 +14,13 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/asheshgoplani/agent-deck/internal/termreply"
 	"github.com/asheshgoplani/agent-deck/internal/tmux"
 	"github.com/creack/pty"
 	"golang.org/x/term"
 )
+
+const sshAttachReplyQuarantine = 2 * time.Second
 
 // sshControlDir is the directory for SSH ControlMaster sockets.
 const sshControlDir = "/tmp/agent-deck-ssh"
@@ -206,6 +209,7 @@ func (r *SSHRunner) Attach(sessionID string) error {
 	case <-outputDone:
 	case <-time.After(50 * time.Millisecond):
 	}
+	termreply.QuarantineFor(sshAttachReplyQuarantine)
 
 	// Reset terminal styles that may have leaked from the remote session.
 	_, _ = os.Stdout.WriteString("\x1b]8;;\x1b\\\x1b[0m\x1b[24m\x1b[39m\x1b[49m")
@@ -255,6 +259,34 @@ func (r *SSHRunner) FetchSessions(ctx context.Context) ([]RemoteSessionInfo, err
 	}
 
 	return sessions, nil
+}
+
+type remoteSessionOutputJSON struct {
+	Content string `json:"content"`
+}
+
+func parseRemoteSessionOutput(output []byte) (string, error) {
+	trimmed := bytes.TrimSpace(output)
+	if len(trimmed) == 0 {
+		return "", nil
+	}
+
+	var parsed remoteSessionOutputJSON
+	if err := json.Unmarshal(trimmed, &parsed); err != nil {
+		return "", fmt.Errorf("failed to parse remote session output: %w", err)
+	}
+
+	return parsed.Content, nil
+}
+
+// FetchSessionOutput retrieves the last response content for a remote session.
+func (r *SSHRunner) FetchSessionOutput(ctx context.Context, sessionID string) (string, error) {
+	output, err := r.Run(ctx, "session", "output", sessionID, "--json")
+	if err != nil {
+		return "", err
+	}
+
+	return parseRemoteSessionOutput(output)
 }
 
 // DetectPlatform returns the remote host's OS and architecture (e.g., "linux", "amd64").

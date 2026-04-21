@@ -53,6 +53,7 @@ type jsonInstanceData struct {
 	ToolOptionsJSON  json.RawMessage `json:"tool_options,omitempty"`
 	LoadedMCPNames   []string        `json:"loaded_mcp_names,omitempty"`
 	Channels         []string        `json:"channels,omitempty"`
+	ExtraArgs        []string        `json:"extra_args,omitempty"`
 	Sandbox          json.RawMessage `json:"sandbox,omitempty"`
 	SandboxContainer string          `json:"sandbox_container,omitempty"`
 }
@@ -82,6 +83,7 @@ type toolDataBlob struct {
 	Notes              string          `json:"notes,omitempty"`
 	LoadedMCPNames     []string        `json:"loaded_mcp_names,omitempty"`
 	Channels           []string        `json:"channels,omitempty"`
+	ExtraArgs          []string        `json:"extra_args,omitempty"`
 	ToolOptions        json.RawMessage `json:"tool_options,omitempty"`
 	Sandbox            json.RawMessage `json:"sandbox,omitempty"`
 	SandboxContainer   string          `json:"sandbox_container,omitempty"`
@@ -92,6 +94,8 @@ type toolDataBlob struct {
 	AdditionalPaths    []string                `json:"additional_paths,omitempty"`
 	MultiRepoTempDir   string                  `json:"multi_repo_temp_dir,omitempty"`
 	MultiRepoWorktrees []multiRepoWorktreeBlob `json:"multi_repo_worktrees,omitempty"`
+	// Presentation
+	Color string `json:"color,omitempty"` // issue #391 — per-session TUI row tint
 }
 
 // multiRepoWorktreeBlob is the JSON representation of a multi-repo worktree in tool_data.
@@ -219,6 +223,8 @@ func MarshalToolData(
 	multiRepoEnabled bool, additionalPaths []string,
 	multiRepoTempDir string, multiRepoWorktrees []MultiRepoWorktreeData,
 	channels []string,
+	extraArgs []string,
+	color string, // issue #391
 ) json.RawMessage {
 	td := toolDataBlob{
 		ClaudeSessionID:   claudeSessionID,
@@ -231,6 +237,7 @@ func MarshalToolData(
 		Notes:             notes,
 		LoadedMCPNames:    loadedMCPNames,
 		Channels:          channels,
+		ExtraArgs:         extraArgs,
 		ToolOptions:       toolOptionsJSON,
 		Sandbox:           sandboxJSON,
 		SandboxContainer:  sandboxContainer,
@@ -239,6 +246,7 @@ func MarshalToolData(
 		MultiRepoEnabled:  multiRepoEnabled,
 		AdditionalPaths:   additionalPaths,
 		MultiRepoTempDir:  multiRepoTempDir,
+		Color:             color,
 	}
 	for _, wt := range multiRepoWorktrees {
 		td.MultiRepoWorktrees = append(td.MultiRepoWorktrees, multiRepoWorktreeBlob(wt))
@@ -274,6 +282,8 @@ func UnmarshalToolData(data json.RawMessage) (
 	multiRepoEnabled bool, additionalPaths []string,
 	multiRepoTempDir string, multiRepoWorktrees []MultiRepoWorktreeData,
 	channels []string,
+	extraArgs []string,
+	color string, // issue #391
 ) {
 	if len(data) == 0 {
 		return
@@ -282,6 +292,7 @@ func UnmarshalToolData(data json.RawMessage) (
 	if err := json.Unmarshal(data, &td); err != nil {
 		return
 	}
+	color = td.Color
 	claudeSessionID = td.ClaudeSessionID
 	if td.ClaudeDetectedAt > 0 {
 		claudeDetectedAt = time.Unix(td.ClaudeDetectedAt, 0)
@@ -304,6 +315,7 @@ func UnmarshalToolData(data json.RawMessage) (
 	notes = td.Notes
 	loadedMCPNames = td.LoadedMCPNames
 	channels = td.Channels
+	extraArgs = td.ExtraArgs
 	toolOptionsJSON = td.ToolOptions
 	sandboxJSON = td.Sandbox
 	sandboxContainer = td.SandboxContainer

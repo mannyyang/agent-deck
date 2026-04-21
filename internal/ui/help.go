@@ -136,12 +136,14 @@ func (h *HelpOverlay) View() string {
 	deleteKey := h.key(hotkeyDelete, "d")
 	closeKey := h.key(hotkeyCloseSession, "D")
 	restartKey := h.key(hotkeyRestart, "Shift+R")
+	restartFreshKey := h.key(hotkeyRestartFresh, "Shift+T")
 	renameKey := h.key(hotkeyRename, "r")
 	moveKey := h.key(hotkeyMoveToGroup, "M")
 	mcpKey := h.key(hotkeyMCPManager, "m")
 	skillsKey := h.key(hotkeySkillsManager, "s")
 	previewKey := h.key(hotkeyTogglePreview, "v")
 	unreadKey := h.key(hotkeyMarkUnread, "u")
+	quickApproveKey := h.key(hotkeyQuickApprove, "a")
 	copyKey := h.key(hotkeyCopyOutput, "c")
 	sendKey := h.key(hotkeySendOutput, "x")
 	execShellKey := h.key(hotkeyExecShell, "E")
@@ -149,6 +151,7 @@ func (h *HelpOverlay) View() string {
 	if cfg, _ := session.LoadUserConfig(); cfg != nil && !cfg.GetShowNotes() {
 		notesKey = ""
 	}
+	editPathsKey := h.key(hotkeyEditPaths, "p")
 	worktreeKey := h.key(hotkeyWorktreeFinish, "W")
 	watcherPanelKey := h.key(hotkeyWatcherPanel, "w")
 	groupKey := h.key(hotkeyCreateGroup, "g")
@@ -179,20 +182,23 @@ func (h *HelpOverlay) View() string {
 				{newKeys, "New / quick create"},
 				{renameKey, "Rename session"},
 				{restartKey, "Restart session"},
+				{restartFreshKey, "Restart with new session ID"},
 				{deleteKey, "Delete session"},
 				{closeKey, "Close session process"},
 				{undoKey, "Undo delete"},
 				{moveKey, "Move to group"},
 				{mcpKey, "MCP Manager (Claude/Gemini)"},
-				{skillsKey, "Skills Manager (Claude)"},
+				{skillsKey, "Skills Manager"},
 				{"$", "Cost Dashboard"},
 				{previewKey, "Toggle preview mode (output/stats/both)"},
 				{unreadKey, "Mark unread"},
+				{quickApproveKey, "Quick approve (send '1' to Claude session)"},
 				{reorderKeys, "Reorder up/down"},
 				{forkKeys, "Fork session (Claude only)"},
 				{copyKey, "Copy output to clipboard"},
 				{sendKey, "Send output to session"},
 				{execShellKey, "Exec shell in sandbox container"},
+				{editPathsKey, "Edit multi-repo paths"},
 				{notesKey, "Edit notes"},
 			},
 		},

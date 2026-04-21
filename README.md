@@ -314,7 +314,29 @@ Both Telegram and Slack can run simultaneously — the bridge daemon handles bot
 
 **Built-in status-driven notifications**: conductor setup also installs a transition notifier daemon (`agent-deck notify-daemon`) that watches status transitions and sends parent nudges when child sessions move `running -> waiting|error|idle`.
 
+Dispatch can be suppressed at two scopes (PR #580, v1.7.34):
+
+```toml
+# Global kill switch in ~/.agent-deck/config.toml (default: true)
+[notifications]
+transition_events = false
+```
+
+```bash
+# Per-session at creation
+agent-deck add --no-transition-notify -c claude .
+agent-deck -p work launch . --no-transition-notify -c claude -m "Do task"
+
+# Per-session at runtime
+agent-deck session set-transition-notify worker off
+agent-deck session set-transition-notify worker on
+```
+
+Suppression only affects dispatch — the parent link itself is unchanged. Deferred/retried events also honour the flag (guard is in `transition_notifier.dispatch` as well as both daemon entry points).
+
 **Heartbeat-driven monitoring**: heartbeats still run on the configured interval (default 15 minutes) as a secondary safety net. If a conductor response includes `NEED:`, the bridge forwards that alert to Telegram and/or Slack.
+
+**Telegram conductor topology (v1.7.22+)**: each conductor bot must own exactly one channel-owning session. Activate telegram per-session via `--channels plugin:telegram@claude-plugins-official` and inject `TELEGRAM_STATE_DIR` via `[conductors.<name>.claude].env_file` in `~/.agent-deck/config.toml`. Do NOT set `enabledPlugins."telegram@claude-plugins-official"=true` in a profile's `settings.json` — that leaks a poller to every claude session under the profile. agent-deck emits warnings (`GLOBAL_ANTIPATTERN`, `DOUBLE_LOAD`, `WRAPPER_DEPRECATED`) when it detects these setups. Full guidance: [Telegram conductor topology](skills/agent-deck/SKILL.md#telegram-conductor-topology-v1722).
 
 **Permission prompts during automation**: if a conductor keeps pausing on permission requests, set `[claude].allow_dangerous_mode = true` (or `dangerous_mode = true`) in `~/.agent-deck/config.toml`, then run `agent-deck session restart conductor-<name>`. See [Troubleshooting](skills/agent-deck/references/troubleshooting.md#conductor-keeps-asking-for-permissions).
 
@@ -335,6 +357,45 @@ agent-deck -p work launch . -c "codex --dangerously-bypass-approvals-and-sandbox
 
 When `--cmd` includes extra args, agent-deck auto-wraps the tool command so args are preserved reliably.
 Use `--no-parent` only when you explicitly want to disable parent routing/notifications.
+
+### Watchers
+
+Watchers listen for inbound events (webhooks, push notifications, GitHub events, Slack messages) and route them to conductor sessions so running agents can act on them automatically. Four adapter types ship today:
+
+| Type | Use case | Required flags |
+|------|----------|----------------|
+| `webhook` | Generic HTTP POST listener for any service that can fire a webhook | `--port` |
+| `github` | GitHub repository webhooks (issues, PRs, pushes) with HMAC-SHA256 verification | `--secret` |
+| `ntfy` | [ntfy.sh](https://ntfy.sh) push-notification topics (phone / browser → conductor) | `--topic` |
+| `slack` | Slack messages via a Cloudflare Worker bridge into an ntfy topic | `--topic` |
+
+```bash
+# Create, start, test — mirrors the four examples from `agent-deck watcher --help`
+agent-deck watcher create webhook  --name my-webhook  --port 9000
+agent-deck watcher create github   --name gh-alerts   --secret $GITHUB_WEBHOOK_SECRET
+agent-deck watcher create ntfy     --name phone       --topic my-private-topic
+agent-deck watcher create slack    --name team-slack  --topic my-slack-topic
+
+agent-deck watcher start  <name>
+agent-deck watcher list                # health + events/hour per watcher
+agent-deck watcher status <name>       # detail view including recent events
+agent-deck watcher test   <name>       # fire a synthetic event to verify routing
+```
+
+Routing rules live under `~/.agent-deck/watcher/<name>/clients.json` — edit to pick which conductor/group receives which events. Use `agent-deck watcher routes` to see the currently-loaded rules across all watchers.
+
+**Conversational setup (recommended for first-time use):**
+
+```bash
+agent-deck watcher install-skill watcher-creator
+```
+
+Then, inside a Claude Code session started by agent-deck, ask: *"Use the watcher-creator skill to set up a GitHub watcher"*. The skill walks through adapter selection, required settings, and emits the exact `agent-deck watcher create` command to run.
+
+Safety notes:
+- The GitHub adapter enforces HMAC-SHA256 signature verification on every webhook — a missing/invalid signature drops the event.
+- Events are deduplicated in SQLite by `(watcher_name, event_id)`, so retries from the sender do not double-fire the conductor.
+- Watchers keep per-adapter health in `~/.agent-deck/watcher/<name>/state.json`; the TUI watcher panel (press `w`) surfaces this in real time.
 
 ### Multi-Tool Support
 
@@ -374,15 +435,66 @@ weekly_limit = 200.00
 "custom-model" = { input_per_mtok = 1.0, output_per_mtok = 5.0 }
 ```
 
+### Socket Isolation (v1.7.50+)
+
+Run agent-deck on its own tmux server so it never touches your interactive tmux's config, bindings, or sessions. Opt-in via a single config line:
+
+```toml
+# ~/.agent-deck/config.toml
+[tmux]
+socket_name = "agent-deck"
+```
+
+With this set, every agent-deck session is spawned as `tmux -L agent-deck …` — a fully isolated tmux server whose socket lives at `$TMUX_TMPDIR/tmux-<uid>/agent-deck` (or `/tmp/tmux-<uid>/agent-deck` when `TMUX_TMPDIR` is unset, the standard tmux fallback). Your regular tmux server at `default` is never touched.
+
+**What this buys you:**
+- `[tmux].inject_status_line`, bind-key, and global `set-option` mutations stay on the agent-deck server. Your personal status bar, plugins, and theme are untouched.
+- A stray `tmux kill-server` in your shell cannot take agent-deck's managed sessions down with it.
+- `tmux -L agent-deck ls` from the shell shows exactly agent-deck's sessions — no mixing with your own work sessions.
+- Fixes [#276](https://github.com/asheshgoplani/agent-deck/issues/276) and [#687](https://github.com/asheshgoplani/agent-deck/issues/687) at the root, not via per-option sentinels.
+
+**Default behavior unchanged.** Leave `socket_name` unset (the default) and agent-deck behaves exactly like v1.7.46: it uses your default tmux server. This is a pure opt-in.
+
+**Per-session override.** The `agent-deck add` and `agent-deck launch` commands both accept `--tmux-socket <name>` to override the installation-wide default for one session:
+
+```bash
+# One-off isolated session even though config says otherwise
+agent-deck add --tmux-socket experiment -c claude .
+agent-deck launch --tmux-socket experiment -c claude -m "Try the risky thing"
+```
+
+Precedence at session creation: `--tmux-socket` flag > `[tmux].socket_name` > empty.
+
+**Immutable after creation.** Each session captures its socket name in SQLite at creation time. Changing `socket_name` in config later does **not** migrate existing sessions — they stay on the socket they were created on, so restart/revive cycles keep reaching the right tmux server. This is deliberate: mixing sockets mid-life would strand sessions on an unreachable server.
+
+**Migrating existing sessions.** There's no `migrate-socket` subcommand in this release. To move an existing session onto an isolated socket:
+
+1. Set `[tmux].socket_name = "agent-deck"` in your config.
+2. Stop the session (`agent-deck session stop <name>`) — this kills the tmux pane on the old server.
+3. Restart it (`agent-deck session start <name>`) — agent-deck will see TmuxSocketName=`""` on the stored Instance, spawn a fresh pane on the old server, and keep it there. To force it onto the new socket, edit `~/.agent-deck/<profile>/state.db`:
+   ```sql
+   UPDATE instances SET tmux_socket_name = 'agent-deck' WHERE id = '<session-id>';
+   ```
+   then restart agent-deck. Subsequent starts will spawn on `tmux -L agent-deck`.
+4. Easier: delete the old session with `agent-deck rm <name>` and re-create it with `agent-deck add` — the new row picks up the config-wide default.
+
+A proper `session migrate-socket` subcommand is tracked for phase 2.
+
+**`TMUX_TMPDIR` is honored.** Socket path resolution follows tmux's standard rules: if you set `TMUX_TMPDIR=/custom/dir`, agent-deck's socket lives at `/custom/dir/tmux-<uid>/agent-deck`. No extra config needed.
+
 ### Feedback
 
 Found a bug or have an idea? Send feedback without leaving your terminal. Press `Ctrl+E` in the TUI to open the FeedbackDialog, or run `agent-deck feedback` from the shell to submit a rating and a short note.
 
-Feedback posts to a public GitHub Discussion at [Feedback Hub](https://github.com/asheshgoplani/agent-deck/discussions/600) so other users can read along, comment, and upvote. The submit path uses `gh api graphql` when GitHub CLI is authenticated and falls back to clipboard + browser otherwise — no telemetry, no third-party services.
+Feedback posts to a public GitHub Discussion at [Feedback Hub](https://github.com/asheshgoplani/agent-deck/discussions/600) so other users can read along, comment, and upvote. The CLI submit path uses `gh api graphql` under your local GitHub authentication — no telemetry, no third-party services.
 
 - Press `Ctrl+E` from the main TUI to open the dialog
-- Or run `agent-deck feedback <rating> "<message>"` (rating 1-5) from the CLI
-- Headless hosts (no display, no `gh` auth) print a copy-pasteable comment instead of opening a browser
+- Or run `agent-deck feedback` from the CLI (rating 1-5)
+- **Nothing is sent until you explicitly type `y` at the confirmation prompt.** Before the prompt, the CLI shows (1) the public URL the comment will land on, (2) that it posts via the `gh` CLI using your account, (3) your GitHub username as it will appear, and (4) the exact body that will be posted. Default answer is **N** — pressing Enter declines.
+- If `gh` fails (auth required, not installed, network), the CLI prints an error and exits non-zero. No clipboard or browser fallback is triggered on the CLI path.
+- A private/anonymous feedback channel is being designed for a future release — track in [#679](https://github.com/asheshgoplani/agent-deck/issues/679).
+
+**Feedback prompt frequency** (v1.7.41+): the TUI's auto-prompt is paced so brand-new users aren't asked on their first few launches. The first prompt appears only after **7 launches or 3 days** of use, whichever comes later. If you dismiss it, agent-deck waits **14 days** before asking again. You'll see at most **3 prompts per version**, and pressing `n` at any step opts you out permanently — use `agent-deck feedback` or `Ctrl+E` to re-enable on demand. Opt-out always wins over every pacing gate.
 
 ## Installation
 
@@ -481,7 +593,7 @@ agent-deck web --token my-secret
 | `n` | New session |
 | `f` / `F` | Fork (quick / dialog) |
 | `m` | MCP Manager |
-| `s` | Skills Manager (Claude) |
+| `s` | Skills Manager |
 | `$` | Cost Dashboard |
 | `M` | Move session to group |
 | `S` | Settings |

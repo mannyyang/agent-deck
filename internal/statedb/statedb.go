@@ -18,7 +18,7 @@ import (
 
 // SchemaVersion tracks the current database schema version.
 // Bump this when adding migrations.
-const SchemaVersion = 5
+const SchemaVersion = 7
 
 // StateDB wraps a SQLite database for session/group persistence.
 // Thread-safe for concurrent use from multiple goroutines within one process.
@@ -30,24 +30,29 @@ type StateDB struct {
 
 // InstanceRow represents a session row in the database.
 type InstanceRow struct {
-	ID              string
-	Title           string
-	ProjectPath     string
-	GroupPath       string
-	Order           int
-	Command         string
-	Wrapper         string
-	Tool            string
-	Status          string
-	TmuxSession     string
-	CreatedAt       time.Time
-	LastAccessed    time.Time
-	ParentSessionID string
-	IsConductor     bool
-	WorktreePath    string
-	WorktreeRepo    string
-	WorktreeBranch  string
-	ToolData        json.RawMessage // JSON blob for tool-specific data
+	ID                 string
+	Title              string
+	ProjectPath        string
+	GroupPath          string
+	Order              int
+	Command            string
+	Wrapper            string
+	Tool               string
+	Status             string
+	TmuxSession        string
+	CreatedAt          time.Time
+	LastAccessed       time.Time
+	ParentSessionID    string
+	IsConductor        bool
+	NoTransitionNotify bool
+	// TmuxSocketName mirrors Instance.TmuxSocketName (v1.7.50+, issue #687).
+	// Empty for pre-v1.7.50 rows — those keep targeting the default server
+	// after upgrade.
+	TmuxSocketName string
+	WorktreePath   string
+	WorktreeRepo   string
+	WorktreeBranch string
+	ToolData       json.RawMessage // JSON blob for tool-specific data
 }
 
 // WatcherRow represents a watcher row in the database.
@@ -200,11 +205,13 @@ func (s *StateDB) Migrate() error {
 			wrapper         TEXT NOT NULL DEFAULT '',
 			tool            TEXT NOT NULL DEFAULT 'shell',
 			status          TEXT NOT NULL DEFAULT 'error',
-			tmux_session    TEXT NOT NULL DEFAULT '',
+			tmux_session     TEXT NOT NULL DEFAULT '',
+			tmux_socket_name TEXT NOT NULL DEFAULT '',
 			created_at      INTEGER NOT NULL,
 			last_accessed   INTEGER NOT NULL DEFAULT 0,
 			parent_session_id TEXT NOT NULL DEFAULT '',
-			is_conductor      INTEGER NOT NULL DEFAULT 0,
+			is_conductor            INTEGER NOT NULL DEFAULT 0,
+			no_transition_notify    INTEGER NOT NULL DEFAULT 0,
 			worktree_path     TEXT NOT NULL DEFAULT '',
 			worktree_repo     TEXT NOT NULL DEFAULT '',
 			worktree_branch   TEXT NOT NULL DEFAULT '',
@@ -332,6 +339,9 @@ func (s *StateDB) Migrate() error {
 	alterMigrations := []string{
 		"ALTER TABLE instances ADD COLUMN acknowledged INTEGER NOT NULL DEFAULT 0",
 		"ALTER TABLE watcher_events ADD COLUMN triage_session_id TEXT NOT NULL DEFAULT ''",
+		// v7 (issue #687, v1.7.50): per-session tmux socket isolation.
+		// Default '' keeps the pre-v1.7.50 behavior for existing rows.
+		"ALTER TABLE instances ADD COLUMN tmux_socket_name TEXT NOT NULL DEFAULT ''",
 	}
 	for _, stmt := range alterMigrations {
 		if _, err := tx.Exec(stmt); err != nil {
@@ -371,6 +381,13 @@ func (s *StateDB) Migrate() error {
 		}
 		// v5: Watcher tables are new (CREATE TABLE IF NOT EXISTS handles creation).
 		// No column backfill needed for v5.
+		if oldVer < 6 {
+			if _, err := tx.Exec(`ALTER TABLE instances ADD COLUMN no_transition_notify INTEGER NOT NULL DEFAULT 0`); err != nil {
+				if !strings.Contains(err.Error(), "duplicate column") {
+					return fmt.Errorf("statedb: migrate v6 no_transition_notify: %w", err)
+				}
+			}
+		}
 		if _, err := tx.Exec(`
 			UPDATE metadata SET value = ? WHERE key = 'schema_version'
 		`, schemaVersion); err != nil {
@@ -404,19 +421,25 @@ func (s *StateDB) SaveInstance(inst *InstanceRow) error {
 	if inst.IsConductor {
 		isConductorInt = 1
 	}
+	noTransitionNotifyInt := 0
+	if inst.NoTransitionNotify {
+		noTransitionNotifyInt = 1
+	}
 	_, err := s.db.Exec(`
 		INSERT OR REPLACE INTO instances (
 			id, title, project_path, group_path, sort_order,
-			command, wrapper, tool, status, tmux_session,
+			command, wrapper, tool, status, tmux_session, tmux_socket_name,
 			created_at, last_accessed,
-			parent_session_id, is_conductor, worktree_path, worktree_repo, worktree_branch,
+			parent_session_id, is_conductor, no_transition_notify,
+			worktree_path, worktree_repo, worktree_branch,
 			tool_data
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		inst.ID, inst.Title, inst.ProjectPath, inst.GroupPath, inst.Order,
-		inst.Command, inst.Wrapper, inst.Tool, inst.Status, inst.TmuxSession,
+		inst.Command, inst.Wrapper, inst.Tool, inst.Status, inst.TmuxSession, inst.TmuxSocketName,
 		inst.CreatedAt.Unix(), inst.LastAccessed.Unix(),
-		inst.ParentSessionID, isConductorInt, inst.WorktreePath, inst.WorktreeRepo, inst.WorktreeBranch,
+		inst.ParentSessionID, isConductorInt, noTransitionNotifyInt,
+		inst.WorktreePath, inst.WorktreeRepo, inst.WorktreeBranch,
 		string(toolData),
 	)
 	return err
@@ -453,11 +476,12 @@ func (s *StateDB) SaveInstances(insts []*InstanceRow) error {
 	stmt, err := tx.Prepare(`
 		INSERT OR REPLACE INTO instances (
 			id, title, project_path, group_path, sort_order,
-			command, wrapper, tool, status, tmux_session,
+			command, wrapper, tool, status, tmux_session, tmux_socket_name,
 			created_at, last_accessed,
-			parent_session_id, is_conductor, worktree_path, worktree_repo, worktree_branch,
+			parent_session_id, is_conductor, no_transition_notify,
+			worktree_path, worktree_repo, worktree_branch,
 			tool_data
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`)
 	if err != nil {
 		return err
@@ -473,11 +497,16 @@ func (s *StateDB) SaveInstances(insts []*InstanceRow) error {
 		if inst.IsConductor {
 			isConductorInt = 1
 		}
+		noTransitionNotifyInt := 0
+		if inst.NoTransitionNotify {
+			noTransitionNotifyInt = 1
+		}
 		if _, err := stmt.Exec(
 			inst.ID, inst.Title, inst.ProjectPath, inst.GroupPath, inst.Order,
-			inst.Command, inst.Wrapper, inst.Tool, inst.Status, inst.TmuxSession,
+			inst.Command, inst.Wrapper, inst.Tool, inst.Status, inst.TmuxSession, inst.TmuxSocketName,
 			inst.CreatedAt.Unix(), inst.LastAccessed.Unix(),
-			inst.ParentSessionID, isConductorInt, inst.WorktreePath, inst.WorktreeRepo, inst.WorktreeBranch,
+			inst.ParentSessionID, isConductorInt, noTransitionNotifyInt,
+			inst.WorktreePath, inst.WorktreeRepo, inst.WorktreeBranch,
 			string(toolData),
 		); err != nil {
 			return err
@@ -491,9 +520,10 @@ func (s *StateDB) SaveInstances(insts []*InstanceRow) error {
 func (s *StateDB) LoadInstances() ([]*InstanceRow, error) {
 	rows, err := s.db.Query(`
 		SELECT id, title, project_path, group_path, sort_order,
-			command, wrapper, tool, status, tmux_session,
+			command, wrapper, tool, status, tmux_session, tmux_socket_name,
 			created_at, last_accessed,
-			parent_session_id, is_conductor, worktree_path, worktree_repo, worktree_branch,
+			parent_session_id, is_conductor, no_transition_notify,
+			worktree_path, worktree_repo, worktree_branch,
 			tool_data
 		FROM instances ORDER BY sort_order
 	`)
@@ -507,12 +537,13 @@ func (s *StateDB) LoadInstances() ([]*InstanceRow, error) {
 		r := &InstanceRow{}
 		var createdUnix, accessedUnix int64
 		var toolDataStr string
-		var isConductorInt int
+		var isConductorInt, noTransitionNotifyInt int
 		if err := rows.Scan(
 			&r.ID, &r.Title, &r.ProjectPath, &r.GroupPath, &r.Order,
-			&r.Command, &r.Wrapper, &r.Tool, &r.Status, &r.TmuxSession,
+			&r.Command, &r.Wrapper, &r.Tool, &r.Status, &r.TmuxSession, &r.TmuxSocketName,
 			&createdUnix, &accessedUnix,
-			&r.ParentSessionID, &isConductorInt, &r.WorktreePath, &r.WorktreeRepo, &r.WorktreeBranch,
+			&r.ParentSessionID, &isConductorInt, &noTransitionNotifyInt,
+			&r.WorktreePath, &r.WorktreeRepo, &r.WorktreeBranch,
 			&toolDataStr,
 		); err != nil {
 			return nil, err
@@ -522,6 +553,7 @@ func (s *StateDB) LoadInstances() ([]*InstanceRow, error) {
 			r.LastAccessed = time.Unix(accessedUnix, 0)
 		}
 		r.IsConductor = isConductorInt != 0
+		r.NoTransitionNotify = noTransitionNotifyInt != 0
 		r.ToolData = json.RawMessage(toolDataStr)
 		result = append(result, r)
 	}
@@ -961,10 +993,25 @@ func (s *StateDB) LoadWatchers() ([]*WatcherRow, error) {
 // Returns true if the row was inserted (new event), false if it was a duplicate.
 // Prunes to maxEvents after successful insert.
 func (s *StateDB) SaveWatcherEvent(watcherID, dedupKey, sender, subject, routedTo, sessionID string, maxEvents int) (bool, error) {
-	result, err := s.db.Exec(`
-		INSERT OR IGNORE INTO watcher_events (watcher_id, dedup_key, sender, subject, routed_to, session_id, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
-	`, watcherID, dedupKey, sender, subject, routedTo, sessionID, time.Now().Unix())
+	// Retry on SQLITE_BUSY: concurrent INSERTs across connections can trip the
+	// write lock even with WAL + busy_timeout if the driver surfaces BUSY
+	// before the backoff completes. Retries are cheap because the operation
+	// is idempotent (INSERT OR IGNORE).
+	var result sql.Result
+	var err error
+	for attempt := 0; attempt < 5; attempt++ {
+		result, err = s.db.Exec(`
+			INSERT OR IGNORE INTO watcher_events (watcher_id, dedup_key, sender, subject, routed_to, session_id, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?)
+		`, watcherID, dedupKey, sender, subject, routedTo, sessionID, time.Now().Unix())
+		if err == nil {
+			break
+		}
+		if !isSQLiteBusy(err) {
+			return false, err
+		}
+		time.Sleep(time.Duration(10*(attempt+1)) * time.Millisecond)
+	}
 	if err != nil {
 		return false, err
 	}
@@ -973,6 +1020,16 @@ func (s *StateDB) SaveWatcherEvent(watcherID, dedupKey, sender, subject, routedT
 		_ = s.pruneWatcherEvents(watcherID, maxEvents)
 	}
 	return n > 0, nil
+}
+
+// isSQLiteBusy returns true when err is a SQLITE_BUSY / "database is locked"
+// transient condition that can be safely retried.
+func isSQLiteBusy(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "sqlite_busy") || strings.Contains(msg, "database is locked")
 }
 
 // LookupWatcherEventSessionByDedupKey queries the session_id for a specific event.

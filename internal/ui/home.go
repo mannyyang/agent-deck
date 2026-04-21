@@ -18,6 +18,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/charmbracelet/bubbles/textarea"
 	tea "github.com/charmbracelet/bubbletea"
@@ -104,6 +105,11 @@ const (
 	// clearOnCompactCooldown - minimum time between /clear sends for the same session
 	// Prevents repeated /clear if context fills up again quickly
 	clearOnCompactCooldown = 60 * time.Second
+
+	// attach-return grace periods keep the main menu responsive right after tea.Exec returns.
+	attachReturnHotDuration  = 1200 * time.Millisecond
+	attachReturnRefreshDelay = 350 * time.Millisecond
+	attachReturnPreviewGrace = 1500 * time.Millisecond
 )
 
 // UI spacing constants (2-char grid system)
@@ -195,6 +201,7 @@ type Home struct {
 	confirmDialog        *ConfirmDialog        // For confirming destructive actions
 	helpOverlay          *HelpOverlay          // For showing keyboard shortcuts
 	mcpDialog            *MCPDialog            // For managing MCPs
+	editPathsDialog      *EditPathsDialog      // For editing multi-repo paths
 	skillDialog          *SkillDialog          // For managing project skills
 	setupWizard          *SetupWizard          // For first-run setup
 	settingsPanel        *SettingsPanel        // For editing settings
@@ -229,24 +236,25 @@ type Home struct {
 	analyticsCacheTime     map[string]time.Time                       // TTL cache: sessionID -> cache timestamp
 
 	// State
-	cursor         int            // Selected item index in flatItems
-	viewOffset     int            // First visible item index (for scrolling)
-	isAttaching    atomic.Bool    // Prevents View() output during attach (fixes Bubble Tea Issue #431) - atomic for thread safety
-	statusFilter   session.Status // Filter sessions by status ("" = all, or specific status)
-	groupScope     string         // Limit TUI to a specific group path ("" = all groups)
-	previewMode    PreviewMode    // What to show in preview pane (both, output-only, analytics-only)
-	err            error
-	errTime        time.Time  // When error occurred (for auto-dismiss)
-	isReloading    bool       // Visual feedback during auto-reload
-	initialLoading bool       // True until first loadSessionsMsg received (shows splash screen)
-	isQuitting     bool       // True when user pressed q, shows quitting splash
-	reloadVersion  uint64     // Incremented on each reload to prevent stale background saves
-	reloadMu       sync.Mutex // Protects reloadVersion, isReloading, and lastLoadMtime for thread-safe access
-	lastLoadMtime  time.Time  // File mtime when we last loaded (for external change detection)
+	cursor              int            // Selected item index in flatItems
+	viewOffset          int            // First visible item index (for scrolling)
+	previewScrollOffset int            // Lines scrolled up from tail in the preview pane (#574). 0 = tail (default). Reset on cursor move.
+	isAttaching         atomic.Bool    // Prevents View() output during attach (fixes Bubble Tea Issue #431) - atomic for thread safety
+	statusFilter        session.Status // Filter sessions by status ("" = all, or specific status)
+	groupScope          string         // Limit TUI to a specific group path ("" = all groups)
+	previewMode         PreviewMode    // What to show in preview pane (both, output-only, analytics-only)
+	err                 error
+	errTime             time.Time  // When error occurred (for auto-dismiss)
+	isReloading         bool       // Visual feedback during auto-reload
+	initialLoading      bool       // True until first loadSessionsMsg received (shows splash screen)
+	isQuitting          bool       // True when user pressed q, shows quitting splash
+	reloadVersion       uint64     // Incremented on each reload to prevent stale background saves
+	reloadMu            sync.Mutex // Protects reloadVersion, isReloading, and lastLoadMtime for thread-safe access
+	lastLoadMtime       time.Time  // File mtime when we last loaded (for external change detection)
 
 	// Preview cache (async fetching - View() must be pure, no blocking I/O)
-	previewCache      map[string]string    // sessionID -> cached preview content
-	previewCacheTime  map[string]time.Time // sessionID -> when cached (for expiration)
+	previewCache      map[string]string    // previewKey -> cached preview content
+	previewCacheTime  map[string]time.Time // previewKey -> when cached (for expiration)
 	previewCacheMu    sync.RWMutex         // Protects previewCache for thread-safety
 	previewFetchingID string               // ID currently being fetched (prevents duplicate fetches)
 
@@ -310,8 +318,9 @@ type Home struct {
 	// Watcher warning (shown if fsnotify may not work, e.g., on 9p/NFS)
 	watcherWarning string
 
-	// Update notification (async check on startup)
-	updateInfo *update.UpdateInfo
+	// Update notification (async check on startup, periodic re-check)
+	updateInfo      *update.UpdateInfo
+	lastUpdateCheck time.Time
 
 	// Launching animation state (for newly created sessions)
 	launchingSessions  map[string]time.Time        // sessionID -> creation time
@@ -447,6 +456,13 @@ type uiState struct {
 	StatusFilter    string `json:"status_filter,omitempty"`
 }
 
+type selectedItemIdentity struct {
+	groupPath       string
+	sessionID       string
+	windowSessionID string
+	windowIndex     int
+}
+
 func (h *Home) reloadHotkeysFromConfig() {
 	h.setHotkeys(resolveHotkeys(session.GetHotkeyOverrides()))
 }
@@ -528,6 +544,8 @@ type statusUpdateMsg struct {
 	attachedWorkDir   string // pane_current_path captured after attach returns
 } // Triggers immediate status update without reloading
 
+type attachReturnRefreshMsg struct{}
+
 // storageChangedMsg signals that state.db was modified externally
 type storageChangedMsg struct{}
 
@@ -543,8 +561,9 @@ type updateCheckMsg struct {
 }
 
 type (
-	tickMsg time.Time
-	quitMsg bool
+	tickMsg        time.Time
+	quitMsg        bool
+	reviverTickMsg struct{}
 )
 
 // previewFetchedMsg is sent when async preview content is ready
@@ -560,6 +579,7 @@ type previewDebounceMsg struct {
 	previewKey  string // cache key
 	sessionID   string // parent session ID (for instance lookup)
 	windowIndex int    // -1 for session, >= 0 for specific window
+	remoteName  string // remote name for remote session preview
 }
 
 // analyticsFetchedMsg is sent when async analytics parsing is complete
@@ -697,6 +717,7 @@ func NewHomeWithProfileAndMode(profile string) *Home {
 		confirmDialog:        NewConfirmDialog(),
 		helpOverlay:          NewHelpOverlay(),
 		mcpDialog:            NewMCPDialog(),
+		editPathsDialog:      NewEditPathsDialog(),
 		skillDialog:          NewSkillDialog(),
 		setupWizard:          NewSetupWizard(),
 		settingsPanel:        NewSettingsPanel(),
@@ -841,7 +862,7 @@ func NewHomeWithProfileAndMode(profile string) *Home {
 
 		for _, inst := range instances {
 			if ts := inst.GetTmuxSession(); ts != nil && ts.Exists() {
-				if err := pm.Connect(ts.Name); err != nil {
+				if err := pm.Connect(ts.Name, inst.TmuxSocketName); err != nil {
 					pipeUILog.Debug("startup_pipe_connect_failed",
 						slog.String("session", ts.Name),
 						slog.String("error", err.Error()))
@@ -1216,6 +1237,63 @@ func (h *Home) moveCursorToGroup(path string) {
 			return
 		}
 	}
+}
+
+func (h *Home) captureSelectedItemIdentity() selectedItemIdentity {
+	if h.cursor < 0 || h.cursor >= len(h.flatItems) {
+		return selectedItemIdentity{windowIndex: -1}
+	}
+
+	item := h.flatItems[h.cursor]
+	identity := selectedItemIdentity{windowIndex: -1}
+	switch item.Type {
+	case session.ItemTypeGroup:
+		identity.groupPath = item.Path
+	case session.ItemTypeSession:
+		if item.Session != nil {
+			identity.sessionID = item.Session.ID
+		}
+	case session.ItemTypeWindow:
+		identity.windowSessionID = item.WindowSessionID
+		identity.windowIndex = item.WindowIndex
+	}
+	return identity
+}
+
+func (h *Home) restoreSelectedItemIdentity(identity selectedItemIdentity) bool {
+	for i, item := range h.flatItems {
+		switch {
+		case identity.windowSessionID != "" && item.Type == session.ItemTypeWindow && item.WindowSessionID == identity.windowSessionID && item.WindowIndex == identity.windowIndex:
+			h.cursor = i
+			return true
+		case identity.sessionID != "" && item.Type == session.ItemTypeSession && item.Session != nil && item.Session.ID == identity.sessionID:
+			h.cursor = i
+			return true
+		case identity.groupPath != "" && item.Type == session.ItemTypeGroup && item.Path == identity.groupPath:
+			h.cursor = i
+			return true
+		}
+	}
+
+	if identity.windowSessionID != "" {
+		for i, item := range h.flatItems {
+			if item.Type == session.ItemTypeSession && item.Session != nil && item.Session.ID == identity.windowSessionID {
+				h.cursor = i
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+func (h *Home) rebuildFlatItemsPreservingSelection(identity selectedItemIdentity) {
+	h.rebuildFlatItems()
+	if !h.restoreSelectedItemIdentity(identity) && len(h.flatItems) > 0 {
+		h.cursor = min(h.cursor, len(h.flatItems)-1)
+		h.cursor = max(h.cursor, 0)
+	}
+	h.syncViewport()
 }
 
 // rebuildFlatItems rebuilds the flattened view from group tree
@@ -1654,6 +1732,7 @@ func (h *Home) Init() tea.Cmd {
 		h.loadSessions,
 
 		h.tick(),
+		h.reviverTick(),
 		h.checkForUpdate(),
 		h.fetchRemoteSessions,
 	}
@@ -1908,6 +1987,15 @@ func (h *Home) tick() tea.Cmd {
 	})
 }
 
+// reviverTick fires every 60s to sweep the session list for instances whose
+// tmux server survived an SSH scope cleanup but whose control pipe got
+// reaped. See .planning/v178-ssh-reviver/PLAN.md (REPORT-D).
+func (h *Home) reviverTick() tea.Cmd {
+	return tea.Tick(60*time.Second, func(_ time.Time) tea.Msg {
+		return reviverTickMsg{}
+	})
+}
+
 // invalidatePreviewCache removes a session's preview from the cache
 // Called when session is deleted, renamed, or moved to ensure stale data is not displayed
 func (h *Home) invalidatePreviewCache(sessionID string) {
@@ -2106,6 +2194,42 @@ func previewCacheKey(sessionID string, windowIndex int) string {
 	return fmt.Sprintf("%s:%d", sessionID, windowIndex)
 }
 
+func remotePreviewCacheKey(remoteName, sessionID string) string {
+	return fmt.Sprintf("remote:%s:%s", remoteName, sessionID)
+}
+
+const (
+	remotePreviewMaxLines = 200
+	remotePreviewMaxBytes = 16 * 1024
+)
+
+func truncateRemotePreviewContent(content string) string {
+	if content == "" {
+		return ""
+	}
+
+	lines := strings.Split(content, "\n")
+	if len(lines) > remotePreviewMaxLines {
+		lines = lines[len(lines)-remotePreviewMaxLines:]
+		content = strings.Join(lines, "\n")
+	}
+
+	if len(content) <= remotePreviewMaxBytes {
+		return content
+	}
+
+	trimmed := []byte(content)
+	trimmed = trimmed[len(trimmed)-remotePreviewMaxBytes:]
+	for len(trimmed) > 0 && !utf8.Valid(trimmed) {
+		trimmed = trimmed[1:]
+	}
+	if idx := bytes.IndexByte(trimmed, '\n'); idx >= 0 && idx < len(trimmed)-1 {
+		trimmed = trimmed[idx+1:]
+	}
+
+	return string(trimmed)
+}
+
 // fetchPreview returns a command that asynchronously fetches preview content.
 // windowIndex < 0 captures the session's primary pane; >= 0 captures a specific window.
 func (h *Home) fetchPreview(inst *session.Instance, key string, windowIndex int) tea.Cmd {
@@ -2144,6 +2268,42 @@ func (h *Home) fetchPreviewDebounced(sessionID string, windowIndex int) tea.Cmd 
 	}
 }
 
+func (h *Home) fetchRemotePreviewDebounced(remoteName, sessionID string) tea.Cmd {
+	const debounceDelay = 150 * time.Millisecond
+
+	key := remotePreviewCacheKey(remoteName, sessionID)
+	h.previewDebounceMu.Lock()
+	h.pendingPreviewKey = key
+	h.previewDebounceMu.Unlock()
+
+	return func() tea.Msg {
+		time.Sleep(debounceDelay)
+		return previewDebounceMsg{previewKey: key, sessionID: sessionID, windowIndex: -1, remoteName: remoteName}
+	}
+}
+
+func (h *Home) fetchRemotePreview(remoteName, sessionID, key string) tea.Cmd {
+	return func() tea.Msg {
+		config, err := session.LoadUserConfig()
+		if err != nil || config == nil || config.Remotes == nil {
+			return previewFetchedMsg{previewKey: key, err: fmt.Errorf("failed to load remote config")}
+		}
+
+		rc, ok := config.Remotes[remoteName]
+		if !ok {
+			return previewFetchedMsg{previewKey: key, err: fmt.Errorf("remote '%s' not found", remoteName)}
+		}
+
+		runner := session.NewSSHRunner(remoteName, rc)
+		ctx, cancel := context.WithTimeout(h.ctx, 15*time.Second)
+		defer cancel()
+
+		content, fetchErr := runner.FetchSessionOutput(ctx, sessionID)
+		content = truncateRemotePreviewContent(content)
+		return previewFetchedMsg{previewKey: key, content: content, err: fetchErr}
+	}
+}
+
 // selectedPreviewTarget returns the instance, cache key, and window index for the currently
 // selected flat item. windowIndex is -1 for session items.
 func (h *Home) selectedPreviewTarget() (*session.Instance, string, int) {
@@ -2167,12 +2327,32 @@ func (h *Home) selectedPreviewTarget() (*session.Instance, string, int) {
 	return nil, "", -1
 }
 
+func (h *Home) selectedRemotePreviewTarget() (string, string, string, bool) {
+	if h.cursor >= len(h.flatItems) {
+		return "", "", "", false
+	}
+	item := h.flatItems[h.cursor]
+	if item.Type != session.ItemTypeRemoteSession || item.RemoteSession == nil {
+		return "", "", "", false
+	}
+	if item.RemoteName == "" || item.RemoteSession.ID == "" {
+		return "", "", "", false
+	}
+
+	key := remotePreviewCacheKey(item.RemoteName, item.RemoteSession.ID)
+	return item.RemoteName, item.RemoteSession.ID, key, true
+}
+
 // fetchSelectedPreview debounces a preview fetch for the currently selected item.
 // Handles both session and window items transparently.
 func (h *Home) fetchSelectedPreview() tea.Cmd {
 	inst, _, winIdx := h.selectedPreviewTarget()
 	if inst == nil {
-		return nil
+		remoteName, remoteSessionID, _, ok := h.selectedRemotePreviewTarget()
+		if !ok {
+			return nil
+		}
+		return h.fetchRemotePreviewDebounced(remoteName, remoteSessionID)
 	}
 	return h.fetchPreviewDebounced(inst.ID, winIdx)
 }
@@ -2380,6 +2560,17 @@ func (h *Home) markNavigationActivity() {
 	h.lastNavigationTime = now
 	h.isNavigating = true
 	h.navigationHotUntil.Store(now.Add(900 * time.Millisecond).UnixNano())
+}
+
+func (h *Home) beginAttachReturnGrace(now time.Time) {
+	h.lastAttachReturn = now
+	h.lastNavigationTime = now
+	h.isNavigating = true
+	h.navigationHotUntil.Store(now.Add(attachReturnHotDuration).UnixNano())
+}
+
+func (h *Home) shouldSuppressPreviewRefresh(now time.Time) bool {
+	return !h.lastAttachReturn.IsZero() && now.Sub(h.lastAttachReturn) < attachReturnPreviewGrace
 }
 
 // getInstanceByID returns the instance with the given ID using O(1) map lookup
@@ -3034,8 +3225,37 @@ func (h *Home) processStatusUpdate(req statusUpdateRequest) {
 	h.refreshSessionRenderSnapshot(instancesCopy)
 }
 
-// Update handles messages
+// Update implements tea.Model. It delegates to updateInner and, when
+// fullRepaint is enabled, appends tea.ClearScreen on KeyMsg and mouse-wheel
+// MouseMsg events to prevent incremental-redraw drift between the tick-based
+// clears (issue #607). Under the default (full_repaint = false) this wrapper
+// is a pass-through — no regression for users who never opt in.
 func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	model, cmd := h.updateInner(msg)
+	if !h.fullRepaint {
+		return model, cmd
+	}
+	switch m := msg.(type) {
+	case tea.KeyMsg:
+		_ = m
+		return model, appendClearScreen(cmd)
+	case tea.MouseMsg:
+		if m.Button == tea.MouseButtonWheelUp || m.Button == tea.MouseButtonWheelDown {
+			return model, appendClearScreen(cmd)
+		}
+	}
+	return model, cmd
+}
+
+// appendClearScreen batches tea.ClearScreen onto cmd, preserving nil-safety.
+func appendClearScreen(cmd tea.Cmd) tea.Cmd {
+	if cmd == nil {
+		return tea.ClearScreen
+	}
+	return tea.Batch(cmd, tea.ClearScreen)
+}
+
+func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmds []tea.Cmd
 
 	switch msg := msg.(type) {
@@ -3090,10 +3310,30 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if h.newDialog.IsVisible() || h.forkDialog.IsVisible() {
 				return h, nil
 			}
-			// Main session list scroll
+			// Preview pane scroll (#574): when the wheel event lands in the
+			// preview region of the dual layout, scroll preview content
+			// instead of moving the list cursor. Other layouts keep the
+			// legacy list-scroll behaviour because they have no dedicated
+			// preview click-target (single = no preview; stacked = same-
+			// width column where Y-based routing is ambiguous enough to
+			// leave as list-scroll).
+			if h.getLayoutMode() == LayoutModeDual {
+				leftWidth := int(float64(h.width) * 0.35)
+				if msg.X >= leftWidth {
+					if msg.Button == tea.MouseButtonWheelUp {
+						h.previewScrollOffset++
+					} else if h.previewScrollOffset > 0 {
+						h.previewScrollOffset--
+					}
+					return h, nil
+				}
+			}
+			// Main session list scroll (cursor movement also resets any
+			// stale preview offset so the new session starts at its tail).
 			if msg.Button == tea.MouseButtonWheelUp {
 				if h.cursor > 0 {
 					h.cursor--
+					h.previewScrollOffset = 0
 					h.syncViewport()
 					h.markNavigationActivity()
 					return h, h.fetchSelectedPreview()
@@ -3101,6 +3341,7 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			} else {
 				if h.cursor < len(h.flatItems)-1 {
 					h.cursor++
+					h.previewScrollOffset = 0
 					h.syncViewport()
 					h.markNavigationActivity()
 					return h, h.fetchSelectedPreview()
@@ -3128,11 +3369,15 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			h.confirmDialog.SetSize(h.width, h.height)
 		}
 
-		// Show feedback popup if user has a new version and hasn't rated yet (D-11/D-12)
+		// Show feedback popup if user has a new version and hasn't rated yet (D-11/D-12).
+		// v1.7.38: also skip when the user's config.toml has [feedback].disabled=true,
+		// so a user who opts out via config edit (not just state.json) is honoured.
 		if h.feedbackDialog != nil && !h.feedbackDialog.IsVisible() {
 			fbState, _ := feedback.LoadState()
-			if feedback.ShouldShow(fbState, Version) {
-				feedback.RecordShown(fbState)
+			cfg, _ := session.LoadUserConfig()
+			configDisabled := cfg != nil && cfg.Feedback.Disabled
+			if !configDisabled && feedback.ShouldShow(fbState, Version, time.Now()) {
+				feedback.RecordShown(fbState, time.Now())
 				_ = feedback.SaveState(fbState)
 				h.feedbackState = fbState
 				h.feedbackDialog.Show(Version, fbState, h.feedbackSender)
@@ -3624,7 +3869,11 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			// Restart failed - clear resuming animation immediately so user can retry.
 			delete(h.resumingSessions, msg.sessionID)
-			h.setError(fmt.Errorf("failed to restart session: %w", msg.err))
+			if msg.fresh {
+				h.setError(fmt.Errorf("failed to restart session fresh: %w", msg.err))
+			} else {
+				h.setError(fmt.Errorf("failed to restart session: %w", msg.err))
+			}
 		} else {
 			// Find the instance and refresh its MCP state (O(1) lookup)
 			if inst := h.getInstanceByID(msg.sessionID); inst != nil {
@@ -3663,7 +3912,13 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return h, nil
 
 	case updateCheckMsg:
-		h.updateInfo = msg.info
+		h.lastUpdateCheck = time.Now()
+		if msg.info != nil && !msg.info.Available {
+			// Update is no longer available (e.g., user updated via terminal) — dismiss banner
+			h.updateInfo = nil
+		} else {
+			h.updateInfo = msg.info
+		}
 		return h, nil
 
 	case remoteSessionsFetchedMsg:
@@ -3730,12 +3985,26 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return h, nil
 
+	case reviverTickMsg:
+		// Fire-and-forget reviver sweep for instances whose tmux server
+		// survived an SSH scope cleanup but whose pipe was reaped. Runs in
+		// a goroutine so it never blocks the Bubble Tea update loop.
+		go func(instances []*session.Instance) {
+			rev := session.NewReviver()
+			_ = rev.ReviveAll(instances)
+		}(append([]*session.Instance(nil), h.instances...))
+		return h, h.reviverTick()
+
 	case clearMaintenanceMsg:
 		h.maintenanceMsg = ""
 		return h, nil
 
 	case feedbackSentMsg:
-		// Send completed (best-effort). Dialog auto-dismisses via feedbackDismissMsg timer.
+		// Route the result into the dialog so stepSent renders success or an explicit
+		// error line (v1.7.37, #679 TUI follow-up). Auto-dismiss still fires via timer.
+		if h.feedbackDialog != nil {
+			h.feedbackDialog.OnSent(msg)
+		}
 		return h, nil
 
 	case feedbackDismissMsg:
@@ -3813,17 +4082,11 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case statusUpdateMsg:
 		// Clear attach flag - we've returned from the attached session
 		h.isAttaching.Store(false) // Atomic store for thread safety
-		h.lastAttachReturn = time.Now()
+		now := time.Now()
+		h.beginAttachReturnGrace(now)
 
-		// Refresh window cache and rebuild flat items to reflect window changes
-		// (user may have opened/closed tmux windows while attached)
-		tmux.RefreshSessionCache()
-		h.rebuildFlatItems()
-
-		// Trigger status update on attach return to reflect current state
-		// Acknowledgment was already done on attach (if session was waiting),
-		// so this just refreshes the display with current busy indicator state.
-		h.triggerStatusUpdate()
+		selectedBefore := h.captureSelectedItemIdentity()
+		h.rebuildFlatItemsPreservingSelection(selectedBefore)
 
 		// Cursor sync: if user switched sessions via notification bar during attach,
 		// move cursor to the session they were last viewing
@@ -3876,10 +4139,22 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Combine with periodic save instead of saving on every attach/detach.
 		// We'll let the next tickMsg handle background save if needed.
 
-		// Re-enable mouse mode after returning from tea.Exec.
-		// tmux detach-client sends terminal reset sequences that disable mouse reporting,
-		// and Bubble Tea doesn't re-enable it automatically after exec returns.
-		return h, tea.EnableMouseCellMotion
+		// Re-enable mouse mode after returning from tea.Exec (tmux detach-client
+		// resets mouse reporting), restore legacy keyboard reporting (tmux's
+		// extended-keys setting leaves Kitty/modifyOtherKeys on the outer terminal;
+		// see RestoreLegacyKeyboardCmd for the full rationale), and schedule a
+		// delayed refresh so the main menu reflects attach-return state changes.
+		return h, tea.Batch(
+			tea.EnableMouseCellMotion,
+			RestoreLegacyKeyboardCmd(os.Stdout),
+			tea.Tick(attachReturnRefreshDelay, func(time.Time) tea.Msg { return attachReturnRefreshMsg{} }),
+		)
+
+	case attachReturnRefreshMsg:
+		selectedBefore := h.captureSelectedItemIdentity()
+		tmux.RefreshSessionCache()
+		h.rebuildFlatItemsPreservingSelection(selectedBefore)
+		return h, nil
 
 	case previewDebounceMsg:
 		// PERFORMANCE: Debounce period elapsed - check if this fetch is still relevant
@@ -3893,6 +4168,26 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		if !isPending {
 			return h, nil // Superseded by newer navigation
+		}
+
+		if msg.remoteName != "" {
+			var cmds []tea.Cmd
+
+			// Preview fetch
+			h.previewCacheMu.Lock()
+			needsPreviewFetch := h.previewFetchingID != msg.previewKey
+			if needsPreviewFetch {
+				h.previewFetchingID = msg.previewKey
+			}
+			h.previewCacheMu.Unlock()
+			if needsPreviewFetch {
+				cmds = append(cmds, h.fetchRemotePreview(msg.remoteName, msg.sessionID, msg.previewKey))
+			}
+
+			if len(cmds) > 0 {
+				return h, tea.Batch(cmds...)
+			}
+			return h, nil
 		}
 
 		// Find session and trigger actual fetch
@@ -3993,13 +4288,14 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return h, nil
 
 	case previewFetchedMsg:
-		// Async preview content received - update cache with timestamp
+		// Async preview content received - always advance the TTL so failures
+		// and empty responses don't trigger a fetch on every tick.
 		// Protect both previewFetchingID and previewCache with the same mutex
 		h.previewCacheMu.Lock()
 		h.previewFetchingID = ""
+		h.previewCacheTime[msg.previewKey] = time.Now()
 		if msg.err == nil {
 			h.previewCache[msg.previewKey] = msg.content
-			h.previewCacheTime[msg.previewKey] = time.Now()
 		}
 		h.previewCacheMu.Unlock()
 		return h, nil
@@ -4244,9 +4540,9 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				for _, inst := range h.instances {
 					if ts := inst.GetTmuxSession(); ts != nil && ts.Exists() {
 						if !pm.IsConnected(ts.Name) {
-							go func(name string) {
-								_ = pm.Connect(name)
-							}(ts.Name)
+							go func(name, socket string) {
+								_ = pm.Connect(name, socket)
+							}(ts.Name, inst.TmuxSocketName)
 						}
 					}
 				}
@@ -4261,6 +4557,14 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				logSettings := session.GetLogSettings()
 				tmux.RunLogMaintenance(logSettings.MaxSizeMB, logSettings.MaxLines, logSettings.RemoveOrphans)
 			}()
+		}
+
+		// Periodic update re-check every 5 minutes to dismiss stale banner
+		// after the user updates agent-deck via terminal while TUI is running
+		const updateRecheckInterval = 5 * time.Minute
+		if h.updateInfo != nil && h.updateInfo.Available && time.Since(h.lastUpdateCheck) >= updateRecheckInterval {
+			h.lastUpdateCheck = time.Now()
+			return h, tea.Batch(h.tick(), h.checkForUpdate())
 		}
 
 		// Clean up expired animation entries (launching, resuming, MCP loading, forking)
@@ -4280,11 +4584,13 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// which runs even when TUI is paused during tea.Exec
 
 		// Fetch preview for currently selected item (if stale/missing and not fetching)
-		// Cache expires after 2 seconds to show live terminal updates without excessive fetching
+		// Local previews use a short TTL for near-live terminal updates.
 		const previewCacheTTL = 2 * time.Second
+		// Remote previews use a longer TTL to avoid frequent SSH calls.
+		const remotePreviewCacheTTL = 10 * time.Second
 		var previewCmd tea.Cmd
 		selectedInst, selectedKey, selectedWinIdx := h.selectedPreviewTarget()
-		if selectedInst != nil {
+		if selectedInst != nil && !h.shouldSuppressPreviewRefresh(time.Now()) {
 			h.previewCacheMu.Lock()
 			cachedTime, hasCached := h.previewCacheTime[selectedKey]
 			cacheExpired := !hasCached || time.Since(cachedTime) > previewCacheTTL
@@ -4294,6 +4600,18 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				previewCmd = h.fetchPreview(selectedInst, selectedKey, selectedWinIdx)
 			}
 			h.previewCacheMu.Unlock()
+		} else {
+			remoteName, remoteSessionID, remoteKey, ok := h.selectedRemotePreviewTarget()
+			if ok {
+				h.previewCacheMu.Lock()
+				cachedTime, hasCached := h.previewCacheTime[remoteKey]
+				cacheExpired := !hasCached || time.Since(cachedTime) > remotePreviewCacheTTL
+				if cacheExpired && h.previewFetchingID != remoteKey {
+					h.previewFetchingID = remoteKey
+					previewCmd = h.fetchRemotePreview(remoteName, remoteSessionID, remoteKey)
+				}
+				h.previewCacheMu.Unlock()
+			}
 		}
 		cmds := []tea.Cmd{h.tick(), previewCmd, remoteFetchCmd}
 		if h.fullRepaint {
@@ -4413,6 +4731,9 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if h.mcpDialog.IsVisible() {
 			return h.handleMCPDialogKey(msg)
+		}
+		if h.editPathsDialog.IsVisible() {
+			return h.handleEditPathsDialogKey(msg)
 		}
 		if h.skillDialog.IsVisible() {
 			return h.handleSkillDialogKey(msg)
@@ -4574,8 +4895,11 @@ func (h *Home) createSessionFromGlobalSearch(result *GlobalSearchResult) tea.Cmd
 			projectPath = "."
 		}
 
-		// Create instance
-		inst := session.NewInstanceWithGroupAndTool(title, projectPath, h.getCurrentGroupPath(), "claude")
+		// Create instance. Issue #666: resolveNewSessionGroup rescues empty
+		// cursor-group (Window / RemoteGroup / placeholder flatItems) so
+		// the empty string never reaches NewInstanceWithGroupAndTool, which
+		// would otherwise override the extractGroupPath default with "".
+		inst := session.NewInstanceWithGroupAndTool(title, projectPath, h.resolveNewSessionGroup(), "claude")
 		inst.ClaudeSessionID = result.SessionID
 
 		// Build resume command with config dir and permission flags
@@ -4624,6 +4948,36 @@ func (h *Home) getCurrentGroupPath() string {
 		}
 	}
 	return ""
+}
+
+// resolveNewSessionGroup returns the group path a freshly-created session
+// should land in when no explicit group is chosen via a dialog.
+//
+// Issue #666: the createSessionFromGlobalSearch path (a Claude
+// conversation imported from global search) previously called
+// getCurrentGroupPath() directly and passed its return value into
+// NewInstanceWithGroupAndTool. When the cursor was on a Window,
+// RemoteGroup, RemoteSession, or creating-placeholder item,
+// getCurrentGroupPath returned "" (home.go:4810). That empty string
+// OVERRODE the extractGroupPath default set at construction time inside
+// NewInstanceWithGroupAndTool — producing an Instance with
+// GroupPath="". At the next reload the empty row silently re-derived
+// via extractGroupPath(ProjectPath), making the imported session appear
+// under a path-derived group instead of the one the user was browsing.
+// Exact user-visible symptom: "TUI-created session ends up in a
+// different group, sometimes with a path-derived name."
+//
+// The rescue contract: always return a non-empty, user-recoverable
+// group. Prefer the cursor's group, then the scoped-view root, then
+// DefaultGroupPath as the universal safe default.
+func (h *Home) resolveNewSessionGroup() string {
+	if gp := h.getCurrentGroupPath(); gp != "" {
+		return gp
+	}
+	if h.groupScope != "" {
+		return h.groupScope
+	}
+	return session.DefaultGroupPath
 }
 
 // handleNewDialogKey handles keys when new dialog is visible
@@ -4693,8 +5047,10 @@ func (h *Home) handleNewDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 		// Build generic toolOptionsJSON from tool-specific options
 		var toolOptionsJSON json.RawMessage
+		var claudeExtraArgs []string
 		if command == "claude" && claudeOpts != nil {
 			toolOptionsJSON, _ = session.MarshalToolOptions(claudeOpts)
+			claudeExtraArgs = h.newDialog.GetClaudeExtraArgs()
 		} else if command == "codex" {
 			yolo := h.newDialog.GetCodexYoloMode()
 			codexOpts := &session.CodexOptions{YoloMode: &yolo}
@@ -4708,7 +5064,7 @@ func (h *Home) handleNewDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if !worktreeEnabled {
 			if _, err := os.Stat(path); os.IsNotExist(err) {
 				h.newDialog.Hide()
-				h.confirmDialog.ShowCreateDirectory(path, name, command, groupPath, toolOptionsJSON, parentSessionID, parentProjectPath)
+				h.confirmDialog.ShowCreateDirectory(path, name, command, groupPath, toolOptionsJSON, claudeExtraArgs, parentSessionID, parentProjectPath)
 				return h, nil
 			}
 		}
@@ -4759,6 +5115,7 @@ func (h *Home) handleNewDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			geminiYoloMode,
 			sandboxMode,
 			toolOptionsJSON,
+			claudeExtraArgs,
 			multiRepoEnabled,
 			additionalPaths,
 			parentSessionID,
@@ -4923,7 +5280,7 @@ func (h *Home) hasModalVisible() bool {
 		h.newDialog.IsVisible() || h.groupDialog.IsVisible() || h.forkDialog.IsVisible() ||
 		h.confirmDialog.IsVisible() || h.mcpDialog.IsVisible() || h.skillDialog.IsVisible() ||
 		h.geminiModelDialog.IsVisible() || h.sessionPickerDialog.IsVisible() ||
-		h.worktreeFinishDialog.IsVisible()
+		h.worktreeFinishDialog.IsVisible() || h.editPathsDialog.IsVisible()
 }
 
 // markNavigationAndFetchPreview sets navigation tracking state and returns a debounced preview command
@@ -5014,6 +5371,7 @@ func (h *Home) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 
 		// Single click: select item
 		h.cursor = itemIndex
+		h.previewScrollOffset = 0
 		h.syncViewport()
 		return h, h.markNavigationAndFetchPreview()
 	}
@@ -5103,6 +5461,7 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "up", "k":
 		if h.cursor > 0 {
 			h.cursor--
+			h.previewScrollOffset = 0
 			h.syncViewport()
 			h.markNavigationActivity()
 			// PERFORMANCE: Debounced preview fetch - waits 150ms for navigation to settle
@@ -5114,6 +5473,7 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "down", "j":
 		if h.cursor < len(h.flatItems)-1 {
 			h.cursor++
+			h.previewScrollOffset = 0
 			h.syncViewport()
 			h.markNavigationActivity()
 			// PERFORMANCE: Debounced preview fetch - waits 150ms for navigation to settle
@@ -5132,6 +5492,7 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if h.cursor < 0 {
 			h.cursor = 0
 		}
+		h.previewScrollOffset = 0
 		h.syncViewport()
 		h.markNavigationActivity()
 		return h, h.fetchSelectedPreview()
@@ -5148,6 +5509,7 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if h.cursor < 0 {
 			h.cursor = 0
 		}
+		h.previewScrollOffset = 0
 		h.syncViewport()
 		h.markNavigationActivity()
 		return h, h.fetchSelectedPreview()
@@ -5161,6 +5523,7 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if h.cursor < 0 {
 			h.cursor = 0
 		}
+		h.previewScrollOffset = 0
 		h.syncViewport()
 		h.markNavigationActivity()
 		return h, h.fetchSelectedPreview()
@@ -5177,6 +5540,7 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if h.cursor < 0 {
 			h.cursor = 0
 		}
+		h.previewScrollOffset = 0
 		h.syncViewport()
 		h.markNavigationActivity()
 		return h, h.fetchSelectedPreview()
@@ -5388,6 +5752,17 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return h, nil
 
+	case "p":
+		// Edit multi-repo paths
+		if h.cursor < len(h.flatItems) {
+			item := h.flatItems[h.cursor]
+			if item.Type == session.ItemTypeSession && item.Session != nil && item.Session.IsMultiRepo() {
+				h.editPathsDialog.SetSize(h.width, h.height)
+				h.editPathsDialog.Show(item.Session, h.newDialog.allPathSuggestions)
+			}
+		}
+		return h, nil
+
 	case "m":
 		// MCP Manager - for Claude and Gemini sessions
 		if h.cursor < len(h.flatItems) {
@@ -5439,11 +5814,10 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return h, nil
 
 	case "s":
-		// Skills Manager - currently for Claude sessions
 		if h.cursor < len(h.flatItems) {
 			item := h.flatItems[h.cursor]
 			if item.Type == session.ItemTypeSession && item.Session != nil &&
-				session.IsClaudeCompatible(item.Session.Tool) {
+				session.SupportsProjectSkills(item.Session.Tool) {
 				h.skillDialog.SetSize(h.width, h.height)
 				if err := h.skillDialog.Show(item.Session.ProjectPath, item.Session.ID, item.Session.Tool); err != nil {
 					h.setError(err)
@@ -5604,14 +5978,6 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return h, nil
 
 	case "n":
-		// Check if cursor is on a remote group/session — create on remote instead
-		if h.cursor >= 0 && h.cursor < len(h.flatItems) {
-			item := h.flatItems[h.cursor]
-			if item.Type == session.ItemTypeRemoteGroup || item.Type == session.ItemTypeRemoteSession {
-				return h, h.createRemoteSession(item.RemoteName)
-			}
-		}
-
 		// Collect unique project paths sorted by most recently accessed
 		type pathInfo struct {
 			path           string
@@ -5721,7 +6087,7 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if h.cursor < len(h.flatItems) {
 			item := h.flatItems[h.cursor]
 			if item.Type == session.ItemTypeSession && item.Session != nil {
-				h.confirmDialog.ShowDeleteSession(item.Session.ID, item.Session.Title, item.Session.IsSandboxed())
+				h.confirmDialog.ShowDeleteSession(item.Session.ID, item.Session.Title, item.Session.IsSandboxed(), item.Session.IsWorktree())
 			} else if item.Type == session.ItemTypeRemoteSession && item.RemoteSession != nil {
 				h.confirmDialog.ShowDeleteRemoteSession(item.RemoteName, item.RemoteSession.ID, item.RemoteSession.Title)
 			} else if item.Type == session.ItemTypeGroup && item.Path != session.DefaultGroupPath && item.Path != h.groupScope {
@@ -5763,6 +6129,25 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					item.Session.ForceNextStatusCheck()
 					_ = item.Session.UpdateStatus()
 					h.saveInstances()
+				}
+			}
+		}
+		return h, nil
+
+	case defaultHotkeyBindings[hotkeyQuickApprove]:
+		// Quick approve: send "1" + Enter to the highlighted Claude session
+		// without attaching. Gated to Claude-compatible tools so a stray press
+		// on a vim/shell session cannot dump a "1" into the buffer. No status
+		// guard - Bash-tool permission prompts in Claude Code don't transition
+		// the session to StatusWaiting, so guarding on it would defeat the
+		// most common use case. Matches the existing "agent-deck session send"
+		// CLI, which has no status guard either.
+		if h.cursor < len(h.flatItems) {
+			item := h.flatItems[h.cursor]
+			if item.Type == session.ItemTypeSession && item.Session != nil &&
+				session.IsClaudeCompatible(item.Session.Tool) {
+				if tmuxSess := item.Session.GetTmuxSession(); tmuxSess != nil {
+					_ = tmuxSess.SendKeysAndEnter("1")
 				}
 			}
 		}
@@ -5852,6 +6237,23 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				}
 			} else if item.Type == session.ItemTypeRemoteSession && item.RemoteSession != nil {
 				return h, h.restartRemoteSession(item.RemoteName, item.RemoteSession.ID, item.RemoteSession.Title)
+			}
+		}
+		return h, nil
+
+	case "T":
+		// Restart session fresh (discard current tool session binding first)
+		if h.cursor < len(h.flatItems) {
+			item := h.flatItems[h.cursor]
+			if item.Type == session.ItemTypeSession && item.Session != nil {
+				if h.hasActiveAnimation(item.Session.ID) {
+					h.setError(fmt.Errorf("session is starting, please wait..."))
+					return h, nil
+				}
+				if item.Session.CanRestartFresh() {
+					h.resumingSessions[item.Session.ID] = time.Now()
+					return h, h.restartSessionFresh(item.Session)
+				}
 			}
 		}
 		return h, nil
@@ -5960,6 +6362,14 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			if h.feedbackSender == nil {
 				h.feedbackSender = feedback.NewSender()
+			}
+			// v1.7.38: ctrl+e is explicit user intent. If the user previously
+			// opted out (via CLI decline or TUI stepConfirm decline), re-enable
+			// the state in memory + on disk BEFORE calling Show() so the new
+			// "Show() no-ops on opt-out" guard does not block this path.
+			if st != nil && !st.FeedbackEnabled {
+				st.FeedbackEnabled = true
+				_ = feedback.SaveState(st)
 			}
 			h.feedbackDialog.Show(Version, st, h.feedbackSender)
 			h.feedbackDialog.SetSize(h.width, h.height)
@@ -6159,7 +6569,7 @@ func (h *Home) confirmAction() tea.Cmd {
 
 // confirmCreateDirectory handles the "yes" action for ConfirmCreateDirectory.
 func (h *Home) confirmCreateDirectory() tea.Cmd {
-	name, path, command, groupPath, pendingToolOpts, parentSessionID, parentProjectPath := h.confirmDialog.GetPendingSession()
+	name, path, command, groupPath, pendingToolOpts, pendingExtraArgs, parentSessionID, parentProjectPath := h.confirmDialog.GetPendingSession()
 	h.confirmDialog.Hide()
 	if err := os.MkdirAll(path, 0o755); err != nil {
 		h.setError(fmt.Errorf("failed to create directory: %w", err))
@@ -6176,6 +6586,7 @@ func (h *Home) confirmCreateDirectory() tea.Cmd {
 		false,
 		false,
 		pendingToolOpts,
+		pendingExtraArgs,
 		false,
 		nil,
 		parentSessionID,
@@ -6419,8 +6830,9 @@ func (h *Home) dispatchHealthAlert(state watcher.HealthState) {
 			ts := inst.GetTmuxSession()
 			if ts != nil && ts.Name != "" {
 				tmuxName := ts.Name
+				socket := inst.TmuxSocketName
 				go func() {
-					_ = exec.Command("tmux", "send-keys", "-t", tmuxName, alertMsg, "Enter").Run()
+					_ = tmux.Exec(socket, "send-keys", "-t", tmuxName, alertMsg, "Enter").Run()
 				}()
 			}
 			break
@@ -6490,12 +6902,102 @@ func (h *Home) handleMCPDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 }
 
+// handleEditPathsDialogKey handles key events for the edit paths dialog.
+func (h *Home) handleEditPathsDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "enter":
+		if h.editPathsDialog.IsEditing() {
+			h.editPathsDialog.Update(msg)
+			return h, nil
+		}
+		// Confirm changes
+		if h.editPathsDialog.HasChanged() {
+			if errMsg := h.editPathsDialog.Validate(); errMsg != "" {
+				h.editPathsDialog.validationErr = errMsg
+				return h, nil
+			}
+			newPaths := h.editPathsDialog.GetPaths()
+			sessionID := h.editPathsDialog.GetSessionID()
+			h.editPathsDialog.Hide()
+			inst := h.getInstanceByID(sessionID)
+			if inst != nil {
+				return h, h.applyMultiRepoPathChanges(inst, newPaths)
+			}
+		}
+		h.editPathsDialog.Hide()
+		return h, nil
+	case "esc":
+		if h.editPathsDialog.IsEditing() {
+			h.editPathsDialog.Update(msg)
+			return h, nil
+		}
+		h.editPathsDialog.Hide()
+		return h, nil
+	default:
+		h.editPathsDialog.Update(msg)
+		return h, nil
+	}
+}
+
+// applyMultiRepoPathChanges updates the symlink directory and restarts the session.
+func (h *Home) applyMultiRepoPathChanges(inst *session.Instance, newPaths []string) tea.Cmd {
+	id := inst.ID
+	return func() tea.Msg {
+		h.instancesMu.RLock()
+		current := h.instanceByID[id]
+		h.instancesMu.RUnlock()
+		if current == nil {
+			return sessionRestartedMsg{sessionID: id, err: fmt.Errorf("session no longer exists")}
+		}
+
+		tempDir := current.MultiRepoTempDir
+		if tempDir == "" {
+			return sessionRestartedMsg{sessionID: id, err: fmt.Errorf("no multi-repo temp dir")}
+		}
+
+		// Remove all existing symlinks/entries in tempDir
+		entries, _ := os.ReadDir(tempDir)
+		for _, entry := range entries {
+			_ = os.RemoveAll(filepath.Join(tempDir, entry.Name()))
+		}
+
+		// Create new symlinks
+		dirnames := session.DeduplicateDirnames(newPaths)
+		var newProjectPath string
+		var newAdditionalPaths []string
+		for i, p := range newPaths {
+			linkPath := filepath.Join(tempDir, dirnames[i])
+			_ = os.Symlink(p, linkPath)
+			if i == 0 {
+				newProjectPath = linkPath
+			} else {
+				newAdditionalPaths = append(newAdditionalPaths, linkPath)
+			}
+		}
+
+		// Update instance fields under write lock to avoid races with
+		// the background status worker that reads via instanceByID.
+		h.instancesMu.Lock()
+		current.ProjectPath = newProjectPath
+		current.AdditionalPaths = newAdditionalPaths
+		if current.GetTmuxSession() != nil {
+			current.GetTmuxSession().WorkDir = tempDir
+		}
+		h.instancesMu.Unlock()
+
+		h.saveInstances()
+
+		err := current.Restart()
+		return sessionRestartedMsg{sessionID: id, err: err}
+	}
+}
+
 // handleSkillDialogKey handles keys when Skills dialog is visible
 func (h *Home) handleSkillDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "enter":
-		hasChanged := h.skillDialog.HasChanged()
-		if hasChanged {
+		needsApply := h.skillDialog.NeedsApply()
+		if needsApply {
 			if err := h.skillDialog.Apply(); err != nil {
 				h.setError(err)
 				h.skillDialog.Hide()
@@ -6504,7 +7006,7 @@ func (h *Home) handleSkillDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 			sessionID := h.skillDialog.GetSessionID()
 			targetInst := h.getInstanceByID(sessionID)
-			if targetInst != nil && session.IsClaudeCompatible(targetInst.Tool) {
+			if targetInst != nil && session.ShouldRestartProjectSkills(targetInst.Tool) {
 				h.skillDialog.Hide()
 				return h, h.restartSession(targetInst)
 			}
@@ -6947,6 +7449,7 @@ func (h *Home) createSessionInGroupWithWorktreeAndOptions(
 	geminiYoloMode bool,
 	sandboxEnabled bool,
 	toolOptionsJSON json.RawMessage,
+	claudeExtraArgs []string,
 	multiRepoEnabled bool,
 	additionalPaths []string,
 	parentSessionID, parentProjectPath string,
@@ -6981,26 +7484,7 @@ func (h *Home) createSessionInGroupWithWorktreeAndOptions(
 			path = worktreePath
 		}
 
-		tool := "shell"
-		switch command {
-		case "claude":
-			tool = "claude"
-		case "gemini":
-			tool = "gemini"
-		case "aider":
-			tool = "aider"
-		case "codex":
-			tool = "codex"
-		case "opencode":
-			tool = "opencode"
-		default:
-			// Check custom tools: tool identity stays as the custom name (e.g. "glm")
-			// so config lookup works, but command resolves to the actual binary (e.g. "claude")
-			if toolDef := session.GetToolDef(command); toolDef != nil {
-				tool = command
-				command = toolDef.Command
-			}
-		}
+		tool, command := createSessionTool(command)
 
 		var inst *session.Instance
 		if groupPath != "" {
@@ -7022,6 +7506,11 @@ func (h *Home) createSessionInGroupWithWorktreeAndOptions(
 		// Apply generic tool options (claude, codex, etc.)
 		if len(toolOptionsJSON) > 0 {
 			inst.ToolOptionsJSON = toolOptionsJSON
+		}
+
+		// Apply claude extra CLI tokens (claude-only, ignored for other tools).
+		if tool == "claude" && len(claudeExtraArgs) > 0 {
+			inst.ExtraArgs = claudeExtraArgs
 		}
 
 		// Apply sandbox config.
@@ -7156,6 +7645,35 @@ func (h *Home) createSessionInGroupWithWorktreeAndOptions(
 	}
 }
 
+// createSessionTool maps a free-form command to (tool, command). Built-in
+// tools resolve to themselves; custom tool names from user config resolve
+// to the configured binary while keeping the custom name as the tool
+// identity (so [tools.<name>] config lookup works). Anything unrecognised
+// falls back to a "shell" session running `command` verbatim.
+func createSessionTool(command string) (string, string) {
+	tool := "shell"
+	switch command {
+	case "claude":
+		tool = "claude"
+	case "gemini":
+		tool = "gemini"
+	case "aider":
+		tool = "aider"
+	case "codex":
+		tool = "codex"
+	case "opencode":
+		tool = "opencode"
+	case "pi":
+		tool = "pi"
+	default:
+		if toolDef := session.GetToolDef(command); toolDef != nil {
+			tool = command
+			command = toolDef.Command
+		}
+	}
+	return tool, command
+}
+
 func applyCreateSessionToolOverrides(inst *session.Instance, tool string, geminiYoloMode bool) {
 	if inst == nil {
 		return
@@ -7278,6 +7796,7 @@ func (h *Home) quickCreateSession() tea.Cmd {
 		name, projectPath, command, groupPath,
 		"", "", "", // no worktree
 		geminiYoloMode, false, toolOptionsJSON,
+		nil,        // no extra claude args (recent-session path)
 		false, nil, // no multi-repo
 		"", "", // no parent
 		"", // no placeholder
@@ -7519,8 +8038,12 @@ func (h *Home) deleteSession(inst *session.Instance) tea.Cmd {
 	return func() tea.Msg {
 		killErr := inst.Kill()
 		if isWorktree {
-			_ = git.RemoveWorktree(worktreeRepoRoot, worktreePath, false)
-			_ = git.PruneWorktrees(worktreeRepoRoot)
+			if err := git.RemoveWorktree(worktreeRepoRoot, worktreePath, true); err != nil {
+				uiLog.Warn("worktree_remove_err", slog.String("path", worktreePath), slog.String("err", err.Error()))
+			}
+			if err := git.PruneWorktrees(worktreeRepoRoot); err != nil {
+				uiLog.Warn("worktree_prune_err", slog.String("repo", worktreeRepoRoot), slog.String("err", err.Error()))
+			}
 		}
 		if isMultiRepo {
 			// Clean up multi-repo temp directory
@@ -7529,8 +8052,12 @@ func (h *Home) deleteSession(inst *session.Instance) tea.Cmd {
 			}
 			// Clean up per-repo worktrees
 			for _, wt := range multiRepoWorktrees {
-				_ = git.RemoveWorktree(wt.RepoRoot, wt.WorktreePath, false)
-				_ = git.PruneWorktrees(wt.RepoRoot)
+				if err := git.RemoveWorktree(wt.RepoRoot, wt.WorktreePath, true); err != nil {
+					uiLog.Warn("worktree_remove_err", slog.String("path", wt.WorktreePath), slog.String("err", err.Error()))
+				}
+				if err := git.PruneWorktrees(wt.RepoRoot); err != nil {
+					uiLog.Warn("worktree_prune_err", slog.String("repo", wt.RepoRoot), slog.String("err", err.Error()))
+				}
 			}
 		}
 		return sessionDeletedMsg{deletedID: id, killErr: killErr}
@@ -7551,6 +8078,7 @@ type sessionRestartedMsg struct {
 	sessionID string
 	err       error
 	warning   string
+	fresh     bool
 }
 
 // mcpRestartedMsg signals that an MCP-triggered restart completed and should auto-attach
@@ -7588,6 +8116,38 @@ func (h *Home) restartSession(inst *session.Instance) tea.Cmd {
 			sessionID: id,
 			err:       err,
 			warning:   current.ConsumeCodexRestartWarning(),
+		}
+	}
+}
+
+// restartSessionFresh restarts a session without resuming the previous tool session.
+func (h *Home) restartSessionFresh(inst *session.Instance) tea.Cmd {
+	id := inst.ID
+	mcpUILog.Debug(
+		"restart_session_fresh_called",
+		slog.String("id", inst.ID),
+		slog.String("title", inst.Title),
+		slog.String("tool", inst.Tool),
+	)
+	return func() tea.Msg {
+		mcpUILog.Debug("restart_session_fresh_executing", slog.String("id", id))
+
+		h.instancesMu.RLock()
+		current := h.instanceByID[id]
+		h.instancesMu.RUnlock()
+		if current == nil {
+			err := fmt.Errorf("session no longer exists")
+			mcpUILog.Debug("restart_session_fresh_result", slog.String("id", id), slog.Any("error", err))
+			return sessionRestartedMsg{sessionID: id, err: err, fresh: true}
+		}
+
+		err := current.RestartFresh()
+		mcpUILog.Debug("restart_session_fresh_result", slog.String("id", id), slog.Any("error", err))
+		return sessionRestartedMsg{
+			sessionID: id,
+			err:       err,
+			warning:   current.ConsumeCodexRestartWarning(),
+			fresh:     true,
 		}
 	}
 }
@@ -8211,6 +8771,9 @@ func (h *Home) View() string {
 	}
 	if h.mcpDialog.IsVisible() {
 		return h.mcpDialog.View()
+	}
+	if h.editPathsDialog.IsVisible() {
+		return h.editPathsDialog.View()
 	}
 	if h.skillDialog.IsVisible() {
 		return h.skillDialog.View()
@@ -9242,6 +9805,7 @@ func (h *Home) renderHelpBarMinimal() string {
 	importKey := h.actionKey(hotkeyImport)
 	groupKey := h.actionKey(hotkeyCreateGroup)
 	restartKey := h.actionKey(hotkeyRestart)
+	restartFreshKey := h.actionKey(hotkeyRestartFresh)
 	forkKey := h.actionKey(hotkeyQuickFork)
 	mcpKey := h.actionKey(hotkeyMCPManager)
 	skillsKey := h.actionKey(hotkeySkillsManager)
@@ -9263,6 +9827,12 @@ func (h *Home) renderHelpBarMinimal() string {
 			contextKeys = renderKeys("⏎", newKey, quickKey, groupKey)
 		} else {
 			contextKeys = renderKeys("⏎", newKey, quickKey, restartKey)
+			if item.Session != nil && item.Session.CanRestartFresh() {
+				freshRendered := renderKeys(restartFreshKey)
+				if freshRendered != "" {
+					contextKeys += " " + freshRendered
+				}
+			}
 			if item.Session != nil && item.Session.CanFork() {
 				forkRendered := renderKeys(forkKey)
 				if forkRendered != "" {
@@ -9275,7 +9845,7 @@ func (h *Home) renderHelpBarMinimal() string {
 					contextKeys += " " + mcpRendered
 				}
 			}
-			if item.Session != nil && session.IsClaudeCompatible(item.Session.Tool) {
+			if item.Session != nil && session.SupportsProjectSkills(item.Session.Tool) {
 				skillsRendered := renderKeys(skillsKey)
 				if skillsRendered != "" {
 					contextKeys += " " + skillsRendered
@@ -9335,6 +9905,7 @@ func (h *Home) renderHelpBarCompact() string {
 	sepStyle := lipgloss.NewStyle().Foreground(ColorBorder)
 	sep := sepStyle.Render(" │ ")
 	newQuickKey := joinHotkeyLabels(h.actionKey(hotkeyNewSession), h.actionKey(hotkeyQuickCreate))
+	restartFreshKey := h.actionKey(hotkeyRestartFresh)
 
 	// Abbreviated key+short desc
 	var contextHints []string
@@ -9360,6 +9931,9 @@ func (h *Home) renderHelpBarCompact() string {
 			if key := h.actionKey(hotkeyRestart); key != "" {
 				contextHints = append(contextHints, h.helpKeyShort(key, "Restart"))
 			}
+			if item.Session != nil && item.Session.CanRestartFresh() && restartFreshKey != "" {
+				contextHints = append(contextHints, h.helpKeyShort(restartFreshKey, "Fresh"))
+			}
 			if item.Session != nil && item.Session.CanFork() {
 				if key := h.actionKey(hotkeyQuickFork); key != "" {
 					contextHints = append(contextHints, h.helpKeyShort(key, "Fork"))
@@ -9373,7 +9947,7 @@ func (h *Home) renderHelpBarCompact() string {
 					contextHints = append(contextHints, h.helpKeyShort(key, h.previewModeShort()))
 				}
 			}
-			if item.Session != nil && session.IsClaudeCompatible(item.Session.Tool) {
+			if item.Session != nil && session.SupportsProjectSkills(item.Session.Tool) {
 				if key := h.actionKey(hotkeySkillsManager); key != "" {
 					contextHints = append(contextHints, h.helpKeyShort(key, "Skills"))
 				}
@@ -9471,6 +10045,7 @@ func (h *Home) renderHelpBarFull() string {
 	newQuickKey := joinHotkeyLabels(h.actionKey(hotkeyNewSession), h.actionKey(hotkeyQuickCreate))
 	renameKey := h.actionKey(hotkeyRename)
 	restartKey := h.actionKey(hotkeyRestart)
+	restartFreshKey := h.actionKey(hotkeyRestartFresh)
 	deleteKey := h.actionKey(hotkeyDelete)
 	closeKey := h.actionKey(hotkeyCloseSession)
 	groupKey := h.actionKey(hotkeyCreateGroup)
@@ -9533,6 +10108,9 @@ func (h *Home) renderHelpBarFull() string {
 			if restartKey != "" {
 				primaryHints = append(primaryHints, h.helpKey(restartKey, "Restart"))
 			}
+			if item.Session != nil && item.Session.CanRestartFresh() && restartFreshKey != "" {
+				primaryHints = append(primaryHints, h.helpKey(restartFreshKey, "Restart Fresh"))
+			}
 			// Only show fork hints if session has a valid Claude session ID
 			if item.Session != nil && item.Session.CanFork() {
 				if forkKeys != "" {
@@ -9548,7 +10126,7 @@ func (h *Home) renderHelpBarFull() string {
 					primaryHints = append(primaryHints, h.helpKey(previewKey, h.previewModeShort()))
 				}
 			}
-			if item.Session != nil && session.IsClaudeCompatible(item.Session.Tool) {
+			if item.Session != nil && session.SupportsProjectSkills(item.Session.Tool) {
 				if skillsKey != "" {
 					primaryHints = append(primaryHints, h.helpKey(skillsKey, "Skills"))
 				}
@@ -9556,6 +10134,11 @@ func (h *Home) renderHelpBarFull() string {
 			if item.Session != nil && item.Session.IsSandboxed() {
 				if execShellKey != "" {
 					primaryHints = append(primaryHints, h.helpKey(execShellKey, "Exec"))
+				}
+			}
+			if item.Session != nil && item.Session.IsMultiRepo() {
+				if editPathsKey := h.actionKey(hotkeyEditPaths); editPathsKey != "" {
+					primaryHints = append(primaryHints, h.helpKey(editPathsKey, "Paths"))
 				}
 			}
 			if copyKey != "" {
@@ -10169,6 +10752,17 @@ func (h *Home) renderSessionItem(
 		titleStyle = SessionTitleDefault
 	}
 
+	// Issue #391: per-session color tint. When the user has set
+	// Instance.Color (validated CLI-side in isValidSessionColor), override
+	// the title foreground with that color. Bold/underline from the
+	// status-based style above is preserved — only the hue changes, so
+	// colorblind accessibility via weight still works. Empty Color is the
+	// default and leaves titleStyle untouched (zero behavior change for
+	// users who haven't opted in).
+	if inst.Color != "" {
+		titleStyle = titleStyle.Foreground(lipgloss.Color(inst.Color))
+	}
+
 	// Tool badge with brand-specific color
 	// Claude=orange, Gemini=purple, Codex=cyan, Aider=red
 	toolStyle := GetToolStyle(instTool)
@@ -10442,6 +11036,31 @@ func (h *Home) renderRemotePreview(item session.Item, width, height int) string 
 		b.WriteString(dimStyle.Render("Group:   ") + rs.Group + "\n")
 	}
 	b.WriteString("\n")
+
+	pvKey := remotePreviewCacheKey(item.RemoteName, rs.ID)
+	h.previewCacheMu.RLock()
+	previewContent, hasPreview := h.previewCache[pvKey]
+	_, hasFetched := h.previewCacheTime[pvKey]
+	h.previewCacheMu.RUnlock()
+
+	b.WriteString(dimStyle.Render("Last response") + "\n")
+	b.WriteString(strings.Repeat("-", max(1, min(width-4, 40))))
+	b.WriteString("\n")
+	previewContent = truncateRemotePreviewContent(previewContent)
+	if hasPreview && strings.TrimSpace(previewContent) != "" {
+		b.WriteString(previewContent)
+		b.WriteString("\n\n")
+	} else if hasFetched {
+		b.WriteString(dimStyle.Render("No response available yet."))
+		b.WriteString("\n\n")
+	} else if rs.Status == "running" || rs.Status == "waiting" {
+		b.WriteString(dimStyle.Render("Fetching remote preview..."))
+		b.WriteString("\n\n")
+	} else {
+		b.WriteString(dimStyle.Render("No response available yet."))
+		b.WriteString("\n\n")
+	}
+
 	b.WriteString(dimStyle.Render("Press Enter to attach via SSH"))
 
 	return b.String()
@@ -11060,6 +11679,13 @@ func (h *Home) renderPreviewPane(width, height int) string {
 			b.WriteString(mrValueStyle.Render(truncatePath(p, width-4-len(label))))
 			b.WriteString("\n")
 		}
+
+		editPathsKey := h.actionKey(hotkeyEditPaths)
+		if editPathsKey != "" {
+			hintStyle := lipgloss.NewStyle().Foreground(ColorComment)
+			b.WriteString(hintStyle.Render(fmt.Sprintf("  %s: edit paths", editPathsKey)))
+			b.WriteString("\n")
+		}
 	}
 
 	// Claude-specific info (session ID and MCPs)
@@ -11407,6 +12033,16 @@ func (h *Home) renderPreviewPane(width, height int) string {
 					b.WriteString("\n")
 				}
 			}
+			if selected.CanRestartFresh() {
+				if restartFreshKey := h.actionKey(hotkeyRestartFresh); restartFreshKey != "" {
+					hintStyle := lipgloss.NewStyle().Foreground(ColorText).Italic(true)
+					keyStyle := lipgloss.NewStyle().Foreground(ColorAccent).Bold(true)
+					b.WriteString(hintStyle.Render("Fresh:   "))
+					b.WriteString(keyStyle.Render(restartFreshKey))
+					b.WriteString(hintStyle.Render(" restart with a new session ID"))
+					b.WriteString("\n")
+				}
+			}
 		}
 	}
 
@@ -11458,6 +12094,14 @@ func (h *Home) renderPreviewPane(width, height int) string {
 			b.WriteString(dimStyle.Render(" Resume  - restart with session resume"))
 			b.WriteString("\n")
 		}
+		if selected.CanRestartFresh() {
+			if restartFreshKey := h.actionKey(hotkeyRestartFresh); restartFreshKey != "" {
+				b.WriteString("  ")
+				b.WriteString(keyStyle.Render(restartFreshKey))
+				b.WriteString(dimStyle.Render(" Fresh   - restart with a new session ID"))
+				b.WriteString("\n")
+			}
+		}
 		if deleteKey := h.actionKey(hotkeyDelete); deleteKey != "" {
 			b.WriteString("  ")
 			b.WriteString(keyStyle.Render(deleteKey))
@@ -11468,6 +12112,14 @@ func (h *Home) renderPreviewPane(width, height int) string {
 		b.WriteString(keyStyle.Render("Enter"))
 		b.WriteString(dimStyle.Render(" - attach (will auto-start)"))
 		b.WriteString("\n")
+		if selected.IsMultiRepo() {
+			if editPathsKey := h.actionKey(hotkeyEditPaths); editPathsKey != "" {
+				b.WriteString("  ")
+				b.WriteString(keyStyle.Render(editPathsKey))
+				b.WriteString(dimStyle.Render(" Paths   - edit multi-repo paths"))
+				b.WriteString("\n")
+			}
+		}
 
 		// Pad output to exact height to prevent layout shifts
 		content := b.String()
@@ -11515,6 +12167,14 @@ func (h *Home) renderPreviewPane(width, height int) string {
 			b.WriteString(dimStyle.Render(" Start   - create and start tmux session"))
 			b.WriteString("\n")
 		}
+		if selected.CanRestartFresh() {
+			if restartFreshKey := h.actionKey(hotkeyRestartFresh); restartFreshKey != "" {
+				b.WriteString("  ")
+				b.WriteString(keyStyle.Render(restartFreshKey))
+				b.WriteString(dimStyle.Render(" Fresh   - start without resuming the prior session"))
+				b.WriteString("\n")
+			}
+		}
 		if deleteKey := h.actionKey(hotkeyDelete); deleteKey != "" {
 			b.WriteString("  ")
 			b.WriteString(keyStyle.Render(deleteKey))
@@ -11525,6 +12185,14 @@ func (h *Home) renderPreviewPane(width, height int) string {
 		b.WriteString(keyStyle.Render("Enter"))
 		b.WriteString(dimStyle.Render(" - attach (will auto-start)"))
 		b.WriteString("\n")
+		if selected.IsMultiRepo() {
+			if editPathsKey := h.actionKey(hotkeyEditPaths); editPathsKey != "" {
+				b.WriteString("  ")
+				b.WriteString(keyStyle.Render(editPathsKey))
+				b.WriteString(dimStyle.Render(" Paths   - edit multi-repo paths"))
+				b.WriteString("\n")
+			}
+		}
 
 		// Pad output to exact height to prevent layout shifts
 		content := b.String()
@@ -11765,15 +12433,40 @@ func (h *Home) renderPreviewPane(width, height int) string {
 		// Track if we're truncating from the top (for indicator)
 		truncatedFromTop := len(lines) > maxLines
 		truncatedCount := 0
+		scrolledBelow := 0
 		if truncatedFromTop {
-			// Reserve one line for the truncation indicator
+			// Reserve one line for the "⋮ N more above" indicator
 			maxLines--
 			if maxLines < 1 {
 				maxLines = 1
 			}
-			truncatedCount = len(lines) - maxLines
-			lines = lines[len(lines)-maxLines:]
+			// #574: slide the visible window up by previewScrollOffset lines
+			// so the user can see older output instead of the tail. Clamp
+			// the offset to the valid range so arbitrary values don't go
+			// out of bounds or below zero.
+			maxOffset := len(lines) - maxLines
+			if maxOffset < 0 {
+				maxOffset = 0
+			}
+			if h.previewScrollOffset > maxOffset {
+				h.previewScrollOffset = maxOffset
+			}
+			if h.previewScrollOffset < 0 {
+				h.previewScrollOffset = 0
+			}
+			endIdx := len(lines) - h.previewScrollOffset
+			startIdx := endIdx - maxLines
+			if startIdx < 0 {
+				startIdx = 0
+			}
+			truncatedCount = startIdx
+			scrolledBelow = len(lines) - endIdx
+			lines = lines[startIdx:endIdx]
+		} else {
+			// Content fits without truncation — offset has no effect, keep state consistent.
+			h.previewScrollOffset = 0
 		}
+		_ = scrolledBelow // reserved for a future "⋮ N below" indicator; offset clamp already prevents stale state
 
 		maxWidth := width - 4
 		if maxWidth < 10 {
@@ -11800,6 +12493,12 @@ func (h *Home) renderPreviewPane(width, height int) string {
 			// ANSI escape sequences (ESC = 0x1b) so colors and formatting
 			// from the captured terminal output pass through to display.
 			safeLine := stripControlCharsPreserveANSI(line)
+
+			// Strip CSI K (Erase in Line) and CSI J (Erase in Display).
+			// Without this, captured content (e.g. Neovim mini.statusline)
+			// instructs the outer terminal to paint the active SGR
+			// background beyond the pane's truncation point. See #579.
+			safeLine = stripDisplayErasingEscapes(safeLine)
 
 			// In light theme, remap captured ANSI background colors to the
 			// current preview surface instead of stripping them completely.
@@ -12003,6 +12702,24 @@ func stripControlCharsPreserveANSI(s string) string {
 //   - ESC[100m..ESC[107m — bright/high-intensity backgrounds
 //   - ESC[48;...m        — 256-color and true-color backgrounds (ESC[48;5;Nm / ESC[48;2;R;G;Bm)
 var ansiBackgroundRE = regexp.MustCompile(`\x1b\[(?:4[0-7]|10[0-7]|48;[0-9;]+)m`)
+
+// eraseEscapesRE matches CSI "Erase in Line" (ESC [ ... K) and CSI
+// "Erase in Display" (ESC [ ... J). These tell the outer terminal to
+// paint the currently-active SGR background across the remainder of
+// the physical row (K) or screen (J). When captured content is
+// rendered inside the preview pane, that paint extends past the pane
+// boundary — the regression reported as #579, where Neovim's
+// mini.statusline leaks its green bar past the right edge. Stripping
+// K/J makes every cell the preview emits explicit, so the outer
+// terminal paints only what fits the truncation budget.
+var eraseEscapesRE = regexp.MustCompile(`\x1b\[[0-9;?]*[KJ]`)
+
+// stripDisplayErasingEscapes removes CSI K / CSI J sequences from
+// captured terminal content while preserving SGR (color/attribute)
+// sequences.
+func stripDisplayErasingEscapes(s string) string {
+	return eraseEscapesRE.ReplaceAllString(s, "")
+}
 
 // previewSurfaceANSI returns a truecolor ANSI background sequence matching
 // the current preview surface. Falls back to empty string if the color is not
@@ -12514,15 +13231,36 @@ func (h *Home) getOtherActiveSessions(excludeID string) []*session.Instance {
 }
 
 // getSessionContent retrieves displayable content from a session.
-// Tries GetLastResponse first, falls back to CaptureFullHistory.
+//
+// Refreshes tool session IDs from the live tmux env BEFORE reading, so that
+// a stale ClaudeSessionID (e.g. from a prior resumed conversation) cannot
+// surface old JSONL content as "the last response". Fix for issue #598
+// (cross-session `x` transferred unpredictable content).
+//
+// Falls back to tmux scrollback capture when structured response lookup
+// returns no content.
 func getSessionContent(inst *session.Instance) (string, error) {
-	// Try AI response first
-	resp, err := inst.GetLastResponse()
-	if err == nil && resp.Content != "" {
+	var live string
+	if session.IsClaudeCompatible(inst.Tool) {
+		live = inst.GetSessionIDFromTmux()
+	}
+	return getSessionContentWithLive(inst, live)
+}
+
+// getSessionContentWithLive is the testable core: given a live Claude session
+// ID (may be empty), prefer it over any stored ID before reading the last
+// response, then fall back to tmux scrollback.
+func getSessionContentWithLive(inst *session.Instance, liveClaudeID string) (string, error) {
+	if session.IsClaudeCompatible(inst.Tool) && liveClaudeID != "" && liveClaudeID != inst.ClaudeSessionID {
+		inst.ClaudeSessionID = liveClaudeID
+	}
+
+	// Use best-effort: richer recovery than GetLastResponse if the refreshed
+	// ID still doesn't resolve to a readable JSONL.
+	if resp, err := inst.GetLastResponseBestEffort(); err == nil && resp != nil && resp.Content != "" {
 		return resp.Content, nil
 	}
 
-	// Fall back to tmux pane capture
 	tmuxSession := inst.GetTmuxSession()
 	if tmuxSession == nil {
 		return "", fmt.Errorf("no output available for this session")

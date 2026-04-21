@@ -78,6 +78,16 @@ func (i *Instance) buildEnvSourceCommand() string {
 		sources = append(sources, conductorEnv)
 	}
 
+	// 7. S8 (v1.7.40) — strip TELEGRAM_STATE_DIR on every non-channel-owning
+	// claude spawn. Fires AFTER all sources and inline env so it wins
+	// over any env_file / inline export that set the variable, and
+	// runs even when no env_file is in play (covers `agent-deck
+	// launch` children outside the conductor's group triangle).
+	// Subsumes the narrower issue #680 predicate.
+	if stripExpr := telegramStateDirStripExpr(i); stripExpr != "" {
+		sources = append(sources, stripExpr)
+	}
+
 	if len(sources) == 0 {
 		return ""
 	}
@@ -328,4 +338,42 @@ func isValidEnvKey(key string) bool {
 		return false
 	}
 	return true
+}
+
+// telegramStateDirStripExpr returns `unset TELEGRAM_STATE_DIR` for any
+// claude spawn that is NOT a channel-owning telegram session. S8
+// (v1.7.40) broadens issue #680's narrow conductor-pairing predicate:
+// every `agent-deck launch` child that doesn't own the telegram bot
+// must lose TELEGRAM_STATE_DIR, otherwise it inherits the conductor's
+// TSD via the parent shell env, the telegram plugin (enabled globally
+// per the v3 topology) reads the conductor's .env, and a duplicate
+// bun poller races the conductor on the same bot token → Telegram
+// returns 409 Conflict and messages drop for everyone.
+//
+// Fires when ALL hold:
+//  1. Tool is "claude" — TELEGRAM_STATE_DIR is a Claude Code plugin env
+//     var; don't mutate codex / gemini spawns.
+//  2. Title does NOT start with "conductor-". Conductors are the
+//     legitimate bot owners even before `Channels` is set.
+//  3. No entry in `Channels` carries the `plugin:telegram@` prefix.
+//     Explicit per-session telegram opt-in keeps the variable.
+//
+// Returned string is empty when no strip is needed, so callers can
+// append it unconditionally to the sources slice.
+func telegramStateDirStripExpr(inst *Instance) string {
+	if inst == nil {
+		return ""
+	}
+	if inst.Tool != "claude" {
+		return ""
+	}
+	if conductorNameFromInstance(inst) != "" {
+		return "" // conductor session — owns the bot token
+	}
+	for _, ch := range inst.Channels {
+		if strings.HasPrefix(ch, telegramChannelPrefix) {
+			return "" // explicit telegram channel owner
+		}
+	}
+	return "unset TELEGRAM_STATE_DIR"
 }

@@ -9,100 +9,84 @@ tests:
   source: telegram-incident-2026-04-15
   manual: false
   run:
-    command: go test ./internal/session/ -run TestStartCommandAppendsChannels -count=1
-      -v
+    command: go test ./internal/session/ -run TestStartCommandAppendsChannels -count=1 -v
     expected: pass
 - id: ch-support-omit-when-empty
   added: 2026-04-16
   task: ch-support
   file: internal/session/channels_test.go
   test_name: TestStartCommandOmitsChannelsWhenEmpty
-  purpose: "Negative control \u2014 empty Channels emits no --channels flag (prevents\
-    \ empty-csv bug)"
+  purpose: "Negative control \u2014 empty Channels emits no --channels flag (prevents empty-csv bug)"
   source: telegram-incident-2026-04-15
   manual: false
   run:
-    command: go test ./internal/session/ -run TestStartCommandOmitsChannelsWhenEmpty
-      -count=1 -v
+    command: go test ./internal/session/ -run TestStartCommandOmitsChannelsWhenEmpty -count=1 -v
     expected: pass
 - id: ch-support-restart-persist
   added: 2026-04-16
   task: ch-support
   file: internal/session/channels_test.go
   test_name: TestChannelsRestartPersist
-  purpose: Channels survive JSON round-trip; rebuilt command from revived instance
-    still has --channels (guards against restart-drops-channels bug)
+  purpose: Channels survive JSON round-trip; rebuilt command from revived instance still has --channels (guards against restart-drops-channels bug)
   source: telegram-incident-2026-04-15
   manual: false
   run:
-    command: go test ./internal/session/ -run TestChannelsRestartPersist -count=1
-      -v
+    command: go test ./internal/session/ -run TestChannelsRestartPersist -count=1 -v
     expected: pass
 - id: ch-support-add-flag
   added: 2026-04-16
   task: ch-support
   file: cmd/agent-deck/channels_cmd_test.go
   test_name: TestAddChannelFlag
-  purpose: 'CLI: ''agent-deck add --channel <id>'' (repeatable) persists channels
-    via SQLite round-trip'
+  purpose: 'CLI: ''agent-deck add --channel <id>'' (repeatable) persists channels via SQLite round-trip'
   source: telegram-incident-2026-04-15
   manual: false
   run:
-    command: go test ./cmd/agent-deck/ -run TestAddChannelFlag -count=1 -timeout 90s
-      -v
+    command: go test ./cmd/agent-deck/ -run TestAddChannelFlag -count=1 -timeout 90s -v
     expected: pass
 - id: ch-support-session-set
   added: 2026-04-16
   task: ch-support
   file: cmd/agent-deck/channels_cmd_test.go
   test_name: TestSessionSetChannels
-  purpose: 'CLI: ''agent-deck session set <id> channels <csv>'' persists via SQLite
-    round-trip'
+  purpose: 'CLI: ''agent-deck session set <id> channels <csv>'' persists via SQLite round-trip'
   source: telegram-incident-2026-04-15
   manual: false
   run:
-    command: go test ./cmd/agent-deck/ -run TestSessionSetChannels -count=1 -timeout
-      90s -v
+    command: go test ./cmd/agent-deck/ -run TestSessionSetChannels -count=1 -timeout 90s -v
     expected: pass
 - id: ch-support-only-for-claude
   added: 2026-04-16
   task: ch-support
   file: cmd/agent-deck/channels_cmd_test.go
   test_name: TestChannelsOnlyForClaude
-  purpose: "Channels is claude-only \u2014 bash/codex/gemini sessions reject the field\
-    \ with a tool-specific error"
+  purpose: "Channels is claude-only \u2014 bash/codex/gemini sessions reject the field with a tool-specific error"
   source: telegram-incident-2026-04-15
   manual: false
   run:
-    command: go test ./cmd/agent-deck/ -run TestChannelsOnlyForClaude -count=1 -timeout
-      90s -v
+    command: go test ./cmd/agent-deck/ -run TestChannelsOnlyForClaude -count=1 -timeout 90s -v
     expected: pass
 - id: ch-support-e2e-manual
   added: 2026-04-16
   task: ch-support
   file: "(manual \u2014 not in test harness)"
   test_name: e2e-channel-roundtrip
-  purpose: 'End-to-end: create a session with --channel, restart, verify claude is
-    launched with --channels by inspecting the pane command'
+  purpose: 'End-to-end: create a session with --channel, restart, verify claude is launched with --channels by inspecting the pane command'
   source: telegram-incident-2026-04-15
   manual: true
-  manual_steps: '1. agent-deck -p personal add --channel plugin:telegram@user/repo
-    -c claude -t chan-e2e --no-parent /tmp/chan-e2e
+  manual_steps: '1. agent-deck -p personal add --channel plugin:telegram@user/repo -c claude -t chan-e2e --no-parent /tmp/chan-e2e
 
     2. agent-deck -p personal session start chan-e2e
 
-    3. Wait for session to come online (ps -o args= <claude-pid> or tmux list-panes
-    of its tmux session)
+    3. Wait for session to come online (ps -o args= <claude-pid> or tmux list-panes of its tmux session)
 
     4. Verify the claude command line contains "--channels plugin:telegram@user/repo"
 
     5. agent-deck -p personal session restart chan-e2e
 
-    6. Re-verify the claude command line STILL contains --channels after restart (restart
-    must preserve)
+    6. Re-verify the claude command line STILL contains --channels after restart (restart must preserve)
 
-    7. Cleanup: agent-deck -p personal session stop chan-e2e && agent-deck -p personal
-    remove chan-e2e
+    7. Cleanup: agent-deck -p personal session stop chan-e2e && agent-deck -p personal remove chan-e2e
 
     '
   run:
@@ -113,28 +97,22 @@ tests:
   task: ch-support
   file: internal/session/channels_test.go
   test_name: TestResumeCommandAppendsChannels
-  purpose: 'Restart/resume path must also emit --channels. Phase 5 loopback regression:
-    before this test, buildClaudeResumeCommand hand-rolled its own flag assembly and
-    silently dropped --channels (and every other extra flag). Guards against flag-desync
-    between start/restart paths.'
+  purpose: 'Restart/resume path must also emit --channels. Phase 5 loopback regression: before this test, buildClaudeResumeCommand hand-rolled its own flag assembly and silently dropped --channels (and every other extra flag). Guards against flag-desync between start/restart paths.'
   source: phase-5-loopback-2026-04-16
   manual: false
   run:
-    command: go test ./internal/session/ -run TestResumeCommandAppendsChannels -count=1
-      -v
+    command: go test ./internal/session/ -run TestResumeCommandAppendsChannels -count=1 -v
     expected: pass
 - id: fix-544-544-fd-preservation
   added: '2026-04-16'
   task: fix-544
   file: internal/ui/keyboard_compat_mechanism_test.go
   test_name: TestCSIuReader_PreservesFdForRawMode
-  purpose: "CSIuFileReader must preserve *os.File Fd() for Bubble Tea raw-mode setup\
-    \ \u2014 prevents #544 regression"
+  purpose: "CSIuFileReader must preserve *os.File Fd() for Bubble Tea raw-mode setup \u2014 prevents [#544] regression"
   source: gh#544,#607,phase-02-01-retrospective
   manual: false
   run:
-    command: go test ./internal/ui/ -run TestCSIuReader_PreservesFdForRawMode -count=1
-      -v
+    command: go test ./internal/ui/ -run TestCSIuReader_PreservesFdForRawMode -count=1 -v
     expected: pass
 - id: fix-544-544-non-file-fallback
   added: '2026-04-16'
@@ -145,8 +123,7 @@ tests:
   source: gh#544,#607,phase-02-01-retrospective
   manual: false
   run:
-    command: go test ./internal/ui/ -run TestCSIuReader_NonFileFallsBackToPlainReader
-      -count=1 -v
+    command: go test ./internal/ui/ -run TestCSIuReader_NonFileFallsBackToPlainReader -count=1 -v
     expected: pass
 - id: fix-544-544-underscore-csiu
   added: '2026-04-16'
@@ -157,18 +134,1533 @@ tests:
   source: gh#544,#607,phase-02-01-retrospective
   manual: false
   run:
-    command: go test ./internal/ui/ -run TestCSIuReader_UnderscorePreserved -count=1
-      -v
+    command: go test ./internal/ui/ -run TestCSIuReader_UnderscorePreserved -count=1 -v
 - id: fix-615-session-show-channels
   added: '2026-04-16'
   task: fix-615
   file: cmd/agent-deck/channels_cmd_test.go
   test_name: TestSessionShowJSONIncludesChannels
-  purpose: "session show --json must include channels field when set \u2014 guards\
-    \ parallel-paths regression where list --json and show --json emitters drift."
+  purpose: "session show --json must include channels field when set \u2014 guards parallel-paths regression where list --json and show --json emitters drift."
   source: gh#615
   manual: false
   run:
-    command: go test ./cmd/agent-deck/ -run TestSessionShowJSONIncludesChannels -count=1
-      -timeout 90s -v
+    command: go test ./cmd/agent-deck/ -run TestSessionShowJSONIncludesChannels -count=1 -timeout 90s -v
+    expected: pass
+- id: fix-config-dir-priority-group-beats-env
+  added: '2026-04-17'
+  task: fix-config-dir-priority
+  file: internal/session/conductorconfig_test.go
+  test_name: TestConductorConfig_GroupBeatsEnv
+  purpose: "[groups.<g>.claude].config_dir wins over CLAUDE_CONFIG_DIR env var \u2014 explicit TOML override is more specific than shell-wide default (2026-04-17 priority-inversion fix)."
+  source: user-report-2026-04-17
+  manual: false
+  run:
+    command: go test ./internal/session/ -run TestConductorConfig_GroupBeatsEnv -count=1 -v
+    expected: pass
+- id: fix-config-dir-priority-conductor-beats-env
+  added: '2026-04-17'
+  task: fix-config-dir-priority
+  file: internal/session/conductorconfig_test.go
+  test_name: TestConductorConfig_PrecedenceConductorBeatsEnv
+  purpose: "[conductors.<n>.claude].config_dir wins over CLAUDE_CONFIG_DIR env var \u2014 flipped from old TestConductorConfig_PrecedenceEnvBeatsConductor which codified the buggy env-first order."
+  source: user-report-2026-04-17
+  manual: false
+  run:
+    command: go test ./internal/session/ -run TestConductorConfig_PrecedenceConductorBeatsEnv -count=1 -v
+    expected: pass
+- id: fix-config-dir-priority-env-still-beats-profile
+  added: '2026-04-17'
+  task: fix-config-dir-priority
+  file: internal/session/conductorconfig_test.go
+  test_name: TestConductorConfig_EnvBeatsProfile
+  purpose: 'Regression guard: env var STILL beats [profiles.<p>.claude].config_dir. Profile is shell-wide-ish and less specific than env; must stay below env in the new priority order.'
+  source: user-report-2026-04-17
+  manual: false
+  run:
+    command: go test ./internal/session/ -run TestConductorConfig_EnvBeatsProfile -count=1 -v
+    expected: pass
+- id: fix-config-dir-priority-env-still-beats-global
+  added: '2026-04-17'
+  task: fix-config-dir-priority
+  file: internal/session/conductorconfig_test.go
+  test_name: TestConductorConfig_EnvBeatsGlobal
+  purpose: 'Regression guard: env var STILL beats [claude].config_dir top-level global. Global is shell-wide fallback; env remains stronger.'
+  source: user-report-2026-04-17
+  manual: false
+  run:
+    command: go test ./internal/session/ -run TestConductorConfig_EnvBeatsGlobal -count=1 -v
+    expected: pass
+- id: fix-config-dir-priority-source-label-group
+  added: '2026-04-17'
+  task: fix-config-dir-priority
+  file: internal/session/conductorconfig_test.go
+  test_name: TestConductorConfig_SourceLabelGroupWhenGroupBeatsEnv
+  purpose: "GetClaudeConfigDirSourceForInstance must return source=\"group\" when group TOML beats env \u2014 parallel-paths audit for the (path, source) getter alongside the primary resolver."
+  source: user-report-2026-04-17
+  manual: false
+  run:
+    command: go test ./internal/session/ -run TestConductorConfig_SourceLabelGroupWhenGroupBeatsEnv -count=1 -v
+    expected: pass
+- id: fix-restart-custom-config-dir-respects-per-instance
+  added: '2026-04-17'
+  task: fix-restart-custom-config-dir
+  file: internal/session/conductorconfig_test.go
+  test_name: TestSessionHasConversationData_RespectsPerInstanceConfigDir
+  purpose: sessionHasConversationData must consult per-instance Claude config dir (GetClaudeConfigDirForInstance) so conductors/groups with config_dir overrides detect their own JSONL history on restart. Pre-fix, the global GetClaudeConfigDir() was used, causing restart to mis-route to --session-id (Claude rejects as already-in-use) and the tmux pane to die.
+  source: user-report-2026-04-17-conductor-innotrade
+  manual: false
+  run:
+    command: go test ./internal/session/ -run TestSessionHasConversationData_RespectsPerInstanceConfigDir -count=1 -v
+    expected: pass
+- id: fix-restart-custom-config-dir-resume-flag
+  added: '2026-04-17'
+  task: fix-restart-custom-config-dir
+  file: internal/session/conductorconfig_test.go
+  test_name: TestBuildClaudeResumeCommand_UsesResumeWhenPerInstanceHistoryExists
+  purpose: "End-to-end live-boundary pin \u2014 when JSONL exists only under the per-instance config dir, buildClaudeResumeCommand (output becomes tmux pane_start_command verbatim) emits --resume <uuid>, NOT --session-id. Guards against the v1.7.6 regression where restart forked a fresh conversation because sessionHasConversationData ignored conductor/group config_dir overrides."
+  source: user-report-2026-04-17-conductor-innotrade
+  manual: false
+  run:
+    command: go test ./internal/session/ -run TestBuildClaudeResumeCommand_UsesResumeWhenPerInstanceHistoryExists -count=1 -v
+    expected: pass
+- id: v178-reviver-errored-alive-respawns
+  added: '2026-04-17'
+  task: v178-ssh-reviver
+  file: internal/session/reviver_test.go
+  test_name: TestReviver_ErroredSessionWithAliveServer_Respawns
+  purpose: "Reviver core contract \u2014 an errored instance with a living tmux server triggers ReviveAction exactly once and marks the outcome as Revived. This is the seamless-SSH-reconnect fix; a regression here brings back the \"27 sessions stuck on error\" pain."
+  source: REPORT-D-auto-revive.md
+  manual: false
+  run:
+    command: go test ./internal/session/ -run TestReviver_ErroredSessionWithAliveServer_Respawns -race -count=1 -v
+    expected: pass
+- id: v178-reviver-dead-server-not-revived
+  added: '2026-04-17'
+  task: v178-ssh-reviver
+  file: internal/session/reviver_test.go
+  test_name: TestReviver_DeadServer_NotRevived
+  purpose: "Negative control \u2014 when the tmux server is actually gone (OOM, reboot, explicit kill), reviver must NOT auto-respawn. Prevents silent resurrection of sessions the user intentionally killed."
+  source: REPORT-D-auto-revive.md
+  manual: false
+  run:
+    command: go test ./internal/session/ -run TestReviver_DeadServer_NotRevived -race -count=1 -v
+    expected: pass
+- id: v178-reviver-tombstone-not-revived
+  added: '2026-04-17'
+  task: v178-ssh-reviver
+  file: internal/session/reviver_test.go
+  test_name: TestReviver_DeletedInstance_NotRevived
+  purpose: "Tombstone semantics \u2014 deleted instances (absent from storage) produce zero outcomes and zero ReviveAction calls. Guards the \"I removed it, why is it back?\" UX bug."
+  source: REPORT-D-auto-revive.md
+  manual: false
+  run:
+    command: go test ./internal/session/ -run TestReviver_DeletedInstance_NotRevived -race -count=1 -v
+    expected: pass
+- id: v178-reviver-stagger
+  added: '2026-04-17'
+  task: v178-ssh-reviver
+  file: internal/session/reviver_test.go
+  test_name: TestReviver_Stagger500ms_AcrossManyInstances
+  purpose: "Stagger discipline \u2014 revive calls are serialized with the configured stagger between actual revives (alive/dead entries don't consume slots). Protects Anthropic API from cold-start thundering herd when 40+ sessions errored simultaneously."
+  source: REPORT-D-auto-revive.md
+  manual: false
+  run:
+    command: go test ./internal/session/ -run TestReviver_Stagger500ms_AcrossManyInstances -race -count=1 -v
+    expected: pass
+- id: v178-revive-cli-dispatch
+  added: '2026-04-17'
+  task: v178-ssh-reviver
+  file: cmd/agent-deck/revive_cmd_test.go
+  test_name: TestRevive_CLI_AllFlag_TriggersReviver
+  purpose: "CLI dispatch wiring \u2014 `agent-deck session revive --all` correctly classifies a mixed fixture (errored/alive/dead) and emits the stable summary string \"revived=N errored=N alive=N dead=N\". Guards the one-shot recovery path used on conductor restart."
+  source: REPORT-D-auto-revive.md
+  manual: false
+  run:
+    command: go test ./cmd/agent-deck/ -run TestRevive_CLI_AllFlag_TriggersReviver -race -count=1 -v
+    expected: pass
+- id: issue-610-cli-parity-spinner
+  added: '2026-04-17'
+  task: fix-issue-610
+  file: internal/session/instance_cli_parity_test.go
+  test_name: TestUpdateStatus_CLIParity_SpinnerTitle_StaleHook
+  purpose: "CLI cold path with a 3-minute-old hook file and a braille-spinner pane title must report StatusRunning. Regression guard for [#610] \u2014 without RefreshInstancesForCLIStatus the title fast-path cache is never populated so the CLI fell back to idle/waiting while TUI/web said running."
+  source: .planning/fix-issue-610/PLAN.md
+  manual: false
+  run:
+    command: go test ./internal/session/ -run TestUpdateStatus_CLIParity_SpinnerTitle_StaleHook -race -count=1 -v
+    expected: pass
+- id: issue-610-cli-vs-tui-parity
+  added: '2026-04-17'
+  task: fix-issue-610
+  file: internal/session/instance_cli_parity_test.go
+  test_name: TestUpdateStatus_CLIvsTUIParity_SameTmuxState
+  purpose: "Direct parity assertion \u2014 CLI path (RefreshInstancesForCLIStatus + UpdateStatus) and TUI path (RefreshPaneInfoCache + UpdateHookStatus + UpdateStatus) must produce identical Status for the same underlying tmux session. Script automation via list --json sees what the TUI shows."
+  source: .planning/fix-issue-610/PLAN.md
+  manual: false
+  run:
+    command: go test ./internal/session/ -run TestUpdateStatus_CLIvsTUIParity_SameTmuxState -race -count=1 -v
+    expected: pass
+- id: issue-616-send-no-wait-late-composer
+  added: '2026-04-17'
+  task: fix-issue-616
+  file: cmd/agent-deck/session_send_test.go
+  test_name: TestSendNoWait_ReEntersWhenComposerRendersLate
+  purpose: "Regression guard for [#616] \u2014 sendNoWait must keep detecting the unsent composer prompt and re-firing SendEnter even when the Claude composer renders late (after 5 iterations of status=active/pane=\"\"). Also asserts that only one SendKeysAndEnter fires (preserves the [#479] no-double-send guarantee)."
+  source: .planning/fix-issue-616/PLAN.md
+  manual: false
+  run:
+    command: go test ./cmd/agent-deck/ -run TestSendNoWait_ReEntersWhenComposerRendersLate -race -count=1 -v
+    expected: pass
+- id: issue-616-no-wait-budget-sizing
+  added: '2026-04-17'
+  task: fix-issue-616
+  file: cmd/agent-deck/session_send_test.go
+  test_name: TestSendWithRetryTarget_NoWait_BudgetSpansRealisticClaudeStartup
+  purpose: "Locks in that noWaitSendOptions() has \u22654s total verification budget so future refactors cannot silently shrink it back to the pre-v1.7.10 1.2s window that caused [#616]. Also pins maxFullResends=-1 (preserves [#479] double-send fix)."
+  source: .planning/fix-issue-616/PLAN.md
+  manual: false
+  run:
+    command: go test ./cmd/agent-deck/ -run TestSendWithRetryTarget_NoWait_BudgetSpansRealisticClaudeStartup -race -count=1 -v
+    expected: pass
+- id: issue-616-preflight-barrier-correctness
+  added: '2026-04-17'
+  task: fix-issue-616
+  file: cmd/agent-deck/session_send_test.go
+  test_name: TestAwaitComposerReadyBestEffort_ReturnsTrueWhenComposerAppears
+  purpose: "Preflight barrier must detect Claude composer `\u276F` appearing within the cap window. Without this, --no-wait sends before Claude's TUI mounts and the keystrokes are discarded by pre-mount handlers (#616 root cause layer 1)."
+  source: .planning/fix-issue-616/PLAN.md
+  manual: false
+  run:
+    command: go test ./cmd/agent-deck/ -run TestAwaitComposerReadyBestEffort_ReturnsTrueWhenComposerAppears -race -count=1 -v
+    expected: pass
+- id: issue-616-preflight-barrier-cap-respected
+  added: '2026-04-17'
+  task: fix-issue-616
+  file: cmd/agent-deck/session_send_test.go
+  test_name: TestAwaitComposerReadyBestEffort_CappedAtMaxWait
+  purpose: Preflight barrier must NOT block --no-wait indefinitely on broken sessions where the composer never renders. Returns at maxWait with false. Protects --no-wait spirit (fast, bounded).
+  source: .planning/fix-issue-616/PLAN.md
+  manual: false
+  run:
+    command: go test ./cmd/agent-deck/ -run TestAwaitComposerReadyBestEffort_CappedAtMaxWait -race -count=1 -v
+    expected: pass
+- id: issue-616-live-boundary-fresh-session
+  added: '2026-04-17'
+  task: fix-issue-616
+  file: manual-live-test
+  test_name: 10x-fresh-session-no-wait-submits
+  purpose: "Live-boundary regression \u2014 launch 10 fresh Claude sessions, fire `session send --no-wait` immediately, verify message was submitted and Claude processed it. Pre-v1.7.10 baseline: 3-5/10 failures (typed-but-not-submitted). v1.7.10 target -- 10/10 pass. Shown passing in the release verification run 2026-04-17."
+  source: .planning/fix-issue-616/PLAN.md
+  manual: true
+  run:
+    command: "for i in 1..10; do agent-deck add /tmp/t616-$i -t t-$i -c claude; agent-deck session start t-$i; agent-deck session send t-$i 'Say OK_$i' --no-wait; sleep 30; tmux capture-pane -t agentdeck_t-$i* -p | grep -q '\u25CF OK_$i' && echo PASS_$i || echo FAIL_$i; agent-deck remove t-$i; done"
+    expected: 10 PASS lines
+- id: issue-604-rename-session-cursor-at-end
+  added: '2026-04-17'
+  task: fix-issue-604
+  file: internal/ui/group_dialog_test.go
+  test_name: TestGroupDialog_ShowRenameSession_CursorAtEnd_Issue604
+  purpose: "Regression test for [#604] \u2014 opening the rename-session dialog must place the cursor at the end of the pre-filled name. Before v1.7.11 the long-lived textinput cursor bled between invocations, landing at min(prev_pos, new_len)."
+  source: .planning/fix-issue-604/PLAN.md
+  manual: false
+  run:
+    command: go test ./internal/ui/ -run TestGroupDialog_ShowRenameSession_CursorAtEnd_Issue604 -race -count=1 -v
+    expected: pass
+- id: issue-604-rename-group-cursor-at-end
+  added: '2026-04-17'
+  task: fix-issue-604
+  file: internal/ui/group_dialog_test.go
+  test_name: TestGroupDialog_ShowRename_CursorAtEnd_Issue604
+  purpose: Same class of regression as [#604] but for the group-rename entry point. Cursor must land at end of pre-filled group name.
+  source: .planning/fix-issue-604/PLAN.md
+  manual: false
+  run:
+    command: go test ./internal/ui/ -run TestGroupDialog_ShowRename_CursorAtEnd_Issue604 -race -count=1 -v
+    expected: pass
+- id: issue-604-fresh-cursor-after-create-type
+  added: '2026-04-17'
+  task: fix-issue-604
+  file: internal/ui/group_dialog_test.go
+  test_name: TestGroupDialog_ShowRenameSession_FreshCursor_Issue604
+  purpose: "After a Create-type cycle that advances the cursor, opening a rename must reset the cursor to the end of the pre-filled name \u2014 not inherit the typing cursor from Create mode."
+  source: .planning/fix-issue-604/PLAN.md
+  manual: false
+  run:
+    command: go test ./internal/ui/ -run TestGroupDialog_ShowRenameSession_FreshCursor_Issue604 -race -count=1 -v
+    expected: pass
+- id: issue-618-iterm-clearscrollback-constant
+  added: '2026-04-17'
+  task: fix-issue-618
+  file: internal/tmux/pty_test.go
+  test_name: TestITermClearScrollback_ConstantContents
+  purpose: Guard the iTerm2-specific OSC 1337 ClearScrollback constant. If the constant drifts (typo, wrong terminator, accidental deletion), iTerm2 3.6.x users regress to cross-session scrollback bleedover (#618 = regression of [#419]).
+  source: .planning/fix-issue-618/PLAN.md
+  manual: false
+  run:
+    command: go test ./internal/tmux/ -run TestITermClearScrollback_ConstantContents -race -count=1 -v
+    expected: pass
+- id: issue-618-emit-scrollback-clear-both-escapes
+  added: '2026-04-17'
+  task: fix-issue-618
+  file: internal/tmux/pty_test.go
+  test_name: TestEmitScrollbackClear_IncludesBothEscapes
+  purpose: "Parallel-paths guard. Both Attach() entry and cleanupAttach() on detach route through emitScrollbackClear(); this test asserts the helper emits BOTH the generic CSI 3 J escape AND the iTerm2-specific OSC 1337 ClearScrollback escape in the correct order (CSI first, OSC second). Prevents silent drift between the two boundaries \u2014 the exact regression pattern that bit [#419]."
+  source: .planning/fix-issue-618/PLAN.md
+  manual: false
+  run:
+    command: go test ./internal/tmux/ -run TestEmitScrollbackClear_IncludesBothEscapes -race -count=1 -v
+    expected: pass
+- id: issue-618-cleanup-attach-emits-iterm-osc1337
+  added: '2026-04-17'
+  task: fix-issue-618
+  file: internal/tmux/pty_test.go
+  test_name: TestCleanupAttach_EmitsITermClearScrollback
+  purpose: "Live-boundary regression. Detach path (Ctrl+Q) must emit OSC 1337 ClearScrollback on stdout so iTerm2 3.6.x actually clears its scrollback (#618). TTY-gated \u2014 skips on CI without a terminal."
+  source: .planning/fix-issue-618/PLAN.md
+  manual: false
+  run:
+    command: go test ./internal/tmux/ -run TestCleanupAttach_EmitsITermClearScrollback -race -count=1 -v
+    expected: pass
+- id: issue-607-clear-on-mouse-wheel-down
+  added: '2026-04-17'
+  task: fix-issue-607
+  file: internal/ui/home_repaint_test.go
+  test_name: TestFullRepaint_ClearsOnMouseWheelDown_Issue607
+  purpose: full_repaint=true must emit tea.ClearScreen when the user scrolls wheel-down so drift does not accumulate between tick-based clears.
+  source: .planning/fix-issue-607/PLAN.md
+  manual: false
+  run:
+    command: go test ./internal/ui/ -run TestFullRepaint_ClearsOnMouseWheelDown_Issue607 -count=1 -v
+    expected: pass
+- id: issue-607-clear-on-mouse-wheel-up
+  added: '2026-04-17'
+  task: fix-issue-607
+  file: internal/ui/home_repaint_test.go
+  test_name: TestFullRepaint_ClearsOnMouseWheelUp_Issue607
+  purpose: full_repaint=true must emit tea.ClearScreen on wheel-up scroll.
+  source: .planning/fix-issue-607/PLAN.md
+  manual: false
+  run:
+    command: go test ./internal/ui/ -run TestFullRepaint_ClearsOnMouseWheelUp_Issue607 -count=1 -v
+    expected: pass
+- id: issue-607-clear-on-key-navigation
+  added: '2026-04-17'
+  task: fix-issue-607
+  file: internal/ui/home_repaint_test.go
+  test_name: TestFullRepaint_ClearsOnKeyNavigation_Issue607
+  purpose: full_repaint=true must emit tea.ClearScreen on key-driven navigation (j).
+  source: .planning/fix-issue-607/PLAN.md
+  manual: false
+  run:
+    command: go test ./internal/ui/ -run TestFullRepaint_ClearsOnKeyNavigation_Issue607 -count=1 -v
+    expected: pass
+- id: issue-607-clear-on-any-key
+  added: '2026-04-17'
+  task: fix-issue-607
+  file: internal/ui/home_repaint_test.go
+  test_name: TestFullRepaint_NonNavKeyStillClears_Issue607
+  purpose: "Single-rule contract \u2014 under full_repaint ANY KeyMsg clears, not just j/k. Catches regressions that narrow the rule to specific keys."
+  source: .planning/fix-issue-607/PLAN.md
+  manual: false
+  run:
+    command: go test ./internal/ui/ -run TestFullRepaint_NonNavKeyStillClears_Issue607 -count=1 -v
+    expected: pass
+- id: issue-607-default-no-clear-on-scroll
+  added: '2026-04-17'
+  task: fix-issue-607
+  file: internal/ui/home_repaint_test.go
+  test_name: TestFullRepaint_Disabled_NoClearOnScroll_Issue607
+  purpose: "Regression guard for default users \u2014 full_repaint=false must NOT emit ClearScreen on scroll (would flicker every default install)."
+  source: .planning/fix-issue-607/PLAN.md
+  manual: false
+  run:
+    command: go test ./internal/ui/ -run TestFullRepaint_Disabled_NoClearOnScroll_Issue607 -count=1 -v
+    expected: pass
+- id: issue-607-default-no-clear-on-key
+  added: '2026-04-17'
+  task: fix-issue-607
+  file: internal/ui/home_repaint_test.go
+  test_name: TestFullRepaint_Disabled_NoClearOnKey_Issue607
+  purpose: "Regression guard for default users \u2014 full_repaint=false must NOT emit ClearScreen on KeyMsg."
+  source: .planning/fix-issue-607/PLAN.md
+  manual: false
+  run:
+    command: go test ./internal/ui/ -run TestFullRepaint_Disabled_NoClearOnKey_Issue607 -count=1 -v
+    expected: pass
+- id: issue-607-non-wheel-mouse-no-clear
+  added: '2026-04-17'
+  task: fix-issue-607
+  file: internal/ui/home_repaint_test.go
+  test_name: TestFullRepaint_NonWheelMouseDoesNotClear_Issue607
+  purpose: "Non-wheel mouse events (clicks, drags) under full_repaint must NOT clear \u2014 would cause click-flicker. Pins the wheel-only scope of the fix."
+  source: .planning/fix-issue-607/PLAN.md
+  manual: false
+  run:
+    command: go test ./internal/ui/ -run TestFullRepaint_NonWheelMouseDoesNotClear_Issue607 -count=1 -v
+    expected: pass
+- id: issue-598-fresh-claude-id-over-stale
+  added: '2026-04-17'
+  task: fix-issue-598
+  file: internal/ui/send_output_content_test.go
+  test_name: TestGetSessionContentWithLive_PrefersFreshIDOverStoredStaleID
+  purpose: Cross-session `x` send-output must use the live CLAUDE_SESSION_ID from tmux env, not a stale stored ClaudeSessionID. Reproduces the v1.7.10 bug where resumed sessions leaked prior-conversation JSONL content into the target session.
+  source: .planning/fix-issue-598/PLAN.md
+  manual: false
+  run:
+    command: go test ./internal/ui/ -run TestGetSessionContentWithLive_PrefersFreshIDOverStoredStaleID -race -count=1 -v
+    expected: pass
+- id: issue-598-keeps-stored-when-live-empty
+  added: '2026-04-17'
+  task: fix-issue-598
+  file: internal/ui/send_output_content_test.go
+  test_name: TestGetSessionContentWithLive_KeepsStoredIDWhenLiveEmpty
+  purpose: "Back-compat \u2014 when tmux env has no live CLAUDE_SESSION_ID, getSessionContent falls through to the stored ID. Prevents the refresh path from clobbering valid state."
+  source: .planning/fix-issue-598/PLAN.md
+  manual: false
+  run:
+    command: go test ./internal/ui/ -run TestGetSessionContentWithLive_KeepsStoredIDWhenLiveEmpty -race -count=1 -v
+    expected: pass
+- id: issue-598-refresh-nil-tmux-safe
+  added: '2026-04-17'
+  task: fix-issue-598
+  file: internal/session/instance_test.go
+  test_name: TestInstance_RefreshLiveSessionIDs_NoOpWhenTmuxSessionNil
+  purpose: RefreshLiveSessionIDs must be a safe no-op when tmuxSession is nil so callers can invoke it unconditionally. Pins the safety contract.
+  source: .planning/fix-issue-598/PLAN.md
+  manual: false
+  run:
+    command: go test ./internal/session/ -run TestInstance_RefreshLiveSessionIDs_NoOpWhenTmuxSessionNil -race -count=1 -v
+    expected: pass
+- id: issue-618-iterm-clearscrollback-constant
+  added: '2026-04-17'
+  task: fix-issue-618
+  file: internal/tmux/pty_test.go
+  test_name: TestITermClearScrollback_ConstantContents
+  purpose: Guard the iTerm2-specific OSC 1337 ClearScrollback constant. If the constant drifts (typo, wrong terminator, accidental deletion), iTerm2 3.6.x users regress to cross-session scrollback bleedover (#618 = regression of [#419]).
+  source: .planning/fix-issue-618/PLAN.md
+  manual: false
+  run:
+    command: go test ./internal/tmux/ -run TestITermClearScrollback_ConstantContents -race -count=1 -v
+    expected: pass
+- id: issue-618-emit-scrollback-clear-both-escapes
+  added: '2026-04-17'
+  task: fix-issue-618
+  file: internal/tmux/pty_test.go
+  test_name: TestEmitScrollbackClear_IncludesBothEscapes
+  purpose: Parallel-paths guard. Both Attach() entry and cleanupAttach() on detach route through emitScrollbackClear(); this test asserts the helper emits BOTH the generic CSI 3 J escape AND the iTerm2-specific OSC 1337 ClearScrollback escape in the correct order (CSI first, OSC second). Prevents silent drift between the two boundaries.
+  source: .planning/fix-issue-618/PLAN.md
+  manual: false
+  run:
+    command: go test ./internal/tmux/ -run TestEmitScrollbackClear_IncludesBothEscapes -race -count=1 -v
+    expected: pass
+- id: issue-618-cleanup-attach-emits-iterm-osc1337
+  added: '2026-04-17'
+  task: fix-issue-618
+  file: internal/tmux/pty_test.go
+  test_name: TestCleanupAttach_EmitsITermClearScrollback
+  purpose: "Live-boundary regression. Detach path (Ctrl+Q) must emit OSC 1337 ClearScrollback on stdout so iTerm2 3.6.x actually clears its scrollback (#618). TTY-gated \u2014 skips on CI without a terminal."
+  source: .planning/fix-issue-618/PLAN.md
+  manual: false
+  run:
+    command: go test ./internal/tmux/ -run TestCleanupAttach_EmitsITermClearScrollback -race -count=1 -v
+    expected: pass
+- id: issue-601-prepare-command-applies-wrapper-before-bash-wrap
+  added: '2026-04-17'
+  task: fix-issue-601
+  file: internal/session/instance_test.go
+  test_name: TestPrepareCommand_AppliesWrapperBeforeBashWrap
+  purpose: prepareCommand must apply the user wrapper BEFORE the bash -c wrap so trailing args in a "{command} --flag1 --flag2" template land INSIDE the bash -c single-quoted payload. The reversed order dropped flags by turning them into bash positional parameters ($0, $1, ...).
+  source: .planning/fix-issue-601/PLAN.md
+  manual: false
+  run:
+    command: go test ./internal/session/ -run TestPrepareCommand_AppliesWrapperBeforeBashWrap -race -count=1 -v
+    expected: pass
+- id: issue-601-prepare-command-reporter-repro
+  added: '2026-04-17'
+  task: fix-issue-601
+  file: internal/session/instance_test.go
+  test_name: TestPrepareCommand_Issue601_ReporterRepro
+  purpose: "Mirrors the reporter's exact scenario \u2014 claude-compatible wrapper + --session-id + --dangerously-skip-permissions. Asserts flags survive the wrap/substitute chain to the tmux.Start boundary."
+  source: .planning/fix-issue-601/PLAN.md
+  manual: false
+  run:
+    command: go test ./internal/session/ -run TestPrepareCommand_Issue601_ReporterRepro -race -count=1 -v
+    expected: pass
+- id: issue-601-prepare-command-quoting-safe
+  added: '2026-04-17'
+  task: fix-issue-601
+  file: internal/session/instance_test.go
+  test_name: TestPrepareCommand_WrapperWithSingleQuoteInCmd_QuotesSafely
+  purpose: After the reorder, a single quote inside the fully-substituted wrapped string must still be escaped via the POSIX close/dq/open (close-quote, double-quoted-squote, reopen-quote) pattern used by prepareCommand.
+  source: .planning/fix-issue-601/PLAN.md
+  manual: false
+  run:
+    command: go test ./internal/session/ -run TestPrepareCommand_WrapperWithSingleQuoteInCmd_QuotesSafely -race -count=1 -v
+    expected: pass
+- id: issue-601-prepare-command-no-wrapper-unchanged
+  added: '2026-04-17'
+  task: fix-issue-601
+  file: internal/session/instance_test.go
+  test_name: TestPrepareCommand_NoWrapper_Unchanged
+  purpose: "Guard against the reorder breaking the no-wrapper path \u2014 when no wrapper is configured, prepareCommand must return cmd unchanged."
+  source: .planning/fix-issue-601/PLAN.md
+  manual: false
+  run:
+    command: go test ./internal/session/ -run TestPrepareCommand_NoWrapper_Unchanged -race -count=1 -v
+    expected: pass
+- id: issue-601-cli-folds-extras-into-wrapper
+  added: '2026-04-17'
+  task: fix-issue-601
+  file: cmd/agent-deck/launch_cmd_test.go
+  test_name: TestLaunch_ToolWithFlags_FoldsExtrasIntoWrapper
+  purpose: "CLI-parse boundary regression \u2014 resolveSessionCommand must fold EVERY extra arg of a recognized tool into the wrapper template as \"{command} <extras>\". Paired with the session-layer TestPrepareCommand_Issue601_ReporterRepro, this pins both ends of the [#601] data flow."
+  source: .planning/fix-issue-601/PLAN.md
+  manual: false
+  run:
+    command: go test ./cmd/agent-deck/ -run TestLaunch_ToolWithFlags_FoldsExtrasIntoWrapper -race -count=1 -v
+    expected: pass
+- id: issue-601-cli-session-id-preserved
+  added: '2026-04-17'
+  task: fix-issue-601
+  file: cmd/agent-deck/launch_cmd_test.go
+  test_name: TestLaunch_ToolWithSessionIdFlag_IsPreserved
+  purpose: "Narrower [#601] symptom \u2014 --session-id must survive CLI parse for claude-compatible wrappers, unblocking deterministic session IDs and JSONL file resolution."
+  source: .planning/fix-issue-601/PLAN.md
+  manual: false
+  run:
+    command: go test ./cmd/agent-deck/ -run TestLaunch_ToolWithSessionIdFlag_IsPreserved -race -count=1 -v
+    expected: pass
+- id: v1716-manifest-yaml-valid
+  added: '2026-04-17'
+  task: v1716-cleanup
+  file: internal/releasetests/manifest_test.go
+  test_name: TestManifestIsValidYAML
+  purpose: YAML validity gate. .claude/release-tests.yaml must be loadable by gopkg.in/yaml.v3 (strict YAML 1.2). Guards against inline issue-NNN comment-truncation foot-gun (verify-today-sprint REPORT F2, introduced by 4b49e6d).
+  source: .planning/v1716-cleanup/PLAN.md
+  manual: false
+  run:
+    command: go test ./internal/releasetests/ -run TestManifestIsValidYAML -count=1 -v
+    expected: pass
+- id: v1716-manifest-source-drift
+  added: '2026-04-17'
+  task: v1716-cleanup
+  file: internal/releasetests/manifest_test.go
+  test_name: TestManifestReferencesExistInSource
+  purpose: Manifest/source drift guard. Every non-manual release-tests.yaml entry's (file, test_name) pair must resolve in source. Catches rebase-silent-deletion of peer regression tests (verify-today-sprint REPORT F1; PR 640 dropped two issue-598 tests).
+  source: .planning/v1716-cleanup/PLAN.md
+  manual: false
+  run:
+    command: go test ./internal/releasetests/ -run TestManifestReferencesExistInSource -count=1 -v
+    expected: pass
+- id: v1716-tmux-bootstrap-session
+  added: '2026-04-17'
+  task: v1716-cleanup
+  file: internal/session/testmain_test.go
+  test_name: TestTmuxBootstrap_ServerIsRunning
+  purpose: Pins that session-package TestMain bootstraps an idle tmux session in the isolated socket, so downstream regression tests (issue-610 CLI parity, issue-618 OSC cleanup) stop silently no-opping on fresh TMUX_TMPDIR (verify-today-sprint REPORT F3).
+  source: .planning/v1716-cleanup/PLAN.md
+  manual: false
+  run:
+    command: go test ./internal/session/ -run TestTmuxBootstrap_ServerIsRunning -race -count=1 -v
+    expected: pass
+- id: v1716-tmux-bootstrap-tmux-pkg
+  added: '2026-04-17'
+  task: v1716-cleanup
+  file: internal/tmux/testmain_test.go
+  test_name: TestTmuxBootstrap_ServerIsRunning
+  purpose: Parallel-paths guard for the tmux package variant of the bootstrap. Pins issue-618 cleanup-attach OSC test and siblings actively run on isolated sockets.
+  source: .planning/v1716-cleanup/PLAN.md
+  manual: false
+  run:
+    command: go test ./internal/tmux/ -run TestTmuxBootstrap_ServerIsRunning -race -count=1 -v
+    expected: pass
+- id: issue-617-dollar-home-expand
+  added: '2026-04-17'
+  task: fix-617
+  file: internal/session/skills_catalog_test.go
+  test_name: TestExpandSkillPath_DollarHome
+  purpose: Regression guard for issue-617 cross-machine portability. Pins that expandSkillPath expands $HOME so a sources.toml synced macOS-to-Linux (or across Linux hosts with different usernames) does not silently return "No skills found".
+  source: .planning/fix-617/PLAN.md
+  manual: false
+  run:
+    command: go test ./internal/session/ -run TestExpandSkillPath_DollarHome -count=1 -v
+    expected: pass
+- id: issue-617-braced-home-expand
+  added: '2026-04-17'
+  task: fix-617
+  file: internal/session/skills_catalog_test.go
+  test_name: TestExpandSkillPath_BracedDollarHome
+  purpose: Regression guard that ${HOME} (braced form) expands alongside $HOME. Protects against a partial fix that only handles one form.
+  source: .planning/fix-617/PLAN.md
+  manual: false
+  run:
+    command: go test ./internal/session/ -run TestExpandSkillPath_BracedDollarHome -count=1 -v
+    expected: pass
+- id: issue-617-unknown-envvar-preserved
+  added: '2026-04-17'
+  task: fix-617
+  file: internal/session/skills_catalog_test.go
+  test_name: TestExpandSkillPath_UnknownEnvVarPreserved
+  purpose: "Scope guard \u2014 only $HOME is expanded. Prevents a future \"simplify to os.ExpandEnv\" regression from silently inheriting arbitrary process environment ($USER, $PATH, secrets) into config paths."
+  source: .planning/fix-617/PLAN.md
+  manual: false
+  run:
+    command: go test ./internal/session/ -run TestExpandSkillPath_UnknownEnvVarPreserved -count=1 -v
+    expected: pass
+- id: issue-617-discover-via-dollar-home
+  added: '2026-04-17'
+  task: fix-617
+  file: internal/session/skills_catalog_test.go
+  test_name: TestLoadSkillSources_DiscoversSkillsViaDollarHome
+  purpose: "End-to-end guard covering the full load\u2192discovery hop \u2014 writes a sources.toml with $HOME, populates a pool skill, and asserts ListAvailableSkills finds it. Covers the exact repro in issue-617."
+  source: .planning/fix-617/PLAN.md
+  manual: false
+  run:
+    command: go test ./internal/session/ -run TestLoadSkillSources_DiscoversSkillsViaDollarHome -count=1 -v
+    expected: pass
+- id: fix-560-outer-tmux-guard
+  added: '2026-04-17'
+  task: fix-560-tmux-detach-guidance
+  file: cmd/agent-deck/main_test.go
+  test_name: TestOuterTmuxGuard
+  purpose: "Guards issue-560 regressions \u2014 warns-and-exits when TUI is launched inside a non-agentdeck tmux session without AGENT_DECK_ALLOW_OUTER_TMUX=1. Covers three subcases (no-optin blocks, optin passes, no-tmux passes) + defensive narrow-match on opt-in value."
+  source: gh#560
+  manual: false
+  run:
+    command: go test ./cmd/agent-deck/ -run TestOuterTmuxGuard -count=1 -v
+    expected: pass
+- id: fix-574-mouse-wheel-scrolls-preview
+  added: '2026-04-17'
+  task: fix-574
+  file: internal/ui/preview_scroll_test.go
+  test_name: TestPreviewScroll_MouseWheel_OverPreviewPane_IncrementsOffset
+  purpose: Wheel events over the preview region in dual layout scroll preview content (previewScrollOffset++) and DO NOT move the session list cursor (#574).
+  source: gh-issue-574
+  manual: false
+  run:
+    command: go test ./internal/ui/ -run TestPreviewScroll_MouseWheel_OverPreviewPane_IncrementsOffset -race -count=1 -v
+    expected: pass
+- id: fix-574-wheel-over-list-resets-preview-offset
+  added: '2026-04-17'
+  task: fix-574
+  file: internal/ui/preview_scroll_test.go
+  test_name: TestPreviewScroll_MouseWheel_OverList_MovesCursor_ResetsOffset
+  purpose: Wheel events over the list region move the cursor AND reset any stale preview-scroll offset, so the new session opens at its tail (#574).
+  source: gh-issue-574
+  manual: false
+  run:
+    command: go test ./internal/ui/ -run TestPreviewScroll_MouseWheel_OverList_MovesCursor_ResetsOffset -race -count=1 -v
+    expected: pass
+- id: fix-574-render-applies-offset
+  added: '2026-04-17'
+  task: fix-574
+  file: internal/ui/preview_scroll_test.go
+  test_name: TestPreviewScroll_Render_AppliesOffset
+  purpose: renderPreviewPane slides the visible window up by previewScrollOffset lines so older output becomes visible (#574).
+  source: gh-issue-574
+  manual: false
+  run:
+    command: go test ./internal/ui/ -run TestPreviewScroll_Render_AppliesOffset -race -count=1 -v
+    expected: pass
+- id: fix-574-cursor-move-resets-offset
+  added: '2026-04-17'
+  task: fix-574
+  file: internal/ui/preview_scroll_test.go
+  test_name: TestPreviewScroll_CursorMove_ResetsOffset
+  purpose: Keyboard cursor movement (j/k/arrows/ctrl-u/d/b/f) resets the preview scroll offset so a newly-selected session opens at its tail (#574).
+  source: gh-issue-574
+  manual: false
+  run:
+    command: go test ./internal/ui/ -run TestPreviewScroll_CursorMove_ResetsOffset -race -count=1 -v
+    expected: pass
+- id: fix-574-clamps-offset-to-bounds
+  added: '2026-04-17'
+  task: fix-574
+  file: internal/ui/preview_scroll_test.go
+  test_name: TestPreviewScroll_ClampsToContentRange
+  purpose: Absurd previewScrollOffset values (huge, negative) are clamped to the valid range in renderPreviewPane so the state can never go out of bounds (#574).
+  source: gh-issue-574
+  manual: false
+  run:
+    command: go test ./internal/ui/ -run TestPreviewScroll_ClampsToContentRange -race -count=1 -v
+    expected: pass
+- id: issue-579-strips-erase-in-line
+  added: '2026-04-17'
+  task: fix-issue-579
+  file: internal/ui/preview_clip_test.go
+  test_name: TestRenderPreviewPane_StripsEraseInLine_Issue579
+  purpose: Preview pane must not pass CSI K (Erase in Line) through to the outer terminal. Captured content like Neovim mini.statusline ends a row with an active bg SGR plus CSI K; without the sanitizer, the outer terminal paints the rest of that physical row with the active bg, bleeding past the preview boundary into adjacent panels. See issue 579.
+  source: .planning/fix-issue-579/PLAN.md
+  manual: false
+  run:
+    command: go test ./internal/ui/ -run TestRenderPreviewPane_StripsEraseInLine_Issue579 -count=1 -v
+    expected: pass
+- id: issue-579-strips-erase-in-display
+  added: '2026-04-17'
+  task: fix-issue-579
+  file: internal/ui/preview_clip_test.go
+  test_name: TestRenderPreviewPane_StripsEraseInDisplay_Issue579
+  purpose: 'Parallel-paths guard: the same sanitizer must also strip CSI J (Erase in Display). ED has the same bleed mechanism as EL but targets the rest of the screen, not just the line.'
+  source: .planning/fix-issue-579/PLAN.md
+  manual: false
+  run:
+    command: go test ./internal/ui/ -run TestRenderPreviewPane_StripsEraseInDisplay_Issue579 -count=1 -v
+    expected: pass
+- id: issue-579-every-line-fits-width
+  added: '2026-04-17'
+  task: fix-issue-579
+  file: internal/ui/preview_clip_test.go
+  test_name: TestRenderPreviewPane_EveryLineFitsWidth_Issue579
+  purpose: Core clip guarantee. Every rendered preview line must have visible width less than or equal to the pane width. Without this the issue 579 regression is back.
+  source: .planning/fix-issue-579/PLAN.md
+  manual: false
+  run:
+    command: go test ./internal/ui/ -run TestRenderPreviewPane_EveryLineFitsWidth_Issue579 -count=1 -v
+    expected: pass
+- id: issue-579-nvim-statusline-fixture
+  added: '2026-04-17'
+  task: fix-issue-579
+  file: internal/ui/preview_clip_test.go
+  test_name: TestRenderPreviewPane_NvimStatusline_NoBleedEscapes_Issue579
+  purpose: End-to-end reporter-pattern fixture. A Neovim mini.statusline capture (label plus filename plus trailing bg padding plus CSI K) must render with no bleed escapes AND every line fitting the pane width. Combined assertion so the fix stays anchored to the reporter scenario.
+  source: .planning/fix-issue-579/PLAN.md
+  manual: false
+  run:
+    command: go test ./internal/ui/ -run TestRenderPreviewPane_NvimStatusline_NoBleedEscapes_Issue579 -count=1 -v
+    expected: pass
+- id: v1721-launch-as-service-argv-shape
+  added: '2026-04-18'
+  task: v1721-scope-to-service
+  file: internal/tmux/tmux_launch_as_test.go
+  test_name: TestStartCommandSpec_LaunchAs_Service_UsesServiceForm
+  purpose: 'Pins the exact systemd-run argv for LaunchAs=service — Type=forking, Restart=on-failure, KillMode=control-group, NO --scope, NO --collect. Missing any of these silently defeats the auto-restart guarantee.'
+  source: .planning/v1721-scope-to-service/PLAN.md
+  manual: false
+  run:
+    command: go test ./internal/tmux/ -run TestStartCommandSpec_LaunchAs_Service_UsesServiceForm -count=1 -v
+    expected: pass
+- id: v1721-launch-as-scope-backcompat
+  added: '2026-04-18'
+  task: v1721-scope-to-service
+  file: internal/tmux/tmux_launch_as_test.go
+  test_name: TestStartCommandSpec_LaunchAs_Scope_UsesScopeForm
+  purpose: 'Backward-compatibility lifeline. Users who set launch_as="scope" must get the exact PR #467 argv shape. Guards against a future service-mode refactor silently mutating scope-mode semantics.'
+  source: .planning/v1721-scope-to-service/PLAN.md
+  manual: false
+  run:
+    command: go test ./internal/tmux/ -run TestStartCommandSpec_LaunchAs_Scope_UsesScopeForm -count=1 -v
+    expected: pass
+- id: v1721-launch-as-empty-legacy-respect
+  added: '2026-04-18'
+  task: v1721-scope-to-service
+  file: internal/tmux/tmux_launch_as_test.go
+  test_name: TestStartCommandSpec_LaunchAs_Empty_RespectsLegacyLaunchInUserScope
+  purpose: 'Zero-behavior-change contract for v1.7.20 users. Unset launch_as must defer fully to LaunchInUserScope — NO accidental switch to service mode, NO accidental switch to direct.'
+  source: .planning/v1721-scope-to-service/PLAN.md
+  manual: false
+  run:
+    command: go test ./internal/tmux/ -run TestStartCommandSpec_LaunchAs_Empty_RespectsLegacyLaunchInUserScope -count=1 -v
+    expected: pass
+- id: v1721-launch-as-invalid-fallback
+  added: '2026-04-18'
+  task: v1721-scope-to-service
+  file: internal/tmux/tmux_launch_as_test.go
+  test_name: TestStartCommandSpec_LaunchAs_Invalid_FallsBackToLegacy
+  purpose: 'Typo protection. A misspelled launch_as value must NOT silently opt the user into service mode — must fall through to LaunchInUserScope with a one-line warning log.'
+  source: .planning/v1721-scope-to-service/PLAN.md
+  manual: false
+  run:
+    command: go test ./internal/tmux/ -run TestStartCommandSpec_LaunchAs_Invalid_FallsBackToLegacy -count=1 -v
+    expected: pass
+- id: v1721-fallback-service-to-scope
+  added: '2026-04-18'
+  task: v1721-scope-to-service
+  file: internal/tmux/tmux_service_fallback_test.go
+  test_name: TestStart_Service_WhenServiceFails_FallbackToScope
+  purpose: 'Three-tier fallback chain — when service-mode systemd-run fails (rare; e.g. transient-unit Restart= rejected on very old systemd), fall back to scope-mode before falling to direct tmux. Preserves PR #467 isolation even when service mode is broken.'
+  source: .planning/v1721-scope-to-service/PLAN.md
+  manual: false
+  run:
+    command: go test ./internal/tmux/ -run TestStart_Service_WhenServiceFails_FallbackToScope -count=1 -timeout 60s -v
+    expected: pass
+- id: v1721-fallback-all-three-wraps-error
+  added: '2026-04-18'
+  task: v1721-scope-to-service
+  file: internal/tmux/tmux_service_fallback_test.go
+  test_name: TestStart_Service_AllThreePathsFail_ErrorIncludesAllThree
+  purpose: 'Observability. When all three tiers fail the error must list every diagnostic so operators can grep one log to find which tier broke.'
+  source: .planning/v1721-scope-to-service/PLAN.md
+  manual: false
+  run:
+    command: go test ./internal/tmux/ -run TestStart_Service_AllThreePathsFail_ErrorIncludesAllThree -count=1 -v
+    expected: pass
+- id: v1721-service-restarts-on-sigkill
+  added: '2026-04-18'
+  task: v1721-scope-to-service
+  file: internal/tmux/tmux_service_integration_test.go
+  test_name: TestTmuxService_RestartsOnUnexpectedKill
+  purpose: 'Headline live-boundary empirical guarantee — the whole point of v1.7.21. Spawn tmux via the exact argv startCommandSpec emits, SIGKILL the daemon, observe systemd bring it back via Restart=on-failure within ~10s. Requires systemd-user; skips cleanly elsewhere.'
+  source: .planning/v1721-scope-to-service/PLAN.md
+  manual: false
+  run:
+    command: go test ./internal/tmux/ -run TestTmuxService_RestartsOnUnexpectedKill -count=1 -timeout 60s -v
+    expected: pass
+- id: v1721-service-clean-stop
+  added: '2026-04-18'
+  task: v1721-scope-to-service
+  file: internal/tmux/tmux_service_integration_test.go
+  test_name: TestTmuxService_ExplicitStopDoesNotTriggerRestart
+  purpose: 'Removal semantics. systemctl --user stop must be a CLEAN stop — Restart=on-failure must NOT fire. This guarantees `agent-deck remove` is truly terminal and not papered over by auto-restart.'
+  source: .planning/v1721-scope-to-service/PLAN.md
+  manual: false
+  run:
+    command: go test ./internal/tmux/ -run TestTmuxService_ExplicitStopDoesNotTriggerRestart -count=1 -timeout 60s -v
+    expected: pass
+- id: v1721-tmux-settings-get-launch-as
+  added: '2026-04-18'
+  task: v1721-scope-to-service
+  file: internal/session/userconfig_launch_as_test.go
+  test_name: TestTmuxSettings_GetLaunchAs_UnknownValueReturnsEmpty
+  purpose: 'Config parse guard. An unknown launch_as value in config.toml must return "" from GetLaunchAs so the legacy LaunchInUserScope code path kicks in — never a random spawn path.'
+  source: .planning/v1721-scope-to-service/PLAN.md
+  manual: false
+  run:
+    command: go test ./internal/session/ -run TestTmuxSettings_GetLaunchAs_UnknownValueReturnsEmpty -count=1 -v
+    expected: pass
+- id: v1722-telegram-global-disabled-no-warning
+  added: '2026-04-18'
+  task: v1722-telegram-poller-stability
+  file: internal/session/telegram_validator_test.go
+  test_name: TestTelegramValidator_GlobalDisabled_NoWarning
+  purpose: 'Silent path — when the profile is configured correctly the validator emits zero warnings, keeping logs clean. Locks the no-noise baseline so future guards do not accidentally warn on the supported topology.'
+  source: .planning/fix-v1722-telegram-poller-stability/PLAN.md
+  manual: false
+  run:
+    command: go test ./internal/session/ -run TestTelegramValidator_GlobalDisabled_NoWarning -count=1 -v
+    expected: pass
+- id: v1722-telegram-global-enabled-warn-antipattern
+  added: '2026-04-18'
+  task: v1722-telegram-poller-stability
+  file: internal/session/telegram_validator_test.go
+  test_name: TestTelegramValidator_GlobalEnabled_OrdinarySession_WarnAntiPattern
+  purpose: 'Root-cause A — detect the profile-wide enablement of telegram@claude-plugins-official in settings.json, the anti-pattern that leaks a bun poller to every claude subprocess.'
+  source: .planning/fix-v1722-telegram-poller-stability/PLAN.md
+  manual: false
+  run:
+    command: go test ./internal/session/ -run TestTelegramValidator_GlobalEnabled_OrdinarySession_WarnAntiPattern -count=1 -v
+    expected: pass
+- id: v1722-telegram-double-load
+  added: '2026-04-18'
+  task: v1722-telegram-poller-stability
+  file: internal/session/telegram_validator_test.go
+  test_name: TestTelegramValidator_GlobalEnabled_ConductorSession_WarnDoubleLoad
+  purpose: 'Root-cause B — detect the combined global+channels configuration that makes the plugin load twice in one claude process, producing Telegram 409 Conflict.'
+  source: .planning/fix-v1722-telegram-poller-stability/PLAN.md
+  manual: false
+  run:
+    command: go test ./internal/session/ -run TestTelegramValidator_GlobalEnabled_ConductorSession_WarnDoubleLoad -count=1 -v
+    expected: pass
+- id: v1722-telegram-wrapper-deprecated
+  added: '2026-04-18'
+  task: v1722-telegram-poller-stability
+  file: internal/session/telegram_validator_test.go
+  test_name: TestTelegramValidator_WrapperStateDir_AntiPattern
+  purpose: 'Root-cause C — detect the wrapper-injected TELEGRAM_STATE_DIR anti-pattern and recommend the canonical env_file mechanism. Wrapper fails silently on the fresh-start path due to bash -c argv splitting.'
+  source: .planning/fix-v1722-telegram-poller-stability/PLAN.md
+  manual: false
+  run:
+    command: go test ./internal/session/ -run TestTelegramValidator_WrapperStateDir_AntiPattern -count=1 -v
+    expected: pass
+- id: v1722-telegram-settings-reader
+  added: '2026-04-18'
+  task: v1722-telegram-poller-stability
+  file: cmd/agent-deck/conductor_cmd_telegram_test.go
+  test_name: TestReadTelegramGloballyEnabled_TrueWhenSettingsHasIt
+  purpose: 'CLI helper parses Claude Code settings.json defensively — missing file and missing key both map to false (safe baseline), explicit true surfaces the anti-pattern.'
+  source: .planning/fix-v1722-telegram-poller-stability/PLAN.md
+  manual: false
+  run:
+    command: go test ./cmd/agent-deck/ -run TestReadTelegramGloballyEnabled_ -count=1 -v
+    expected: pass
+- id: v1722-telegram-warn-formatting
+  added: '2026-04-18'
+  task: v1722-telegram-poller-stability
+  file: cmd/agent-deck/conductor_cmd_telegram_test.go
+  test_name: TestConductorSetup_WarnsOnGlobalTelegramEnabled
+  purpose: 'End-to-end CLI surface — the human-facing warning text includes the ⚠ prefix, the GLOBAL_ANTIPATTERN code or label, and the exact settings.json key so users can find and fix the setting.'
+  source: .planning/fix-v1722-telegram-poller-stability/PLAN.md
+  manual: false
+  run:
+    command: go test ./cmd/agent-deck/ -run "TestConductorSetup_WarnsOnGlobalTelegramEnabled|TestConductorSetup_RecommendsEnvFileOverWrapper|TestEmitTelegramWarnings_CleanConfig_Silent" -count=1 -v
+    expected: pass
+- id: v1723-history-loss-rebind-rejects-less-data
+  added: '2026-04-18'
+  task: v1723-history-loss-guard
+  file: internal/session/instance_test.go
+  test_name: TestInstance_UpdateHookStatus_RejectsRebindWhenCurrentHasMoreData
+  purpose: 'Issue #661 manifestation 3 — UserPromptSubmit rebind must refuse to replace a rich current session with a sparser candidate. Size-based rejection with lifecycle action=reject reason=candidate_has_less_conversation_data. Stops conductor history loss across restarts.'
+  source: .planning/fix-issue-661/PLAN.md
+  manual: false
+  run:
+    command: go test ./internal/session/ -run TestInstance_UpdateHookStatus_RejectsRebindWhenCurrentHasMoreData -count=1 -race -v
+    expected: pass
+- id: v1723-history-loss-rebind-empty-candidate
+  added: '2026-04-18'
+  task: v1723-history-loss-guard
+  file: internal/session/instance_test.go
+  test_name: TestInstance_UpdateHookStatus_RejectsRebindWhenCurrentHasDataCandidateEmpty
+  purpose: 'Preserves v1.7.7 reject path on the UserPromptSubmit route when candidate jsonl has zero sessionId records. Keeps the weaker guarantee alongside the stronger v1.7.23 guard so both are permanent.'
+  source: .planning/fix-issue-661/PLAN.md
+  manual: false
+  run:
+    command: go test ./internal/session/ -run TestInstance_UpdateHookStatus_RejectsRebindWhenCurrentHasDataCandidateEmpty -count=1 -race -v
+    expected: pass
+- id: v1723-history-loss-rebind-allows-current-empty
+  added: '2026-04-18'
+  task: v1723-history-loss-guard
+  file: internal/session/instance_test.go
+  test_name: TestInstance_UpdateHookStatus_AllowsRebindWhenCurrentIsEmpty
+  purpose: 'Healthy-path guard — when current jsonl has no sessionId records and candidate has data, the first-prompt rebind must proceed. Prevents the v1.7.23 guard from over-rejecting during normal session bring-up.'
+  source: .planning/fix-issue-661/PLAN.md
+  manual: false
+  run:
+    command: go test ./internal/session/ -run TestInstance_UpdateHookStatus_AllowsRebindWhenCurrentIsEmpty -count=1 -race -v
+    expected: pass
+- id: v1723-history-loss-rebind-allows-cold-start
+  added: '2026-04-18'
+  task: v1723-history-loss-guard
+  file: internal/session/instance_test.go
+  test_name: TestInstance_UpdateHookStatus_AllowsRebindWhenCurrentIsUnset
+  purpose: 'Cold start — with i.ClaudeSessionID == "" the first hook binding must be accepted unconditionally. Guards against the v1.7.23 size comparison blocking the very first bind.'
+  source: .planning/fix-issue-661/PLAN.md
+  manual: false
+  run:
+    command: go test ./internal/session/ -run TestInstance_UpdateHookStatus_AllowsRebindWhenCurrentIsUnset -count=1 -race -v
+    expected: pass
+- id: v1723-history-loss-flap-replay
+  added: '2026-04-18'
+  task: v1723-history-loss-guard
+  file: internal/session/instance_test.go
+  test_name: TestInstance_UpdateHookStatus_RejectsBidirectionalFlap
+  purpose: 'Replay of the travel-conductor 3-restart flap from the real lifecycle.jsonl — rich-id is bound first, then three consecutive fresh UUIDs arrive as UserPromptSubmit candidates. ClaudeSessionID must remain the rich one across all three cycles.'
+  source: .planning/fix-issue-661/PLAN.md
+  manual: false
+  run:
+    command: go test ./internal/session/ -run TestInstance_UpdateHookStatus_RejectsBidirectionalFlap -count=1 -race -v
+    expected: pass
+- id: v1723-history-loss-boundary-resume
+  added: '2026-04-18'
+  task: v1723-history-loss-guard
+  file: internal/session/instance_test.go
+  test_name: TestInstance_BuildClaudeResumeCommand_AfterFlap_ResumesRichID
+  purpose: 'Live-runtime-boundary pin — after the flap, the emitted restart command (buildClaudeResumeCommand) must contain --resume <rich-uuid> and never the overwritten fresh UUID. Proves the user-visible fix at the exact layer that regressed.'
+  source: .planning/fix-issue-661/PLAN.md
+  manual: false
+  run:
+    command: go test ./internal/session/ -run TestInstance_BuildClaudeResumeCommand_AfterFlap_ResumesRichID -count=1 -race -v
+    expected: pass
+- id: v1724-multirepo-restore-reconnect-workdir
+  added: '2026-04-18'
+  task: v1724-multirepo-restore-663
+  file: internal/session/multirepo_restore_test.go
+  test_name: TestRestore_ReconnectSeedsWorkDirFromMultiRepoTempDir
+  purpose: 'Issue #663 site 1 — storage.go convertToInstances must seed tmux WorkDir from MultiRepoTempDir, not the ProjectPath symlink. Otherwise the restart pane launches in the wrong cwd and Claude''s JSONL encoded-path key never matches, silently dropping the prior conversation.'
+  source: .planning/investigate-multirepo-restart/REPORT.md
+  manual: false
+  run:
+    command: go test ./internal/session/ -run TestRestore_ReconnectSeedsWorkDirFromMultiRepoTempDir -count=1 -race -v
+    expected: pass
+- id: v1724-multirepo-restore-recreate-workdir
+  added: '2026-04-18'
+  task: v1724-multirepo-restore-663
+  file: internal/session/multirepo_restore_test.go
+  test_name: TestRestore_RecreateTmuxSessionUsesEffectiveWorkingDir
+  purpose: 'Issue #663 site 2 — instance.go recreateTmuxSession must use EffectiveWorkingDir(), not ProjectPath, when the TUI restart path finds the prior tmux session dead. Without this, multi-repo TUI restarts spawn the replacement tmux session inside the symlinked source repo rather than the worktree parent dir.'
+  source: .planning/investigate-multirepo-restart/REPORT.md
+  manual: false
+  run:
+    command: go test ./internal/session/ -run TestRestore_RecreateTmuxSessionUsesEffectiveWorkingDir -count=1 -race -v
+    expected: pass
+- id: v1724-multirepo-restore-jsonl-discovery
+  added: '2026-04-18'
+  task: v1724-multirepo-restore-663
+  file: internal/session/multirepo_restore_test.go
+  test_name: TestRestore_DiscoverJSONLUsesMultiRepoTempDir
+  purpose: 'Issue #663 site 3 — ensureClaudeSessionIDFromDisk must probe discoverLatestClaudeJSONL with EffectiveWorkingDir(). ProjectPath on a multi-repo session EvalSymlinks-resolves into the original source repo, so the encoded path never finds the JSONL that Claude wrote while cwd=MultiRepoTempDir. Without this, Start() silently enters the fresh-session branch and the prior conversation vanishes.'
+  source: .planning/investigate-multirepo-restart/REPORT.md
+  manual: false
+  run:
+    command: go test ./internal/session/ -run TestRestore_DiscoverJSONLUsesMultiRepoTempDir -count=1 -race -v
+    expected: pass
+- id: issue-434-detach-key-tmux-alias
+  added: '2026-04-17'
+  task: feat-434-detach-key
+  file: internal/session/userconfig_test.go
+  test_name: TestDetachKey_ConfigurableViaToml
+  purpose: '[tmux].detach_key alias layers into [hotkeys].detach only when hotkeys.detach is absent; [hotkeys].detach always wins when both set; whitespace trimmed; empty string ignored. Guards #434 alias semantics against regression.'
+  source: issue-434-make-ctrl-q-detach-key-configurable
+  manual: false
+  run:
+    command: go test ./internal/session/ -run TestDetachKey_ConfigurableViaToml -count=1 -v
+    expected: pass
+- id: issue-628-watcher-help-examples
+  added: '2026-04-17'
+  task: feat-628-watcher-docs
+  file: cmd/agent-deck/watcher_cmd_test.go
+  test_name: TestWatcherHelp_MentionsAdapterExamples
+  purpose: "agent-deck watcher --help must include an example for every adapter type (webhook/github/ntfy/slack) plus a pointer to watcher-creator skill and the README anchor \u2014 guards against docs regression that erases first-time-setup guidance."
+  source: issue-628-documentation-for-watcher-feature
+  manual: false
+  run:
+    command: go test ./cmd/agent-deck/ -run TestWatcherHelp_MentionsAdapterExamples -count=1 -v
+    expected: pass
+- id: issue-391-session-color-valid
+  added: '2026-04-17'
+  task: feat-391-per-session-colors
+  file: cmd/agent-deck/session_color_test.go
+  test_name: TestIsValidSessionColor
+  purpose: 'Locks the CLI-boundary validator for per-session color (issue #391): empty/truecolor-hex/ANSI-256 accepted; typos like "red", malformed hex, and out-of-range ints rejected. Prevents bad values reaching the render layer.'
+  source: issue-391-per-session-colors
+  manual: false
+  run:
+    command: go test ./cmd/agent-deck/ -run TestIsValidSessionColor -count=1 -v
+    expected: pass
+- id: issue-391-session-color-persist
+  added: '2026-04-17'
+  task: feat-391-per-session-colors
+  file: cmd/agent-deck/session_color_test.go
+  test_name: TestSessionSetColor_PersistsValidAndRejectsInvalid
+  purpose: "End-to-end CLI round-trip for per-session color (issue #391): set \u2192 list shows field; invalid value rejected with non-zero exit AND prior value preserved; empty clears the field (omitempty on persisted JSON). Guards the full persistence path through SQLite blob."
+  source: issue-391-per-session-colors
+  manual: false
+  run:
+    command: go test ./cmd/agent-deck/ -run TestSessionSetColor_PersistsValidAndRejectsInvalid -count=1 -v -timeout 120s
+    expected: pass
+- id: v1725-issue666-empty-grouppath-load-fallback
+  added: '2026-04-18'
+  task: v1725-issue666-group-disappearance
+  file: internal/session/issue666_test.go
+  test_name: TestIssue666_LoadRowWithEmptyGroupPath_FallsBackToDefaultNotPathDerived
+  purpose: 'Issue #666 site 1 — storage.go convertToInstances fallback must route empty group_path rows to DefaultGroupPath, NOT re-derive via extractGroupPath(ProjectPath). The old fallback was the trigger for the "session disappeared from its group and surfaced under a path-derived name" symptom — silent re-parenting that the user could not see or recover from.'
+  source: .planning/investigate-issue-666/REPORT.md
+  manual: false
+  run:
+    command: go test ./internal/session/ -run TestIssue666_LoadRowWithEmptyGroupPath_FallsBackToDefaultNotPathDerived -count=1 -race -v
+    expected: pass
+- id: v1725-issue666-explicit-grouppath-preserved
+  added: '2026-04-18'
+  task: v1725-issue666-group-disappearance
+  file: internal/session/issue666_test.go
+  test_name: TestIssue666_LoadRowWithExplicitGroupPath_IsPreserved
+  purpose: 'Issue #666 over-reach guard — the fallback rewrite must ONLY fire on empty group_path. Rows with an explicit group stay as-is.'
+  source: .planning/investigate-issue-666/REPORT.md
+  manual: false
+  run:
+    command: go test ./internal/session/ -run TestIssue666_LoadRowWithExplicitGroupPath_IsPreserved -count=1 -race -v
+    expected: pass
+- id: v1725-issue666-save-normalizes-empty-grouppath
+  added: '2026-04-18'
+  task: v1725-issue666-group-disappearance
+  file: internal/session/issue666_test.go
+  test_name: TestIssue666_SaveWithGroups_NormalizesEmptyGroupPath
+  purpose: 'Issue #666 belt-and-braces — SaveWithGroups must refuse to persist empty group_path, normalizing to DefaultGroupPath at the save boundary. Prevents a future write-path regression from leaving the DB in the state that triggered the original bug.'
+  source: .planning/investigate-issue-666/REPORT.md
+  manual: false
+  run:
+    command: go test ./internal/session/ -run TestIssue666_SaveWithGroups_NormalizesEmptyGroupPath -count=1 -race -v
+    expected: pass
+- id: v1725-issue666-autodisable-telegram-global
+  added: '2026-04-18'
+  task: v1725-issue666-group-disappearance
+  file: cmd/agent-deck/conductor_cmd_telegram_autofix_test.go
+  test_name: TestDisableTelegramGlobally_FixesTrueToFalse
+  purpose: 'Issue #666 mechanism 1 — `agent-deck conductor setup` now auto-remediates enabledPlugins."telegram@claude-plugins-official" = true (not just warn). v1.7.22 warn-only path let the silent-crash anti-pattern persist across setups. The autofix preserves unknown keys in settings.json and only touches the telegram key.'
+  source: .planning/investigate-issue-666/REPORT.md
+  manual: false
+  run:
+    command: go test ./cmd/agent-deck/ -run TestDisableTelegramGlobally_FixesTrueToFalse -count=1 -race -v
+    expected: pass
+- id: v1725-issue666-autodisable-idempotent
+  added: '2026-04-18'
+  task: v1725-issue666-group-disappearance
+  file: cmd/agent-deck/conductor_cmd_telegram_autofix_test.go
+  test_name: TestDisableTelegramGlobally_NoOpWhenAlreadyFalse
+  purpose: 'Issue #666 — autofix is idempotent. Re-running setup must not rewrite settings.json when the flag is already false (mtime preserved to avoid spurious Claude Code watcher reloads).'
+  source: .planning/investigate-issue-666/REPORT.md
+  manual: false
+  run:
+    command: go test ./cmd/agent-deck/ -run TestDisableTelegramGlobally_NoOpWhenAlreadyFalse -count=1 -race -v
+    expected: pass
+- id: v1725-issue666-autodisable-missing-file
+  added: '2026-04-18'
+  task: v1725-issue666-group-disappearance
+  file: cmd/agent-deck/conductor_cmd_telegram_autofix_test.go
+  test_name: TestDisableTelegramGlobally_NoOpWhenMissingFile
+  purpose: 'Issue #666 — autofix must not create settings.json when the file is absent. Missing file = safe baseline, nothing to remediate.'
+  source: .planning/investigate-issue-666/REPORT.md
+  manual: false
+  run:
+    command: go test ./cmd/agent-deck/ -run TestDisableTelegramGlobally_NoOpWhenMissingFile -count=1 -race -v
+    expected: pass
+- id: v1725-issue666-respawn-sweep-claude
+  added: '2026-04-18'
+  task: v1725-issue666-group-disappearance
+  file: internal/session/issue666_restart_sweep_test.go
+  test_name: TestIssue666_SweepDuplicateToolSessions_Claude
+  purpose: 'Issue #666 mechanism 3 — the primary respawn-pane restart branches now call sweepDuplicateToolSessions, matching the fallback branch that already did (issue #596 guard). Fixes the asymmetry where `session restart` on the common path could leave another agentdeck tmux session running the same `claude --resume`, stacking two telegram pollers on the same bot token.'
+  source: .planning/investigate-issue-666/REPORT.md
+  manual: false
+  run:
+    command: go test ./internal/session/ -run TestIssue666_SweepDuplicateToolSessions_Claude -count=1 -race -v
+    expected: pass
+- id: v1725-issue666-respawn-sweep-tool-coverage
+  added: '2026-04-18'
+  task: v1725-issue666-group-disappearance
+  file: internal/session/issue666_restart_sweep_test.go
+  test_name: TestIssue666_SweepDuplicateToolSessions_Gemini
+  purpose: 'Issue #666 — sweep helper covers every tool that has a session-id env var (Gemini, OpenCode, Codex companion tests in same file) so restart hygiene is uniform across claude-compatible tools, not Claude-only.'
+  source: .planning/investigate-issue-666/REPORT.md
+  manual: false
+  run:
+    command: go test ./internal/session/ -run TestIssue666_SweepDuplicateToolSessions_ -count=1 -race -v
+    expected: pass
+- id: v1725-issue666-tui-resolver-fallback-default
+  added: '2026-04-18'
+  task: v1725-issue666-group-disappearance
+  file: internal/ui/issue666_tui_test.go
+  test_name: TestIssue666_ResolveNewSessionGroup_CursorOnWindow_FallsBackToDefault
+  purpose: 'Issue #666 TUI root cause — createSessionFromGlobalSearch at home.go:4762 passed h.getCurrentGroupPath() directly into NewInstanceWithGroupAndTool. For cursor on non-group/non-session items (Window/RemoteGroup/placeholder) that returns "", which overrode the extractGroupPath default. The new resolveNewSessionGroup helper rescues empty → DefaultGroupPath for unscoped Home. This test pins the contract.'
+  source: .planning/investigate-issue-666/REPORT.md
+  manual: false
+  run:
+    command: go test ./internal/ui/ -run TestIssue666_ResolveNewSessionGroup_CursorOnWindow_FallsBackToDefault -count=1 -race -v
+    expected: pass
+- id: v1725-issue666-tui-resolver-scope-rescue
+  added: '2026-04-18'
+  task: v1725-issue666-group-disappearance
+  file: internal/ui/issue666_tui_test.go
+  test_name: TestIssue666_ResolveNewSessionGroup_ScopedView_UsesScope
+  purpose: 'Issue #666 — when the TUI is running in scoped-group mode (agent-deck -g X) and the cursor is on a non-group/non-session item, the resolver must rescue via h.groupScope (not DefaultGroupPath). This preserves the user''s intent when importing a Claude session via global search while browsing a scoped conductor group.'
+  source: .planning/investigate-issue-666/REPORT.md
+  manual: false
+  run:
+    command: go test ./internal/ui/ -run TestIssue666_ResolveNewSessionGroup_ScopedView_UsesScope -count=1 -race -v
+    expected: pass
+- id: v1725-issue666-tui-global-search-e2e
+  added: '2026-04-18'
+  task: v1725-issue666-group-disappearance
+  file: internal/ui/issue666_tui_test.go
+  test_name: TestIssue666_GlobalSearchImport_EndToEnd_PreservesGroupAcrossReload
+  purpose: 'Issue #666 end-to-end integration — mirrors the exact call chain at home.go:4762 (Window cursor → resolveNewSessionGroup → NewInstanceWithGroupAndTool) and persists + reloads through real SQLite storage. On v1.7.24 baseline (all fixes reverted) this fails with "GroupPath after reload = tmp, want agent-deck" — exact user-reported symptom. With only belt-and-braces it fails differently ("my-sessions, want agent-deck"). With both fixes it passes.'
+  source: .planning/investigate-issue-666/REPORT.md
+  manual: false
+  run:
+    command: go test ./internal/ui/ -run TestIssue666_GlobalSearchImport_EndToEnd_PreservesGroupAcrossReload -count=1 -race -v
+    expected: pass
+- id: v1726-issue556-copilot-options-toargs
+  added: '2026-04-18'
+  task: v1726-issue556-copilot-cli
+  file: internal/session/copilot_test.go
+  test_name: TestCopilotOptions_ToArgs
+  purpose: 'Issue #556 — CopilotOptions.ToArgs emits the right flag shape for each session mode (new → no args, resume → --resume, resume with ID → --resume <id>). This is the contract that buildCopilotCommand wiring will consume as the feature extends.'
+  source: github-issue-556
+  manual: false
+  run:
+    command: go test ./internal/session/ -run TestCopilotOptions_ToArgs -count=1 -race -v
+    expected: pass
+- id: v1726-issue556-copilot-marshal-roundtrip
+  added: '2026-04-18'
+  task: v1726-issue556-copilot-cli
+  file: internal/session/copilot_test.go
+  test_name: TestCopilotOptions_MarshalUnmarshalRoundtrip
+  purpose: 'Issue #556 — CopilotOptions survives JSON roundtrip through the ToolOptionsWrapper envelope (tool="copilot"). Guards against persistence regression when the storage layer serialises tool options.'
+  source: github-issue-556
+  manual: false
+  run:
+    command: go test ./internal/session/ -run TestCopilotOptions_MarshalUnmarshalRoundtrip -count=1 -race -v
+    expected: pass
+- id: v1726-issue556-copilot-not-claude-compatible
+  added: '2026-04-18'
+  task: v1726-issue556-copilot-cli
+  file: internal/session/copilot_test.go
+  test_name: TestIsClaudeCompatible_CopilotNotCompatible
+  purpose: 'Issue #556 — Copilot is its own tool, not a Claude wrapper. IsClaudeCompatible("copilot") must be false so Claude-only surfaces (--channels, --extra-arg, skill injection, MCP hooks) stay off. Critical negative guard preventing Claude-path accidents.'
+  source: github-issue-556
+  manual: false
+  run:
+    command: go test ./internal/session/ -run TestIsClaudeCompatible_CopilotNotCompatible -count=1 -race -v
+    expected: pass
+- id: v1726-issue556-copilot-custom-names-excludes-builtin
+  added: '2026-04-18'
+  task: v1726-issue556-copilot-cli
+  file: internal/session/copilot_test.go
+  test_name: TestGetCustomToolNames_CopilotIsBuiltin
+  purpose: 'Issue #556 — if a user defines [tools.copilot] in config.toml the built-in copilot handler must take precedence. GetCustomToolNames must exclude "copilot" from the custom list so the detection / icon / pattern path routes through the built-in branch.'
+  source: github-issue-556
+  manual: false
+  run:
+    command: go test ./internal/session/ -run TestGetCustomToolNames_CopilotIsBuiltin -count=1 -race -v
+    expected: pass
+- id: v1726-issue556-copilot-tmux-detect
+  added: '2026-04-18'
+  task: v1726-issue556-copilot-cli
+  file: internal/tmux/copilot_test.go
+  test_name: TestDetectToolFromCommand_Copilot
+  purpose: 'Issue #556 — tmux-layer detection identifies "copilot" from bare binary, flagged invocations, npx @github/copilot form, and uppercase variants. Fires from pipemanager + title_detection so the TUI and status refresh agree on tool identity.'
+  source: github-issue-556
+  manual: false
+  run:
+    command: go test ./internal/tmux/ -run TestDetectToolFromCommand_Copilot -count=1 -race -v
+    expected: pass
+- id: v1726-issue556-copilot-patterns
+  added: '2026-04-18'
+  task: v1726-issue556-copilot-cli
+  file: internal/tmux/copilot_test.go
+  test_name: TestDefaultRawPatterns_Copilot
+  purpose: 'Issue #556 — DefaultRawPatterns("copilot") returns non-nil busy + prompt pattern sets, wiring copilot into the same status detection pipeline as claude/gemini/codex. Without this patch the session would have no busy/idle semantics in the TUI.'
+  source: github-issue-556
+  manual: false
+  run:
+    command: go test ./internal/tmux/ -run TestDefaultRawPatterns_Copilot -count=1 -race -v
+    expected: pass
+- id: v1726-issue556-copilot-cli-detect
+  added: '2026-04-18'
+  task: v1726-issue556-copilot-cli
+  file: cmd/agent-deck/copilot_detect_test.go
+  test_name: TestDetectTool_Copilot
+  purpose: 'Issue #556 — `agent-deck add -c copilot .` must resolve to Tool="copilot" instead of the shell fallback. Covers bare / flagged / uppercase invocations routed through the CLI-layer detectTool helper in main.go.'
+  source: github-issue-556
+  manual: false
+  run:
+    command: go test ./cmd/agent-deck/ -run TestDetectTool_Copilot -count=1 -race -v
+    expected: pass
+- id: v1728-issue572-name-sync-find-match
+  added: '2026-04-18'
+  task: v1728-issue572-auto-sync-title
+  file: cmd/agent-deck/hook_name_sync_test.go
+  test_name: TestFindClaudeSessionName_MatchBySessionID
+  purpose: 'Issue #572 — core lookup primitive: scan ~/.claude/sessions/*.json and return the `name` field for the matching sessionId. Proves the filesystem-walk + JSON-decode + sessionId-match wiring before any storage writes.'
+  source: '#572'
+  manual: false
+  run:
+    command: go test ./cmd/agent-deck/ -run TestFindClaudeSessionName_MatchBySessionID -count=1 -race -v
+    expected: pass
+- id: v1728-issue572-name-sync-empty-name-noop
+  added: '2026-04-18'
+  task: v1728-issue572-auto-sync-title
+  file: cmd/agent-deck/hook_name_sync_test.go
+  test_name: TestFindClaudeSessionName_EmptyNameField
+  purpose: 'Issue #572 — sessions started without --name (or with name="") must NOT stomp on agent-deck''s auto-generated adjective-noun title. Missing-field and explicit-empty both return "".'
+  source: '#572'
+  manual: false
+  run:
+    command: go test ./cmd/agent-deck/ -run TestFindClaudeSessionName_EmptyNameField -count=1 -race -v
+    expected: pass
+- id: v1728-issue572-apply-title-sync-updates
+  added: '2026-04-18'
+  task: v1728-issue572-auto-sync-title
+  file: cmd/agent-deck/hook_name_sync_test.go
+  test_name: TestApplyClaudeTitleSync_UpdatesInstance
+  purpose: 'Issue #572 end-to-end integration — seeds an instance in SQLite with auto-generated title, seeds a Claude session file with user-set name, calls applyClaudeTitleSync, asserts the title updated in storage. Pins the Storage round-trip so a future refactor to MigrateClaudeProjectDir''s storage layer can''t silently break title sync.'
+  source: '#572'
+  manual: false
+  run:
+    command: go test ./cmd/agent-deck/ -run TestApplyClaudeTitleSync_UpdatesInstance -count=1 -race -v
+    expected: pass
+- id: v1728-issue572-apply-title-sync-no-redundant-write
+  added: '2026-04-18'
+  task: v1728-issue572-auto-sync-title
+  file: cmd/agent-deck/hook_name_sync_test.go
+  test_name: TestApplyClaudeTitleSync_NoopWhenNameEqualsTitle
+  purpose: 'Issue #572 — hooks fire on every UserPromptSubmit. If the title already matches the Claude name, the sync must NOT write to SQLite (would thrash WAL and trigger unnecessary notifier re-reads). Asserts DB last-modified timestamp doesn''t advance on the equal-name path.'
+  source: '#572'
+  manual: false
+  run:
+    command: go test ./cmd/agent-deck/ -run TestApplyClaudeTitleSync_NoopWhenNameEqualsTitle -count=1 -race -v
+    expected: pass
+- id: v1728-issue414-move-updates-path
+  added: '2026-04-18'
+  task: v1728-issue414-session-move
+  file: cmd/agent-deck/session_move_test.go
+  test_name: TestSessionMove_UpdatesPath
+  purpose: 'Issue #414 — the most basic contract: `agent-deck session move <id> <new-path>` accepts the subcommand and persists the new path. On pre-1.7.26 main this fails with "unknown session command: move" (exit 1 from handleSession dispatcher).'
+  source: '#414'
+  manual: false
+  run:
+    command: go test ./cmd/agent-deck/ -run TestSessionMove_UpdatesPath -count=1 -race -v
+    expected: pass
+- id: v1728-issue414-move-migrates-claude-history
+  added: '2026-04-18'
+  task: v1728-issue414-session-move
+  file: cmd/agent-deck/session_move_test.go
+  test_name: TestSessionMove_MigratesClaudeProjectDir
+  purpose: 'Issue #414 value-add over plain `session set path` — ~/.claude/projects/<old-slug>/ is renamed to <new-slug>/ so `claude --resume` in the new path picks up prior conversation history. Sentinel file (abc-123.jsonl) confirms byte-for-byte preservation.'
+  source: '#414'
+  manual: false
+  run:
+    command: go test ./cmd/agent-deck/ -run TestSessionMove_MigratesClaudeProjectDir -count=1 -race -v
+    expected: pass
+- id: v1728-issue414-move-copy-flag-preserves-old
+  added: '2026-04-18'
+  task: v1728-issue414-session-move
+  file: cmd/agent-deck/session_move_test.go
+  test_name: TestSessionMove_CopyFlagPreservesOldDir
+  purpose: 'Issue #414 --copy flag contract — when multiple sessions share the same Claude projects dir, --copy lets the user migrate one without orphaning the others. Both source AND destination dirs must exist afterward with identical contents.'
+  source: '#414'
+  manual: false
+  run:
+    command: go test ./cmd/agent-deck/ -run TestSessionMove_CopyFlagPreservesOldDir -count=1 -race -v
+    expected: pass
+- id: v1728-issue414-move-group-flag
+  added: '2026-04-18'
+  task: v1728-issue414-session-move
+  file: cmd/agent-deck/session_move_test.go
+  test_name: TestSessionMove_GroupFlag
+  purpose: 'Issue #414 — --group flag moves the session to a new group path in the same atomic operation, eliminating the second `group move` step of the 4-step manual ritual.'
+  source: '#414'
+  manual: false
+  run:
+    command: go test ./cmd/agent-deck/ -run TestSessionMove_GroupFlag -count=1 -race -v
+    expected: pass
+- id: v1728-watcher-event-dedup-busy-retry
+  added: '2026-04-18'
+  task: v1728-flake-fix
+  file: internal/statedb/statedb_test.go
+  test_name: TestWatcherEventDedup
+  purpose: 'Pre-existing race flake on CI — SaveWatcherEvent now retries on SQLITE_BUSY with linear backoff. This pins the concurrent-insert dedup guarantee (exactly 1 row after 2 goroutines racing the same dedup key) while tolerating transient busy errors that previously failed release CI intermittently.'
+  source: v1.7.28-release-prep
+  manual: false
+  run:
+    command: go test ./internal/statedb/ -run TestWatcherEventDedup -count=3 -race -v
+    expected: pass
+- id: v1727-issue662-hidden-dir-encoding
+  added: '2026-04-19'
+  task: v1727-issue662-session-data-false-negative
+  file: internal/session/issue662_session_data_diag_test.go
+  test_name: TestIssue662_HiddenDirInPath_EncodesToDoubleDash
+  purpose: 'Issue #662 hypothesis (1) regression pin — paths with dot-prefix segments (/home/u/.agent-deck/conductor/*) must encode with a double-dash (the dot and the path separator both become dashes). Guards against silent encoder regressions that would make every .agent-deck/conductor session stop finding its jsonl.'
+  source: https://github.com/asheshgoplani/agent-deck/issues/662
+  manual: false
+  run:
+    command: go test ./internal/session/ -run TestIssue662_HiddenDirInPath_EncodesToDoubleDash -count=1 -race -v
+    expected: pass
+- id: v1727-issue662-fallback-on-primary-miss
+  added: '2026-04-19'
+  task: v1727-issue662-session-data-false-negative
+  file: internal/session/issue662_session_data_diag_test.go
+  test_name: TestIssue662_FindsFileViaFallback_WhenPrimaryPathMisses
+  purpose: 'Issue #662 hypothesis (3) regression pin — when the primary encoded path has no matching jsonl but another project dir under the same configDir does, the fallback must surface it. Protects the findSessionFileInAllProjects safety net from regressions that would break path-hash drift recovery.'
+  source: https://github.com/asheshgoplani/agent-deck/issues/662
+  manual: false
+  run:
+    command: go test ./internal/session/ -run TestIssue662_FindsFileViaFallback_WhenPrimaryPathMisses -count=1 -race -v
+    expected: pass
+- id: v1727-issue662-diagnostic-log-contract
+  added: '2026-04-19'
+  task: v1727-issue662-session-data-false-negative
+  file: internal/session/issue662_session_data_diag_test.go
+  test_name: TestIssue662_DiagnosticLog_CapturesAllDecisionFields
+  purpose: 'Issue #662 diagnostic contract — sessionHasConversationData must emit a structured session_data_decision log line carrying config_dir, resolved_project_path, encoded_path, primary_path_tested, fallback_lookup_tried, and final_result. Production diagnosis of the travel-conductor false-negative was blocked because these fields were missing; the test pins the full field set so future diagnosis can be done from logs alone.'
+  source: https://github.com/asheshgoplani/agent-deck/issues/662
+  manual: false
+  run:
+    command: go test ./internal/session/ -run TestIssue662_DiagnosticLog_CapturesAllDecisionFields -count=1 -race -v
+    expected: pass
+- id: v1727-issue662-retry-on-session-end-race
+  added: '2026-04-19'
+  task: v1727-issue662-session-data-false-negative
+  file: internal/session/issue662_session_data_diag_test.go
+  test_name: TestIssue662_BuildClaudeResumeCommand_RetriesOnceOnSessionEndRace
+  purpose: 'Issue #662 hypothesis (2) fix — buildClaudeResumeCommand now retries sessionHasConversationData once after a 200ms wait when the first check returns false but ClaudeSessionID is non-empty. Covers the SessionEnd-flush race where Claude is still writing the jsonl when agent-deck picks the resume flag. Test seeds a delayed jsonl write at 50ms and asserts the emitted command contains --resume, not --session-id.'
+  source: https://github.com/asheshgoplani/agent-deck/issues/662
+  manual: false
+  run:
+    command: go test ./internal/session/ -run TestIssue662_BuildClaudeResumeCommand_RetriesOnceOnSessionEndRace -count=1 -race -v
+    expected: pass
+- id: v1729-issue447-movegroupto-tree
+  added: '2026-04-18'
+  task: v1729-issues-447-483
+  file: internal/session/groups_reorganize_test.go
+  test_name: TestMoveGroupTo_WithSubgroups
+  purpose: 'Issue #447 — GroupTree.MoveGroupTo reparents a group and rewrites every subgroup path (and session GroupPath) in one pass.'
+  source: github-issue-447
+  manual: false
+  run:
+    command: go test ./internal/session/ -run TestMoveGroupTo_WithSubgroups -count=1 -race -v
+    expected: pass
+- id: v1729-issue447-movegroupto-circular
+  added: '2026-04-18'
+  task: v1729-issues-447-483
+  file: internal/session/groups_reorganize_test.go
+  test_name: TestMoveGroupTo_Circular
+  purpose: 'Issue #447 — MoveGroupTo refuses circular moves (dest == source or a descendant) and leaves the tree intact.'
+  source: github-issue-447
+  manual: false
+  run:
+    command: go test ./internal/session/ -run TestMoveGroupTo_Circular -count=1 -race -v
+    expected: pass
+- id: v1729-issue447-group-change-cli-e2e
+  added: '2026-04-18'
+  task: v1729-issues-447-483
+  file: cmd/agent-deck/group_change_test.go
+  test_name: TestGroupChange_RootToSubgroup
+  purpose: 'Issue #447 — end-to-end CLI: group change reparents a group and the change survives SaveWithGroups + reload.'
+  source: github-issue-447
+  manual: false
+  run:
+    command: go test ./cmd/agent-deck/ -run TestGroupChange_RootToSubgroup -count=1 -race -v
+    expected: pass
+- id: v1729-issue447-group-change-rejects-circular
+  added: '2026-04-18'
+  task: v1729-issues-447-483
+  file: cmd/agent-deck/group_change_test.go
+  test_name: TestGroupChange_RejectsCircular
+  purpose: 'Issue #447 — CLI refuses circular moves with a non-zero exit and a diagnostic that names the reason.'
+  source: github-issue-447
+  manual: false
+  run:
+    command: go test ./cmd/agent-deck/ -run TestGroupChange_RejectsCircular -count=1 -race -v
+    expected: pass
+- id: v1729-issue483-session-search-content
+  added: '2026-04-18'
+  task: v1729-issues-447-483
+  file: cmd/agent-deck/session_search_test.go
+  test_name: TestSessionSearch_FindsMessageContent
+  purpose: 'Issue #483 — `agent-deck session search` matches on JSONL message content (not titles) and returns session_id + snippet + cwd. Locks the JSON output shape.'
+  source: github-issue-483
+  manual: false
+  run:
+    command: go test ./cmd/agent-deck/ -run TestSessionSearch_FindsMessageContent -count=1 -race -v
+    expected: pass
+- id: v1729-issue483-session-search-no-matches
+  added: '2026-04-18'
+  task: v1729-issues-447-483
+  file: cmd/agent-deck/session_search_test.go
+  test_name: TestSessionSearch_NoMatches
+  purpose: 'Issue #483 — exit 0 + empty results array when no sessions match; keeps `search | jq` pipelines clean.'
+  source: github-issue-483
+  manual: false
+  run:
+    command: go test ./cmd/agent-deck/ -run TestSessionSearch_NoMatches -count=1 -race -v
+    expected: pass
+- id: v1730-issue391-hex-color-rendered
+  added: '2026-04-19'
+  task: v1730-issue-391
+  file: internal/ui/issue391_tui_test.go
+  test_name: TestIssue391_SessionRow_HexColorRenderedAsForeground
+  purpose: 'Issue #391 — renderSessionItem applies Instance.Color as title foreground when set to a #RRGGBB truecolor hex. Pins the render contract so a future refactor of titleStyle cannot silently drop the tint overlay (the exact failure mode from v1.7.27–v1.7.29 where the field round-tripped through storage but never reached the render layer).'
+  source: github-issue-391
+  manual: false
+  run:
+    command: go test ./internal/ui/ -run TestIssue391_SessionRow_HexColorRenderedAsForeground -count=1 -race -v
+    expected: pass
+- id: v1730-issue391-ansi-color-rendered
+  added: '2026-04-19'
+  task: v1730-issue-391
+  file: internal/ui/issue391_tui_test.go
+  test_name: TestIssue391_SessionRow_ANSIIndexColorRendered
+  purpose: 'Issue #391 — renderSessionItem handles the second accepted color format from isValidSessionColor: a 0..255 ANSI 256-palette index emits the `38;5;<idx>` foreground escape. Guards against a future "truecolor-hex only" regression that would silently reject valid CLI input.'
+  source: github-issue-391
+  manual: false
+  run:
+    command: go test ./internal/ui/ -run TestIssue391_SessionRow_ANSIIndexColorRendered -count=1 -race -v
+    expected: pass
+- id: v1730-issue391-empty-color-untinted
+  added: '2026-04-19'
+  task: v1730-issue-391
+  file: internal/ui/issue391_tui_test.go
+  test_name: TestIssue391_SessionRow_EmptyColorLeavesRowUntinted
+  purpose: 'Issue #391 — the fall-through invariant: Color="" must leave the row untinted. Guards against a future refactor that turns the opt-in tint into a mandatory one, which would change rendering for every user who never set a color.'
+  source: github-issue-391
+  manual: false
+  run:
+    command: go test ./internal/ui/ -run TestIssue391_SessionRow_EmptyColorLeavesRowUntinted -count=1 -race -v
+    expected: pass
+- id: v1731-pr674-pi-detect-cli
+  added: '2026-04-19'
+  task: v1731-pr-674
+  file: cmd/agent-deck/copilot_detect_test.go
+  test_name: TestDetectTool_Pi
+  purpose: 'PR #674 (community contribution from @masta-g3) — `agent-deck add -c pi .` must produce Tool="pi" not Tool="shell" with Command="pi". Pins token-matching detection so short ambiguous names like "pi" survive a future refactor without false-matching against substrings ("epic", "tapioca"). Companion to the existing tmux-side detection in internal/tmux; this is the CLI -c flag parser at the boundary.'
+  source: github-pr-674
+  manual: false
+  run:
+    command: go test ./cmd/agent-deck/ -run TestDetectTool_Pi -count=1 -race -v
+    expected: pass
+- id: v1731-pr674-pi-detect-tui
+  added: '2026-04-19'
+  task: v1731-pr-674
+  file: internal/ui/home_test.go
+  test_name: TestCreateSessionTool_Pi
+  purpose: 'PR #674 — TUI session creation must map command="pi" to (tool="pi", command="pi") via createSessionTool. Pins the helper extracted from the inline switch in createSessionInGroupWithWorktreeAndOptions so a future TUI refactor cannot regress Pi sessions back to Tool="shell".'
+  source: github-pr-674
+  manual: false
+  run:
+    command: go test ./internal/ui/ -run TestCreateSessionTool_Pi -count=1 -race -v
+    expected: pass
+- id: v1732-pr675-project-skills-dir-mapping
+  added: '2026-04-19'
+  task: v1732-pr-675
+  file: internal/session/skills_runtime_test.go
+  test_name: TestProjectSkillsDirMapping
+  purpose: 'PR #675 — GetProjectSkillsDir/SupportsProjectSkills/ShouldRestartProjectSkills must produce the right triple for claude (.claude/skills, supported, restart), gemini/codex (.agents/skills, supported, restart), pi (.agents/skills, supported, NO restart), and shell (empty, unsupported, no restart). Pins the runtime→directory contract so a future refactor cannot silently send Pi skills back to .claude/skills/ or enable auto-restart for Pi (Pi does not yet hot-reload skills).'
+  source: github-pr-675
+  manual: false
+  run:
+    command: go test ./internal/session/ -run TestProjectSkillsDirMapping -count=1 -race -v
+    expected: pass
+- id: v1732-pr675-apply-migrates-between-roots
+  added: '2026-04-19'
+  task: v1732-pr-675
+  file: internal/session/skills_runtime_test.go
+  test_name: TestSkillRuntime_ApplyMigratesBetweenManagedRoots
+  purpose: 'PR #675 — when a session is restarted with a different runtime (e.g. claude → gemini), the next ApplyProjectSkills must materialize the skill into the new managed root (.agents/skills) AND remove the old managed target (.claude/skills). Locks down the migration semantics — regressions here would leave orphaned .claude/skills/* directories every time a user switches runtimes, and the manifest would silently keep pointing to .claude/skills/ forever.'
+  source: github-pr-675
+  manual: false
+  run:
+    command: go test ./internal/session/ -run TestSkillRuntime_ApplyMigratesBetweenManagedRoots -count=1 -race -v
+    expected: pass
+- id: v1732-pr675-attach-migrates-when-source-unavailable
+  added: '2026-04-19'
+  task: v1732-pr-675
+  file: internal/session/skills_runtime_test.go
+  test_name: TestSkillRuntime_AttachMigratesFromExistingTargetWhenSourceUnavailable
+  purpose: 'PR #675 — the fallback case: when the original SourcePath no longer exists on disk (e.g. a pool skill was deleted) but the old managed target is still readable, attach into the new runtime root must rebuild from the existing target (copy-only, no symlink). Guards against a regression where losing the source directory would make runtime-switch migration impossible — users would be stranded with a manifest entry pointing at a dir they cannot move.'
+  source: github-pr-675
+  manual: false
+  run:
+    command: go test ./internal/session/ -run TestSkillRuntime_AttachMigratesFromExistingTargetWhenSourceUnavailable -count=1 -race -v
+    expected: pass
+- id: v1732-pr675-detach-removes-agent-skills-target
+  added: '2026-04-19'
+  task: v1732-pr-675
+  file: internal/session/skills_runtime_test.go
+  test_name: TestSkillRuntime_DetachRemovesAgentSkillsTarget
+  purpose: 'PR #675 — DetachSkillFromProject must physically remove the materialized entry under .agents/skills/ (not just delete the manifest row). Pins the detach contract for the new runtime-neutral managed root so a future refactor that special-cases .claude/skills/ cannot leave .agents/skills/ orphans behind. Companion to removeAttachmentTarget''s defense-in-depth check (target must be under a known managed dir AND resolved path must stay inside base — blocks `..`-traversal even with a hand-edited manifest).'
+  source: github-pr-675
+  manual: false
+  run:
+    command: go test ./internal/session/ -run TestSkillRuntime_DetachRemovesAgentSkillsTarget -count=1 -race -v
+    expected: pass
+- id: v1732-pr675-tui-reconcile-on-runtime-switch
+  added: '2026-04-19'
+  task: v1732-pr-675
+  file: internal/ui/skill_dialog_test.go
+  test_name: TestSkillDialog_ShowMarksReconcileNeededForRuntimeSwitch
+  purpose: 'PR #675 — when the TUI Skills Manager opens for a session whose attached skills point at a managed root that doesn''t match the active runtime, NeedsApply() must return true even when the user hasn''t moved anything between columns. Pins the auto-reconcile UX: pressing Enter after a Claude-to-Gemini restart migrates all attachments in one keystroke with no manual shuffling.'
+  source: github-pr-675
+  manual: false
+  run:
+    command: go test ./internal/ui/ -run TestSkillDialog_ShowMarksReconcileNeededForRuntimeSwitch -count=1 -race -v
+    expected: pass
+- id: v1732-pr675-tui-gemini-apply-uses-agent-skills
+  added: '2026-04-19'
+  task: v1732-pr-675
+  file: internal/ui/skill_dialog_test.go
+  test_name: TestSkillDialog_ApplyUsesAgentSkillsDirForGemini
+  purpose: 'PR #675 — the TUI Apply path must honour the runtime-specific destination: attaching a skill in a Gemini session through the Skills Manager materializes into <project>/.agents/skills/, not <project>/.claude/skills/. Companion to TestSkillRuntime_AttachUsesAgentSkillsDirForGemini on the session-layer side; this is the UI-to-session integration seam.'
+  source: github-pr-675
+  manual: false
+  run:
+    command: go test ./internal/ui/ -run TestSkillDialog_ApplyUsesAgentSkillsDirForGemini -count=1 -race -v
     expected: pass

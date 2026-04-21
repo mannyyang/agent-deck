@@ -13,6 +13,7 @@ const (
 	hotkeyQuickCreate     = "quick_create"
 	hotkeyRename          = "rename"
 	hotkeyRestart         = "restart"
+	hotkeyRestartFresh    = "restart_fresh"
 	hotkeyDelete          = "delete"
 	hotkeyCloseSession    = "close_session"
 	hotkeyUndoDelete      = "undo_delete"
@@ -21,6 +22,7 @@ const (
 	hotkeySkillsManager   = "skills_manager"
 	hotkeyTogglePreview   = "toggle_preview"
 	hotkeyMarkUnread      = "mark_unread"
+	hotkeyQuickApprove    = "quick_approve"
 	hotkeyToggleYolo      = "toggle_yolo"
 	hotkeyQuickFork       = "quick_fork"
 	hotkeyForkWithOptions = "fork_with_options"
@@ -28,6 +30,7 @@ const (
 	hotkeySendOutput      = "send_output"
 	hotkeyExecShell       = "exec_shell"
 	hotkeyEditNotes       = "edit_notes"
+	hotkeyEditPaths       = "edit_paths"
 	hotkeyWorktreeFinish  = "worktree_finish"
 	hotkeyCreateGroup     = "create_group"
 	hotkeySearch          = "search"
@@ -45,6 +48,7 @@ var hotkeyActionOrder = []string{
 	hotkeyQuickCreate,
 	hotkeyRename,
 	hotkeyRestart,
+	hotkeyRestartFresh,
 	hotkeyDelete,
 	hotkeyCloseSession,
 	hotkeyUndoDelete,
@@ -53,6 +57,7 @@ var hotkeyActionOrder = []string{
 	hotkeySkillsManager,
 	hotkeyTogglePreview,
 	hotkeyMarkUnread,
+	hotkeyQuickApprove,
 	hotkeyToggleYolo,
 	hotkeyQuickFork,
 	hotkeyForkWithOptions,
@@ -60,6 +65,7 @@ var hotkeyActionOrder = []string{
 	hotkeySendOutput,
 	hotkeyExecShell,
 	hotkeyEditNotes,
+	hotkeyEditPaths,
 	hotkeyWorktreeFinish,
 	hotkeyCreateGroup,
 	hotkeySearch,
@@ -77,6 +83,7 @@ var defaultHotkeyBindings = map[string]string{
 	hotkeyQuickCreate:     "N",
 	hotkeyRename:          "r",
 	hotkeyRestart:         "R",
+	hotkeyRestartFresh:    "T",
 	hotkeyDelete:          "d",
 	hotkeyCloseSession:    "D",
 	hotkeyUndoDelete:      "ctrl+z",
@@ -85,6 +92,7 @@ var defaultHotkeyBindings = map[string]string{
 	hotkeySkillsManager:   "s",
 	hotkeyTogglePreview:   "v",
 	hotkeyMarkUnread:      "u",
+	hotkeyQuickApprove:    "a",
 	hotkeyToggleYolo:      "y",
 	hotkeyQuickFork:       "f",
 	hotkeyForkWithOptions: "F",
@@ -92,6 +100,7 @@ var defaultHotkeyBindings = map[string]string{
 	hotkeySendOutput:      "x",
 	hotkeyExecShell:       "E",
 	hotkeyEditNotes:       "e",
+	hotkeyEditPaths:       "p",
 	hotkeyWorktreeFinish:  "W",
 	hotkeyCreateGroup:     "g",
 	hotkeySearch:          "/",

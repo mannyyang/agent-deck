@@ -123,22 +123,111 @@ config_dir = "/tmp/group-loses"
 	}
 }
 
-// TestConductorConfig_PrecedenceEnvBeatsConductor locks CFG-11 test 3:
-// the CLAUDE_CONFIG_DIR env var beats a [conductors.<name>.claude] override.
-func TestConductorConfig_PrecedenceEnvBeatsConductor(t *testing.T) {
+// TestConductorConfig_PrecedenceConductorBeatsEnv codifies the CORRECTED
+// priority (fix-config-dir-priority, 2026-04-17): an explicit
+// [conductors.<name>.claude].config_dir TOML override beats a shell-wide
+// CLAUDE_CONFIG_DIR export.
+//
+// This test REPLACES an earlier TestConductorConfig_PrecedenceEnvBeatsConductor
+// that codified the INCORRECT env-first behavior. That priority was wrong
+// because developer shells often export CLAUDE_CONFIG_DIR via aliases
+// (cdp, cdw) to select a profile, and that export shadowed every explicit
+// per-conductor TOML block the user wrote — making config.toml overrides
+// silently useless. The TOML block is scoped to this conductor; the env
+// var is a shell-wide default. More specific wins.
+func TestConductorConfig_PrecedenceConductorBeatsEnv(t *testing.T) {
 	tmpHome := setupConductorTest(t)
-	_ = os.Setenv("CLAUDE_CONFIG_DIR", "/tmp/env-wins")
+	_ = os.Setenv("CLAUDE_CONFIG_DIR", "/tmp/env-loses")
 	// setupConductorTest's t.Cleanup already restores CLAUDE_CONFIG_DIR.
 
 	writeConductorConfig(t, tmpHome, `
 [conductors.foo.claude]
-config_dir = "/tmp/conductor-loses"
+config_dir = "/tmp/conductor-wins"
 `)
 
 	inst := NewInstanceWithGroupAndTool("conductor-foo", tmpHome, "conductor", "claude")
 	got := GetClaudeConfigDirForInstance(inst)
+	if got != "/tmp/conductor-wins" {
+		t.Errorf("GetClaudeConfigDirForInstance: conductor TOML must beat env; got=%q want=%q", got, "/tmp/conductor-wins")
+	}
+}
+
+// TestConductorConfig_GroupBeatsEnv codifies the CORRECTED priority for
+// group-level TOML overrides. An explicit [groups."<group>".claude].config_dir
+// beats a shell-wide CLAUDE_CONFIG_DIR export.
+//
+// Regression protection: a user with cdp/cdw aliases that export
+// CLAUDE_CONFIG_DIR must still be able to use [groups.innotrade.claude]
+// to force a different dir for that group's sessions.
+func TestConductorConfig_GroupBeatsEnv(t *testing.T) {
+	tmpHome := setupConductorTest(t)
+	_ = os.Setenv("CLAUDE_CONFIG_DIR", "/tmp/env-loses")
+	writeConductorConfig(t, tmpHome, `
+[groups."innotrade".claude]
+config_dir = "/tmp/group-wins"
+`)
+
+	inst := NewInstanceWithGroupAndTool("some-session", tmpHome, "innotrade", "claude")
+	got := GetClaudeConfigDirForInstance(inst)
+	if got != "/tmp/group-wins" {
+		t.Errorf("GetClaudeConfigDirForInstance: group TOML must beat env; got=%q want=%q", got, "/tmp/group-wins")
+	}
+}
+
+// TestConductorConfig_EnvBeatsProfile locks the remaining correct behavior:
+// env still beats profile. Profile is less specific than env (targets a
+// profile, not a session), so env > profile stays.
+func TestConductorConfig_EnvBeatsProfile(t *testing.T) {
+	tmpHome := setupConductorTest(t)
+	_ = os.Setenv("CLAUDE_CONFIG_DIR", "/tmp/env-wins")
+	_ = os.Setenv("AGENTDECK_PROFILE", "personal")
+	writeConductorConfig(t, tmpHome, `
+[profiles.personal.claude]
+config_dir = "/tmp/profile-loses"
+`)
+
+	inst := NewInstanceWithGroupAndTool("plain", tmpHome, "", "claude")
+	got := GetClaudeConfigDirForInstance(inst)
 	if got != "/tmp/env-wins" {
-		t.Errorf("GetClaudeConfigDirForInstance with CLAUDE_CONFIG_DIR set = %q, want %q", got, "/tmp/env-wins")
+		t.Errorf("GetClaudeConfigDirForInstance: env must beat profile; got=%q want=%q", got, "/tmp/env-wins")
+	}
+}
+
+// TestConductorConfig_EnvBeatsGlobal locks env > [claude] global fallback.
+// Global is shell-wide too, but less intentional than CLAUDE_CONFIG_DIR.
+func TestConductorConfig_EnvBeatsGlobal(t *testing.T) {
+	tmpHome := setupConductorTest(t)
+	_ = os.Setenv("CLAUDE_CONFIG_DIR", "/tmp/env-wins")
+	writeConductorConfig(t, tmpHome, `
+[claude]
+config_dir = "/tmp/global-loses"
+`)
+
+	inst := NewInstanceWithGroupAndTool("plain", tmpHome, "", "claude")
+	got := GetClaudeConfigDirForInstance(inst)
+	if got != "/tmp/env-wins" {
+		t.Errorf("GetClaudeConfigDirForInstance: env must beat global; got=%q want=%q", got, "/tmp/env-wins")
+	}
+}
+
+// TestConductorConfig_SourceLabelGroupWhenGroupBeatsEnv mirrors the
+// priority swap into the (path, source) getter. With group set AND env
+// set, source must be "group", not "env".
+func TestConductorConfig_SourceLabelGroupWhenGroupBeatsEnv(t *testing.T) {
+	tmpHome := setupConductorTest(t)
+	_ = os.Setenv("CLAUDE_CONFIG_DIR", "/tmp/env-value")
+	writeConductorConfig(t, tmpHome, `
+[groups."innotrade".claude]
+config_dir = "/tmp/group-value"
+`)
+
+	inst := NewInstanceWithGroupAndTool("some-session", tmpHome, "innotrade", "claude")
+	path, source := GetClaudeConfigDirSourceForInstance(inst)
+	if source != "group" {
+		t.Errorf("source label = %q, want %q (group beats env)", source, "group")
+	}
+	if path != "/tmp/group-value" {
+		t.Errorf("path = %q, want %q", path, "/tmp/group-value")
 	}
 }
 
@@ -294,5 +383,104 @@ config_dir = "/tmp/group-for-non-conductor"
 	}
 	if gpath != "/tmp/group-for-non-conductor" {
 		t.Errorf("non-conductor Instance path = %q, want %q", gpath, "/tmp/group-for-non-conductor")
+	}
+}
+
+// TestSessionHasConversationData_RespectsPerInstanceConfigDir pins the bug
+// that v1.7.7 fixes: sessionHasConversationData must consult the PER-INSTANCE
+// Claude config dir (derived from [conductors.<name>.claude].config_dir and
+// friends), not the process-wide GetClaudeConfigDir(). Before the fix, a
+// conductor with a config_dir override would fail to detect its own JSONL
+// history on restart, causing buildClaudeResumeCommand to emit --session-id
+// (which Claude rejects as already-in-use), and the pane would crash.
+//
+// Data-flow covered: GetClaudeConfigDirForInstance → sessionHasConversationData
+// → buildClaudeResumeCommand. This test pins the FIRST hop; Test 2 below
+// pins the second.
+func TestSessionHasConversationData_RespectsPerInstanceConfigDir(t *testing.T) {
+	tmpHome := setupConductorTest(t)
+
+	// Conductor config dir override — this is the scenario that broke on
+	// 2026-04-17: [conductors.innotrade.claude].config_dir = "~/.claude-work".
+	altConfigDir := filepath.Join(tmpHome, ".claude-work")
+	writeConductorConfig(t, tmpHome, fmt.Sprintf(`
+[conductors.foo.claude]
+config_dir = %q
+`, altConfigDir))
+
+	// Seed a JSONL with "sessionId" under the PER-INSTANCE config dir only.
+	// If the lookup falls back to GetClaudeConfigDir() (global ~/.claude),
+	// it won't find anything (tmpHome/.claude doesn't exist) and returns false.
+	projectPath := filepath.Join(tmpHome, "project")
+	if err := os.MkdirAll(projectPath, 0o755); err != nil {
+		t.Fatalf("mkdir project: %v", err)
+	}
+	encoded := ConvertToClaudeDirName(projectPath)
+	projectsDir := filepath.Join(altConfigDir, "projects", encoded)
+	if err := os.MkdirAll(projectsDir, 0o755); err != nil {
+		t.Fatalf("mkdir projects dir: %v", err)
+	}
+	sessionID := "d4bdd524-210c-47f9-a505-9bc49969e278"
+	jsonl := filepath.Join(projectsDir, sessionID+".jsonl")
+	body := `{"type":"user","sessionId":"` + sessionID + `","text":"hi"}` + "\n"
+	if err := os.WriteFile(jsonl, []byte(body), 0o600); err != nil {
+		t.Fatalf("write jsonl: %v", err)
+	}
+
+	inst := NewInstanceWithGroupAndTool("conductor-foo", projectPath, "conductor", "claude")
+
+	// Sanity check: priority chain resolves to the override.
+	if got := GetClaudeConfigDirForInstance(inst); got != altConfigDir {
+		t.Fatalf("precondition failed: GetClaudeConfigDirForInstance = %q, want %q", got, altConfigDir)
+	}
+
+	if !sessionHasConversationData(inst, sessionID) {
+		t.Errorf("sessionHasConversationData(inst, %q) = false; want true — per-instance config_dir %q has live JSONL at %q",
+			sessionID, altConfigDir, jsonl)
+	}
+}
+
+// TestBuildClaudeResumeCommand_UsesResumeWhenPerInstanceHistoryExists is the
+// integration-ish pin for the FULL data-flow: JSONL exists only under the
+// per-instance config dir, and buildClaudeResumeCommand must choose --resume,
+// not --session-id. Before the fix, the command contained --session-id, which
+// Claude rejects with "Error: Session ID is already in use" and the tmux pane
+// dies.
+func TestBuildClaudeResumeCommand_UsesResumeWhenPerInstanceHistoryExists(t *testing.T) {
+	tmpHome := setupConductorTest(t)
+	altConfigDir := filepath.Join(tmpHome, ".claude-work")
+	writeConductorConfig(t, tmpHome, fmt.Sprintf(`
+[conductors.foo.claude]
+config_dir = %q
+`, altConfigDir))
+
+	projectPath := filepath.Join(tmpHome, "project")
+	if err := os.MkdirAll(projectPath, 0o755); err != nil {
+		t.Fatalf("mkdir project: %v", err)
+	}
+	encoded := ConvertToClaudeDirName(projectPath)
+	projectsDir := filepath.Join(altConfigDir, "projects", encoded)
+	if err := os.MkdirAll(projectsDir, 0o755); err != nil {
+		t.Fatalf("mkdir projects dir: %v", err)
+	}
+	sessionID := "d4bdd524-210c-47f9-a505-9bc49969e278"
+	jsonl := filepath.Join(projectsDir, sessionID+".jsonl")
+	body := `{"type":"user","sessionId":"` + sessionID + `","text":"hi"}` + "\n"
+	if err := os.WriteFile(jsonl, []byte(body), 0o600); err != nil {
+		t.Fatalf("write jsonl: %v", err)
+	}
+
+	inst := NewInstanceWithGroupAndTool("conductor-foo", projectPath, "conductor", "claude")
+	inst.ClaudeSessionID = sessionID
+
+	cmd := inst.buildClaudeResumeCommand()
+
+	resumeFlag := "--resume " + sessionID
+	sessionIDFlag := "--session-id " + sessionID
+	if !strings.Contains(cmd, resumeFlag) {
+		t.Errorf("buildClaudeResumeCommand missing %q; got %q", resumeFlag, cmd)
+	}
+	if strings.Contains(cmd, sessionIDFlag) {
+		t.Errorf("buildClaudeResumeCommand must NOT contain %q when history exists at per-instance config_dir; got %q", sessionIDFlag, cmd)
 	}
 }

@@ -5,6 +5,9 @@ import (
 	"fmt"
 	"io"
 	"testing"
+	"time"
+
+	"github.com/asheshgoplani/agent-deck/internal/termreply"
 )
 
 type chunkedReader struct {
@@ -377,11 +380,11 @@ func TestCSIuReaderModifyOtherKeysMixed(t *testing.T) {
 // tea.WithInput(NewCSIuReader(os.Stdin)) wiring.
 func TestCSIuReaderAllShiftHotkeys(t *testing.T) {
 	// Every uppercase hotkey defined in defaultHotkeyBindings:
-	//   N=quick_create, R=restart, D=close_session, M=move_to_group,
+	//   N=quick_create, R=restart, T=restart_fresh, D=close_session, M=move_to_group,
 	//   F=fork_with_options, E=exec_shell, W=worktree_finish, S=settings,
 	//   G=global_search, K=move_up, J=move_down, C=cost_dashboard
 	hotkeys := map[rune]int{
-		'N': 110, 'R': 114, 'D': 100, 'M': 109,
+		'N': 110, 'R': 114, 'T': 116, 'D': 100, 'M': 109,
 		'F': 102, 'E': 101, 'W': 119, 'S': 115,
 		'G': 103, 'K': 107, 'J': 106, 'C': 99,
 	}
@@ -519,6 +522,75 @@ func TestCSIuReaderBuffersSplitModifyOtherKeysSequence(t *testing.T) {
 	}
 }
 
+func TestCSIuReaderDropsTerminalRepliesDuringQuarantine(t *testing.T) {
+	t.Cleanup(termreply.Clear)
+	termreply.QuarantineFor(time.Second)
+
+	tests := []struct {
+		name  string
+		input string
+	}{
+		{
+			name:  "drops OSC color reply",
+			input: "\x1b]11;rgb:d3d3/f5f5/f5f5\x07",
+		},
+		{
+			name:  "drops DCS kitty version reply",
+			input: "\x1bP>|kitty(0.44.0)\x1b\\",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := NewCSIuReader(bytes.NewReader([]byte(tt.input)))
+			out, err := io.ReadAll(r)
+			if err != nil {
+				t.Fatalf("ReadAll error: %v", err)
+			}
+			if string(out) != "" {
+				t.Fatalf("expected terminal reply to be discarded, got %q", string(out))
+			}
+		})
+	}
+}
+
+func TestCSIuReaderDropsSplitTerminalRepliesDuringQuarantine(t *testing.T) {
+	t.Cleanup(termreply.Clear)
+	termreply.QuarantineFor(time.Second)
+
+	r := NewCSIuReader(&chunkedReader{
+		chunks: [][]byte{
+			[]byte("\x1bP>|kitty"),
+			[]byte("(0.44.0)\x1b\\"),
+			[]byte("\x1b]11;rgb:d3d3/f5f5"),
+			[]byte("/d3d3/f5f5\x07"),
+			[]byte("j"),
+		},
+	})
+
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("ReadAll error: %v", err)
+	}
+	if string(out) != "j" {
+		t.Fatalf("expected split terminal replies to be discarded, got %q", string(out))
+	}
+}
+
+func TestCSIuReaderPreservesNormalInputDuringQuarantine(t *testing.T) {
+	t.Cleanup(termreply.Clear)
+	termreply.QuarantineFor(time.Second)
+
+	r := NewCSIuReader(bytes.NewReader([]byte("j\r")))
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("ReadAll error: %v", err)
+	}
+	if string(out) != "j\r" {
+		t.Fatalf("expected normal input to survive quarantine, got %q", string(out))
+	}
+}
+
 func TestCSIuReaderBuffersSplitStandardCSISequence(t *testing.T) {
 	r := NewCSIuReader(&chunkedReader{
 		chunks: [][]byte{
@@ -582,5 +654,30 @@ func TestCSIuReader_Underscore(t *testing.T) {
 	}
 	if string(out) != "_" {
 		t.Errorf("CSIuReader translated %q to %q, want %q", input, string(out), "_")
+	}
+}
+
+// TestRestoreLegacyKeyboardCmd verifies that the helper returned by
+// RestoreLegacyKeyboardCmd writes the Kitty pop sequence to the supplied
+// writer and returns a no-op message. This is a regression guard for the
+// tmux re-enter fix from PR #613: if a future refactor drops the
+// DisableKittyKeyboard call from the Update handler, the integration test
+// below fails; if a refactor changes the escape sequence, this test fails.
+func TestRestoreLegacyKeyboardCmd(t *testing.T) {
+	var buf bytes.Buffer
+	cmd := RestoreLegacyKeyboardCmd(&buf)
+	if cmd == nil {
+		t.Fatal("RestoreLegacyKeyboardCmd returned nil")
+	}
+
+	msg := cmd()
+	if msg != nil {
+		t.Errorf("cmd() returned non-nil msg: %v (want nil so the batch step is a side-effect-only no-op)", msg)
+	}
+
+	got := buf.String()
+	want := "\x1b[<u"
+	if got != want {
+		t.Errorf("cmd() wrote %q to writer, want %q (Kitty pop sequence)", got, want)
 	}
 }

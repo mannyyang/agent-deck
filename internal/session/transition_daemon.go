@@ -151,6 +151,14 @@ func (d *TransitionDaemon) syncProfile(profile string) time.Duration {
 		}
 	}
 
+	// Drain any transitions that were deferred in a prior poll because the
+	// target was StatusRunning. This runs before the initialized-guard so
+	// that each invocation (including `notify-daemon --once`) still retries
+	// persisted queue entries. Without this, deferred events are lost
+	// forever: the child's new status ends up in d.lastStatus below, so the
+	// next poll sees waiting→waiting (no transition) and never retries.
+	d.notifier.DrainRetryQueue(profile)
+
 	if !d.initialized[profile] {
 		// Cover fast transitions that completed before we observed a running snapshot.
 		d.emitHookTransitionCandidates(profile, byID, nil, statuses, hookCandidates)
@@ -160,6 +168,7 @@ func (d *TransitionDaemon) syncProfile(profile string) time.Duration {
 	}
 
 	prev := d.lastStatus[profile]
+	notifyEnabled := GetNotificationsSettings().GetTransitionEventsEnabled()
 	for id, to := range statuses {
 		from := normalizeStatusString(prev[id])
 		if !ShouldNotifyTransition(from, to) {
@@ -167,6 +176,9 @@ func (d *TransitionDaemon) syncProfile(profile string) time.Duration {
 		}
 		inst := byID[id]
 		if inst == nil {
+			continue
+		}
+		if !notifyEnabled || inst.NoTransitionNotify {
 			continue
 		}
 		event := TransitionNotificationEvent{
@@ -213,10 +225,24 @@ func (d *TransitionDaemon) shutdown() {
 	if d.hookWatcher != nil {
 		d.hookWatcher.Stop()
 	}
+	// Flush any in-flight async dispatches before closing storage so their
+	// logEvent/logMissed writes aren't lost when the process exits.
+	if d.notifier != nil {
+		d.notifier.Flush()
+	}
 	for _, s := range d.storages {
 		if s != nil {
 			_ = s.Close()
 		}
+	}
+}
+
+// Flush exposes the notifier's in-flight-dispatch wait for callers of
+// SyncOnce that need deterministic log output before returning (e.g., the
+// `agent-deck notify-daemon --once` CLI path).
+func (d *TransitionDaemon) Flush() {
+	if d.notifier != nil {
+		d.notifier.Flush()
 	}
 }
 
@@ -311,9 +337,13 @@ func (d *TransitionDaemon) emitHookTransitionCandidates(
 	if len(candidates) == 0 {
 		return
 	}
+	notifyEnabled := GetNotificationsSettings().GetTransitionEventsEnabled()
 	for id, candidate := range candidates {
 		inst := byID[id]
 		if inst == nil {
+			continue
+		}
+		if !notifyEnabled || inst.NoTransitionNotify {
 			continue
 		}
 
