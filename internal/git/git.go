@@ -30,6 +30,149 @@ func IsGitRepo(dir string) bool {
 	return err == nil
 }
 
+// IsBareRepo returns true if dir itself is a bare git repository. For a linked
+// worktree checkout, this returns false — use IsBareRepoWorktree for that case.
+func IsBareRepo(dir string) bool {
+	cmd := exec.Command("git", "-C", dir, "rev-parse", "--is-bare-repository")
+	output, err := cmd.Output()
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(string(output)) == "true"
+}
+
+// IsBareRepoWorktree returns true if dir is a linked worktree whose shared
+// git-common-dir is itself a bare repository — the ".bare/" pattern from
+// issue #715. In this layout there is no "main" worktree; every linked
+// worktree is equal.
+func IsBareRepoWorktree(dir string) bool {
+	commonDir, err := gitCommonDirAbs(dir)
+	if err != nil {
+		return false
+	}
+	return IsBareRepo(commonDir)
+}
+
+// gitCommonDirAbs returns the absolute path reported by
+// `git rev-parse --git-common-dir`, resolving any relative path against dir.
+func gitCommonDirAbs(dir string) (string, error) {
+	cmd := exec.Command("git", "-C", dir, "rev-parse", "--git-common-dir")
+	output, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	commonDir := strings.TrimSpace(string(output))
+	if !filepath.IsAbs(commonDir) {
+		commonDir = filepath.Clean(filepath.Join(dir, commonDir))
+	}
+	return commonDir, nil
+}
+
+// resolveWorktreeToToplevel returns the actual working tree for path via
+// `git rev-parse --show-toplevel`. No-op for a regular working tree; for a
+// submodule's gitdir (which `git worktree list --porcelain` reports as the
+// worktree path for the main checkout) it returns the real working tree.
+// Falls back to path on any git failure.
+func resolveWorktreeToToplevel(path string) string {
+	cmd := exec.Command("git", "-C", path, "rev-parse", "--show-toplevel")
+	out, err := cmd.Output()
+	if err != nil {
+		return path
+	}
+	top := strings.TrimSpace(string(out))
+	if top == "" {
+		return path
+	}
+	return top
+}
+
+// isGitDir reports whether dir is a git directory (bare repo, a .git folder,
+// .git/modules/<sub>, .git/worktrees/<wt>) rather than a real working tree.
+// Used as a deletion-safety check before os.RemoveAll.
+//
+// Detection is path-structural plus IsBareRepo. `git rev-parse --show-toplevel`
+// is unusable here: it errors out from inside .git/ and .git/worktrees/ (no
+// working tree), AND it returns false-negative for a submodule gitdir under
+// .git/modules/ (because that gitdir's core.worktree config makes git treat
+// the submodule's working tree as the toplevel). Both classes are caught
+// structurally instead.
+//
+// Non-git paths and orphaned worktree directories at user-chosen locations
+// (the case exercised by TestRemoveWorktree's force-fallback path) are NOT
+// flagged — they are legitimate os.RemoveAll targets.
+func isGitDir(dir string) bool {
+	if IsBareRepo(dir) {
+		return true
+	}
+	clean := filepath.Clean(dir)
+	if filepath.Base(clean) == ".git" {
+		return true
+	}
+	parts := strings.Split(clean, string(filepath.Separator))
+	for i := 0; i+1 < len(parts); i++ {
+		if parts[i] == ".git" && (parts[i+1] == "modules" || parts[i+1] == "worktrees") {
+			return true
+		}
+	}
+	return false
+}
+
+// findNestedBareRepo returns the path to a bare git repository nested under
+// dir, if one exists. The conventional layout from issue #715 places it at
+// "<projectRoot>/.bare"; this helper first probes that path, then scans
+// direct children as a fallback so alternative names still work.
+func findNestedBareRepo(dir string) string {
+	info, err := os.Stat(dir)
+	if err != nil || !info.IsDir() {
+		return ""
+	}
+	conventional := filepath.Join(dir, ".bare")
+	if IsBareRepo(conventional) {
+		return conventional
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return ""
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		candidate := filepath.Join(dir, e.Name())
+		if IsBareRepo(candidate) {
+			return candidate
+		}
+	}
+	return ""
+}
+
+// resolveGitInvocationDir returns a directory suitable for `git -C <dir>`
+// invocations. If dir is itself a git dir (worktree, main repo, or bare repo),
+// it is returned unchanged. If dir is a bare-repo project root — i.e. not a
+// git dir but contains a nested bare repo — the path to that bare repo is
+// returned. Callers can pass the project root transparently.
+func resolveGitInvocationDir(dir string) string {
+	if IsGitRepo(dir) {
+		return dir
+	}
+	if bare := findNestedBareRepo(dir); bare != "" {
+		return bare
+	}
+	return dir
+}
+
+// IsGitRepoOrBareProjectRoot returns true if dir is either a regular git
+// directory (normal repo, linked worktree, or a bare repo) or the project
+// root of a bare-repo layout (contains a nested bare repo such as .bare/).
+// Callers that need to validate "is this a path agent-deck can launch a
+// session from?" should prefer this over IsGitRepo.
+func IsGitRepoOrBareProjectRoot(dir string) bool {
+	if IsGitRepo(dir) {
+		return true
+	}
+	return findNestedBareRepo(dir) != ""
+}
+
 // GetRepoRoot returns the root directory of the git repository containing dir
 func GetRepoRoot(dir string) (string, error) {
 	cmd := exec.Command("git", "-C", dir, "rev-parse", "--show-toplevel")
@@ -52,12 +195,14 @@ func GetCurrentBranch(dir string) (string, error) {
 
 // BranchExists checks if a branch exists in the repository
 func BranchExists(repoDir, branchName string) bool {
+	repoDir = resolveGitInvocationDir(repoDir)
 	cmd := exec.Command("git", "-C", repoDir, "show-ref", "--verify", "--quiet", "refs/heads/"+branchName)
 	err := cmd.Run()
 	return err == nil
 }
 
 func remoteBranchExists(repoDir, remoteName, branchName string) bool {
+	repoDir = resolveGitInvocationDir(repoDir)
 	cmd := exec.Command("git", "-C", repoDir, "show-ref", "--verify", "--quiet", "refs/remotes/"+remoteName+"/"+branchName)
 	err := cmd.Run()
 	return err == nil
@@ -167,6 +312,10 @@ func CreateWorktree(repoDir, worktreePath, branchName string) error {
 		return fmt.Errorf("invalid branch name: %w", err)
 	}
 
+	// Transparently resolve a bare-repo project root (no .git, but contains
+	// a nested bare repo like .bare/) to the underlying git dir.
+	repoDir = resolveGitInvocationDir(repoDir)
+
 	// Check if it's a git repo
 	if !IsGitRepo(repoDir) {
 		return errors.New("not a git repository")
@@ -201,6 +350,7 @@ func CreateWorktree(repoDir, worktreePath, branchName string) error {
 
 // ListWorktrees returns all worktrees for the repository at repoDir
 func ListWorktrees(repoDir string) ([]Worktree, error) {
+	repoDir = resolveGitInvocationDir(repoDir)
 	if !IsGitRepo(repoDir) {
 		return nil, errors.New("not a git repository")
 	}
@@ -254,6 +404,14 @@ func parseWorktreeList(output string) []Worktree {
 		worktrees = append(worktrees, current)
 	}
 
+	// `git worktree list --porcelain` reports the gitdir (not the working
+	// tree) for a plain submodule's main checkout — normalize it back.
+	for i := range worktrees {
+		if !worktrees[i].Bare {
+			worktrees[i].Path = resolveWorktreeToToplevel(worktrees[i].Path)
+		}
+	}
+
 	return worktrees
 }
 
@@ -263,6 +421,7 @@ func parseWorktreeList(output string) []Worktree {
 // untracked files like node_modules), falls back to removing the directory
 // directly and pruning stale worktree references.
 func RemoveWorktree(repoDir, worktreePath string, force bool) error {
+	repoDir = resolveGitInvocationDir(repoDir)
 	if !IsGitRepo(repoDir) {
 		return errors.New("not a git repository")
 	}
@@ -282,6 +441,14 @@ func RemoveWorktree(repoDir, worktreePath string, force bool) error {
 		// Force mode: git worktree remove --force can still fail when the
 		// directory contains untracked content. Fall back to deleting the
 		// directory and pruning the stale worktree reference.
+		//
+		// Refuse if the path is a git directory (bare repo, .git/modules/<sub>,
+		// .git/worktrees/<wt>). A pre-fix bug stored a submodule gitdir as
+		// WorktreePath; without this guard, session deletion destroyed the
+		// submodule's git history.
+		if isGitDir(worktreePath) {
+			return fmt.Errorf("refusing to remove %q: path is a git directory, not a working tree (likely a stale session row from before the submodule path-normalization fix)", worktreePath)
+		}
 		if rmErr := os.RemoveAll(worktreePath); rmErr != nil {
 			return fmt.Errorf("failed to remove worktree directory: %w (git error: %s)", rmErr, strings.TrimSpace(string(output)))
 		}
@@ -329,40 +496,64 @@ func IsWorktree(dir string) bool {
 	return commonDir != gitDir && commonDir != "."
 }
 
-// GetMainWorktreePath returns the path to the main worktree (original clone)
+// GetMainWorktreePath returns the path to the "project root" — the directory
+// that hosts shared config like .agent-deck/.
+//
+//   - Normal repo: the repo root (parent of .git/).
+//   - Linked worktree of a normal repo: the main worktree (parent of .git/).
+//   - Bare-repo layout (issue #715): the parent of .bare/. In this layout
+//     there is no "main" worktree; every linked worktree is equal, and
+//     shared config lives next to .bare/ in the project root.
 func GetMainWorktreePath(dir string) (string, error) {
-	cmd := exec.Command("git", "-C", dir, "rev-parse", "--git-common-dir")
-	output, err := cmd.Output()
+	commonDir, err := gitCommonDirAbs(dir)
 	if err != nil {
 		return "", fmt.Errorf("failed to get common git dir: %w", err)
 	}
 
-	commonDir := strings.TrimSpace(string(output))
-
-	// --git-common-dir may return a relative path; resolve it relative to dir
-	if !filepath.IsAbs(commonDir) {
-		commonDir = filepath.Clean(filepath.Join(dir, commonDir))
+	// Bare-repo layout: common-dir IS the bare repo (e.g. "/project/.bare").
+	// Project root is the parent directory.
+	if IsBareRepo(commonDir) {
+		return filepath.Dir(commonDir), nil
 	}
 
-	// For worktrees, common-dir points to the main repo's .git directory
-	// We need to get the parent of that
+	// Normal worktree: common-dir ends in .git; strip it to get the main worktree root.
 	if strings.HasSuffix(commonDir, ".git") {
 		return strings.TrimSuffix(commonDir, string(filepath.Separator)+".git"), nil
 	}
 
-	// If already in main repo, just get toplevel
+	// Already in the main repo.
 	return GetRepoRoot(dir)
 }
 
-// GetWorktreeBaseRoot returns the root of the main repository, resolving through
-// worktrees if necessary. When called from a normal repo, it behaves identically
-// to GetRepoRoot. When called from within a worktree, it follows --git-common-dir
-// back to the main repo root, preventing worktree nesting.
+// GetWorktreeBaseRoot returns the "project root" suitable for locating shared
+// config (.agent-deck/, setup scripts, etc.). Accepts:
+//
+//   - A normal repo dir → repo root.
+//   - A linked worktree → the main worktree (or, for bare-repo layouts, the
+//     parent of .bare/).
+//   - A bare-repo project root (no .git but contains a nested bare repo) →
+//     the project root itself.
+//
+// This guarantees that downstream .agent-deck/ lookups resolve to a single
+// stable location regardless of which worktree (or the project root) the
+// caller started from.
 func GetWorktreeBaseRoot(dir string) (string, error) {
-	if IsWorktree(dir) {
-		return GetMainWorktreePath(dir)
+	if IsGitRepo(dir) {
+		if IsWorktree(dir) {
+			return GetMainWorktreePath(dir)
+		}
+		// For a plain bare repo (no linked worktree context), the project
+		// root is the parent dir if the bare repo is nested as .bare/.
+		if IsBareRepo(dir) && filepath.Base(dir) == ".bare" {
+			return filepath.Dir(dir), nil
+		}
+		return GetRepoRoot(dir)
 	}
-	return GetRepoRoot(dir)
+	// Not a git dir itself — might be a project root with a nested bare repo.
+	if bare := findNestedBareRepo(dir); bare != "" {
+		return GetMainWorktreePath(bare)
+	}
+	return "", fmt.Errorf("not a git repository: %s", dir)
 }
 
 // SanitizeBranchName converts a string to a valid branch name
@@ -500,6 +691,7 @@ func listRefShortNames(repoDir string, refs ...string) ([]string, error) {
 // ListBranchCandidates returns unique branch names from local branches and the
 // default remote, normalized to plain branch names without a remote prefix.
 func ListBranchCandidates(repoDir string) ([]string, error) {
+	repoDir = resolveGitInvocationDir(repoDir)
 	if !IsGitRepo(repoDir) {
 		return nil, errors.New("not a git repository")
 	}

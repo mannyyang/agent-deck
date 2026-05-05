@@ -63,3 +63,13 @@ __pycache__/
 .venv/
 
 /dist
+
+# Python bytecode (scripts/watchdog/ + conductor/tests/)
+__pycache__/
+*.pyc
+
+# Claude harness lock (per-session, never committed)
+.claude/scheduled_tasks.lock
+
+# Internal planning / scratch (design docs, phase plans) — private to maintainer host
+.planning/

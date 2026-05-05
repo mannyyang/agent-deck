@@ -3,6 +3,7 @@ package ui
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -54,8 +55,8 @@ func TestDialogSetSize(t *testing.T) {
 func TestDialogPresetCommands(t *testing.T) {
 	d := NewNewDialog()
 
-	// Should have shell (empty), claude, gemini, opencode, codex, pi
-	expectedCommands := []string{"", "claude", "gemini", "opencode", "codex", "pi"}
+	// Should have shell (empty), claude, gemini, opencode, codex, pi, copilot
+	expectedCommands := []string{"", "claude", "gemini", "opencode", "codex", "pi", "copilot"}
 
 	if len(d.presetCommands) != len(expectedCommands) {
 		t.Errorf("Expected %d preset commands, got %d", len(expectedCommands), len(d.presetCommands))
@@ -286,16 +287,19 @@ func TestNewDialog_TabAppliesSuggestionWhenNavigated(t *testing.T) {
 	d.focusIndex = 2
 	d.updateFocus()
 
-	// User types something, then navigates to suggestion with Ctrl+N
+	// User types something, then navigates to suggestion with Ctrl+N.
+	// Cursor convention: 0 = "Type custom path…" (synthetic), 1 = first
+	// real suggestion, 2 = second. Two presses lands on the second.
 	d.pathInput.SetValue("/some/partial")
 	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyCtrlN})
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyCtrlN})
 
-	// Now Tab should apply the suggestion
+	// Now Tab should apply the selected suggestion
 	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyTab})
 
 	_, path, _ := d.GetValues()
 
-	// Should be the second suggestion (Ctrl+N moved from 0 to 1)
+	// Should be the second suggestion (cursor 0 → 1 → 2 = suggestions[1])
 	if path != "/Users/test/project-2" {
 		t.Errorf(
 			"Tab should apply suggestion after Ctrl+N navigation\nGot: %q\nWant: %q",
@@ -1498,5 +1502,158 @@ func TestNewDialog_PathInput_AcceptsUnderscore(t *testing.T) {
 
 	if !strings.Contains(updated.pathInput.Value(), "_") {
 		t.Errorf("pathInput.Value() = %q after typing '_', want value to contain '_'", updated.pathInput.Value())
+	}
+}
+
+// TestNewDialog_View_ShowsStartQueryField_WhenClaudeSelected asserts the
+// v1.7.67 "Start query" input renders in the claude-options panel when
+// the claude preset is selected. The field is the dedicated entry point
+// for claude-code's positional startup-query argument, replacing the
+// extra-args misuse documented in @Clindbergh's GH #725 report.
+func TestNewDialog_View_ShowsStartQueryField_WhenClaudeSelected(t *testing.T) {
+	dialog := NewNewDialog()
+	dialog.SetSize(100, 50)
+	dialog.Show()
+	// commandCursor = 1 selects "claude" (see buildPresetCommands order).
+	dialog.commandCursor = 1
+	dialog.updateToolOptions()
+
+	view := dialog.View()
+
+	if !strings.Contains(view, "Start query") {
+		t.Errorf(
+			"View should contain 'Start query' label when claude is "+
+				"selected; without this label the user has no discoverable "+
+				"way to pass a per-session startup query. got:\n%s",
+			view,
+		)
+	}
+}
+
+// TestNewDialog_GetClaudeStartQuery_ReturnsInputValue asserts the
+// accessor returns the raw input string (multi-word, un-split). This is
+// the value the launch code path assigns to Instance.StartupQuery; if it
+// split on spaces here (as extra-args does via strings.Fields), the
+// bug @Clindbergh reported would reappear.
+func TestNewDialog_GetClaudeStartQuery_ReturnsInputValue(t *testing.T) {
+	dialog := NewNewDialog()
+	dialog.Show()
+	dialog.commandCursor = 1 // claude
+	dialog.updateToolOptions()
+
+	// Use reflection to drive the test even before GetClaudeStartQuery exists.
+	dv := reflect.ValueOf(dialog)
+	method := dv.MethodByName("GetClaudeStartQuery")
+	if !method.IsValid() {
+		t.Fatalf(
+			"NewDialog.GetClaudeStartQuery() does not exist; add it in " +
+				"internal/ui/newdialog.go next to GetClaudeExtraArgs. It " +
+				"must return string (NOT []string — the query is a single " +
+				"positional arg, never split on spaces).",
+		)
+	}
+
+	// Drive the underlying input through ClaudeOptionsPanel.SetStartQuery
+	// or direct field access; use reflection to stay compile-safe.
+	panelMethod := reflect.ValueOf(dialog.claudeOptions).MethodByName("SetStartQuery")
+	if !panelMethod.IsValid() {
+		t.Fatalf(
+			"ClaudeOptionsPanel.SetStartQuery(string) does not exist; " +
+				"add it next to SetExtraArgs in internal/ui/claudeoptions.go.",
+		)
+	}
+	panelMethod.Call([]reflect.Value{reflect.ValueOf("explain the codebase")})
+
+	out := method.Call(nil)
+	if len(out) != 1 || out[0].Kind() != reflect.String {
+		t.Fatalf("GetClaudeStartQuery must return (string); got %v", out)
+	}
+	got := out[0].String()
+	if got != "explain the codebase" {
+		t.Errorf(
+			"GetClaudeStartQuery() = %q, want %q (exact string, no space-split)",
+			got, "explain the codebase",
+		)
+	}
+}
+
+func TestNewDialog_ShowInGroup_LoadsConfiguredClaudeExtraArgs(t *testing.T) {
+	origHome := os.Getenv("HOME")
+	tmpHome := t.TempDir()
+	os.Setenv("HOME", tmpHome)
+	session.ClearUserConfigCache()
+	defer func() {
+		os.Setenv("HOME", origHome)
+		session.ClearUserConfigCache()
+	}()
+
+	if err := session.SaveUserConfig(&session.UserConfig{
+		Claude: session.ClaudeSettings{
+			ExtraArgs:       []string{"--agent", "reviewer", "--model", "opus"},
+			UseChrome:       true,
+			UseTeammateMode: true,
+		},
+	}); err != nil {
+		t.Fatalf("SaveUserConfig: %v", err)
+	}
+
+	dialog := NewNewDialog()
+	dialog.SetDefaultTool("claude")
+	dialog.ShowInGroup("default", "default", "", nil, "")
+
+	got := dialog.GetClaudeExtraArgs()
+	want := []string{"--agent", "reviewer", "--model", "opus"}
+	if len(got) != len(want) {
+		t.Fatalf("GetClaudeExtraArgs() = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("GetClaudeExtraArgs()[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+	opts := dialog.GetClaudeOptions()
+	if opts == nil {
+		t.Fatal("GetClaudeOptions() = nil")
+	}
+	if !opts.UseChrome {
+		t.Fatal("GetClaudeOptions().UseChrome = false, want true")
+	}
+	if !opts.UseTeammateMode {
+		t.Fatal("GetClaudeOptions().UseTeammateMode = false, want true")
+	}
+}
+
+// TestNewDialog_StartQuery_ClearsBetweenOpenings is the RED regression for
+// #741 (@Clindbergh). Filed against v1.7.67 after #725 shipped the dedicated
+// "Start query" field: opening the new-session dialog a second time showed
+// the previous invocation's query instead of an empty field. The backend is
+// correct (Instance.StartupQuery is `json:"-"` so SQLite doesn't persist it);
+// the leak is purely at the TUI layer — ShowInGroup clears nameInput,
+// pathInput, branchInput, etc. but never resets claudeOptions.startQueryInput.
+// This test opens the dialog, sets a query, closes, re-opens, and asserts
+// the field is empty.
+func TestNewDialog_StartQuery_ClearsBetweenOpenings(t *testing.T) {
+	dialog := NewNewDialog()
+	dialog.Show()
+	dialog.commandCursor = 1 // claude
+	dialog.updateToolOptions()
+
+	dialog.claudeOptions.SetStartQuery("explain this repo")
+	if got := dialog.GetClaudeStartQuery(); got != "explain this repo" {
+		t.Fatalf("precondition: GetClaudeStartQuery() = %q, want %q", got, "explain this repo")
+	}
+
+	dialog.Hide()
+	dialog.Show()
+	dialog.commandCursor = 1
+	dialog.updateToolOptions()
+
+	if got := dialog.GetClaudeStartQuery(); got != "" {
+		t.Errorf(
+			"Start query must be empty on re-open; got %q. Per-session "+
+				"startup queries are ephemeral (Instance.StartupQuery is "+
+				"json:\"-\") and must not leak between dialog invocations.",
+			got,
+		)
 	}
 }

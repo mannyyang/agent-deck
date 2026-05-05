@@ -1664,3 +1664,311 @@ tests:
   run:
     command: go test ./internal/ui/ -run TestSkillDialog_ApplyUsesAgentSkillsDirForGemini -count=1 -race -v
     expected: pass
+- id: v1757-fix715-isbare-detection
+  added: '2026-04-22'
+  task: fix-715
+  file: internal/git/bare_repo_test.go
+  test_name: TestIsBareRepoWorktree_TrueForLinkedWorktree
+  purpose: 'Issue #715 — IsBareRepoWorktree must return true for every linked worktree of a bare .bare/ layout. This is the single detection point that flips GetMainWorktreePath and GetWorktreeBaseRoot into bare-repo mode; a regression here silently breaks every downstream .agent-deck/ lookup.'
+  source: github-issue-715
+  manual: false
+  run:
+    command: go test ./internal/git/ -run TestIsBareRepoWorktree_TrueForLinkedWorktree -count=1 -race -v
+    expected: pass
+- id: v1757-fix715-main-path-from-bare
+  added: '2026-04-22'
+  task: fix-715
+  file: internal/git/bare_repo_test.go
+  test_name: TestGetMainWorktreePath_BareRepo
+  purpose: 'Issue #715 — GetMainWorktreePath, called from any of the three linked worktrees in a bare layout, must return the project root (parent of .bare/). Before the fix it silently returned the calling worktree path because the TrimSuffix-against-".git" branch never matched. This is the regression guard for the root cause.'
+  source: github-issue-715
+  manual: false
+  run:
+    command: go test ./internal/git/ -run TestGetMainWorktreePath_BareRepo -count=1 -race -v
+    expected: pass
+- id: v1757-fix715-all-worktrees-equal
+  added: '2026-04-22'
+  task: fix-715
+  file: internal/git/bare_repo_test.go
+  test_name: TestBareRepo_AllWorktreesEqual_NoDefaultAssumption
+  purpose: 'Issue #715 — pins the "no default worktree" invariant. GetMainWorktreePath must return the same project root regardless of which linked worktree is queried. Protects against any future refactor that accidentally reintroduces a "first-created worktree wins" or "main-branch worktree is default" assumption.'
+  source: github-issue-715
+  manual: false
+  run:
+    command: go test ./internal/git/ -run TestBareRepo_AllWorktreesEqual_NoDefaultAssumption -count=1 -race -v
+    expected: pass
+- id: v1757-fix715-project-root-agent-deck
+  added: '2026-04-22'
+  task: fix-715
+  file: internal/git/bare_repo_test.go
+  test_name: TestCreateWorktreeWithSetup_BareRepo
+  purpose: 'Issue #715 — end-to-end: CreateWorktreeWithSetup on a bare-repo project root must create the worktree via the nested .bare/ AND run the .agent-deck/worktree-setup.sh located next to .bare/, not inside any individual worktree. Mirrors how launch_cmd.go / handleAdd invoke the flow on the live CLI.'
+  source: github-issue-715
+  manual: false
+  run:
+    command: go test ./internal/git/ -run TestCreateWorktreeWithSetup_BareRepo -count=1 -race -v
+    expected: pass
+- id: v1757-fix715-branch-exists-project-root
+  added: '2026-04-22'
+  task: fix-715
+  file: internal/git/bare_repo_test.go
+  test_name: TestBranchExists_FromBareProjectRoot
+  purpose: 'Issue #715 — BranchExists is called in launch_cmd.go with the result of GetWorktreeBaseRoot, which for bare layouts returns the project root (no .git). Without resolveGitInvocationDir this call silently reported every branch as non-existent, breaking the -b / -w flow. Pins the transparent resolution so future callers in the same shape do not reintroduce the drop.'
+  source: github-issue-715
+  manual: false
+  run:
+    command: go test ./internal/git/ -run TestBranchExists_FromBareProjectRoot -count=1 -race -v
+    expected: pass
+- id: v1759-fix45-count-releases-behind
+  added: '2026-04-22'
+  task: fix-45
+  file: internal/update/update_nudge_test.go
+  test_name: TestCountReleasesBehind_Basic
+  purpose: 'Conductor task #45 — CountReleasesBehind must return the number of tags strictly newer than the current version, tolerating v prefixes, clamping to 0 when current is at or ahead of latest. This is the arithmetic backbone for the >5-releases-behind nudge; an off-by-one here would silence the nudge for severely-behind users or spam it for near-current ones.'
+  source: conductor-task-45
+  manual: false
+  run:
+    command: go test ./internal/update/ -run TestCountReleasesBehind_Basic -count=1 -race -v
+    expected: pass
+- id: v1759-fix45-should-nudge-threshold
+  added: '2026-04-22'
+  task: fix-45
+  file: internal/update/update_nudge_test.go
+  test_name: TestShouldNudge_ThresholdIsGreaterThanFive
+  purpose: 'Conductor task #45 — the nudge fires only at >5 releases behind (6+), never at exactly 5 or below. Pins the threshold so a well-meaning refactor that changes > to >= or flips the constant silently does not widen or narrow who sees the nudge.'
+  source: conductor-task-45
+  manual: false
+  run:
+    command: go test ./internal/update/ -run TestShouldNudge_ThresholdIsGreaterThanFive -count=1 -race -v
+    expected: pass
+- id: v1759-fix45-env-skip-network
+  added: '2026-04-22'
+  task: fix-45
+  file: internal/update/update_nudge_test.go
+  test_name: TestCheckForUpdate_EnvSkipsCheckAndReturnsEmpty
+  purpose: 'Conductor task #45 — AGENTDECK_SKIP_UPDATE_CHECK=1 is a hard kill-switch: no network call, no cache read, return empty UpdateInfo. Protects air-gapped / locked-down / CI environments from outbound GitHub probes. Test points apiBaseURL at an httptest server that t.Fatal-s on any hit; a regression that lets the env slip through trips it immediately.'
+  source: conductor-task-45
+  manual: false
+  run:
+    command: go test ./internal/update/ -run TestCheckForUpdate_EnvSkipsCheckAndReturnsEmpty -count=1 -race -v
+    expected: pass
+- id: v1759-fix45-cached-update-info-offline
+  added: '2026-04-22'
+  task: fix-45
+  file: internal/update/update_nudge_test.go
+  test_name: TestCachedUpdateInfo_OfflineReadFromCache
+  purpose: 'Conductor task #45 — CachedUpdateInfo reads the on-disk cache without ever hitting the network. Used by agent-deck --version for the instant annotation. Test covers no-cache-yet (nil, nil), populated cache (Available=true), and user-ahead (Available=false).'
+  source: conductor-task-45
+  manual: false
+  run:
+    command: go test ./internal/update/ -run TestCachedUpdateInfo_OfflineReadFromCache -count=1 -race -v
+    expected: pass
+- id: v1759-fix45-tui-threshold
+  added: '2026-04-22'
+  task: fix-45
+  file: internal/ui/update_nudge_test.go
+  test_name: TestUpdateNudge_ShowsOnlyWhenSixPlusBehind
+  purpose: 'Conductor task #45 — pins the TUI-side nudge gate: Home.shouldRenderUpdateNudge returns true only when updateInfo is populated, Available is true, and ReleasesBehind > NudgeThreshold (5). Catches a regression where the banner height accounting in home.go gets un-gated back to any Available=true.'
+  source: conductor-task-45
+  manual: false
+  run:
+    command: go test ./internal/ui/ -run TestUpdateNudge_ShowsOnlyWhenSixPlusBehind -count=1 -race -v
+    expected: pass
+- id: v1759-fix45-tui-dismiss-key
+  added: '2026-04-22'
+  task: fix-45
+  file: internal/ui/update_nudge_test.go
+  test_name: TestUpdateNudge_DismissKeySuppressesBanner
+  purpose: 'Conductor task #45 — pins the "shift+U dismisses for the session" contract. handleUpdateNudgeDismiss flips updateNudgeDismissed and shouldRenderUpdateNudge returns false thereafter, even if updateInfo still says 30-behind. Protects against a key-handler refactor that drops the dismiss branch.'
+  source: conductor-task-45
+  manual: false
+  run:
+    command: go test ./internal/ui/ -run TestUpdateNudge_DismissKeySuppressesBanner -count=1 -race -v
+    expected: pass
+- id: v1759-fix45-version-annotation
+  added: '2026-04-22'
+  task: fix-45
+  file: cmd/agent-deck/version_nudge_test.go
+  test_name: TestVersionOutput_AppendsUpdateAnnotationWhenBehind
+  purpose: 'Conductor task #45 — agent-deck --version must append " (update available: vA.B.C)" when the disk cache shows the user is behind. Writes to an io.Writer, not os.Stdout, so the assertion is byte-exact. Catches a flag-dispatch refactor that bypasses writeVersionOutput.'
+  source: conductor-task-45
+  manual: false
+  run:
+    command: go test ./cmd/agent-deck/ -run TestVersionOutput_AppendsUpdateAnnotationWhenBehind -count=1 -race -v
+    expected: pass
+- id: v1759-fix45-version-env-skip
+  added: '2026-04-22'
+  task: fix-45
+  file: cmd/agent-deck/version_nudge_test.go
+  test_name: TestVersionOutput_NoAnnotationWhenEnvSkipped
+  purpose: 'Conductor task #45 — AGENTDECK_SKIP_UPDATE_CHECK=1 strips the --version annotation. Users who opt out of update nagging get a clean "Agent Deck vX.Y.Z" line even with a populated cache.'
+  source: conductor-task-45
+  manual: false
+  run:
+    command: go test ./cmd/agent-deck/ -run TestVersionOutput_NoAnnotationWhenEnvSkipped -count=1 -race -v
+    expected: pass
+- id: v1759-fix45-eval-version-annotation
+  added: '2026-04-22'
+  task: fix-45
+  file: tests/eval/session/update_nudge_test.go
+  test_name: TestEval_VersionFlag_ShowsUpdateAnnotationFromCache
+  purpose: 'Conductor task #45 — eval_smoke case: seeds a fake update-cache.json in the sandbox HOME and runs the real agent-deck --version binary. Proves the full flag-dispatch → writeVersionOutput → CachedUpdateInfo path works end-to-end, catching regressions a pure Go unit test would miss (e.g. a main.go refactor that stops routing --version through writeVersionOutput).'
+  source: conductor-task-45
+  manual: false
+  run:
+    command: go test -tags eval_smoke ./tests/eval/session/ -run TestEval_VersionFlag_ShowsUpdateAnnotationFromCache -count=1 -race -v
+    expected: pass
+- id: v1763-watchdog-poller-running-no-restart
+  added: '2026-04-22'
+  task: fix-53-56-watchdog-poller-patrol
+  file: scripts/watchdog/test_watchdog.py
+  test_name: test_poller_running_no_restart
+  purpose: 'v1.7.63 capability A — when a conductor''s bun-telegram poller is alive (TELEGRAM_STATE_DIR present in running process environ), watchdog must NOT issue a session restart. Catches a false-positive regression in check_poller_existence that would thrash healthy sessions.'
+  source: conductor-internal-53-56
+  manual: false
+  run:
+    command: cd scripts/watchdog && python3 -m unittest test_watchdog.TestPollerExistence.test_poller_running_no_restart -v
+    expected: pass
+- id: v1763-watchdog-poller-missing-triggers-restart
+  added: '2026-04-22'
+  task: fix-53-56-watchdog-poller-patrol
+  file: scripts/watchdog/test_watchdog.py
+  test_name: test_poller_missing_triggers_restart
+  purpose: 'v1.7.63 capability A — when a conductor declares the telegram channel but no matching bun-telegram process is running, watchdog MUST fire agent-deck session restart. Pins the core positive case.'
+  source: conductor-internal-53-56
+  manual: false
+  run:
+    command: cd scripts/watchdog && python3 -m unittest test_watchdog.TestPollerExistence.test_poller_missing_triggers_restart -v
+    expected: pass
+- id: v1763-watchdog-poller-dedup-1h
+  added: '2026-04-22'
+  task: fix-53-56-watchdog-poller-patrol
+  file: scripts/watchdog/test_watchdog.py
+  test_name: test_dedup_within_one_hour
+  purpose: 'v1.7.63 capability A — POLLER_RESTART_DEDUP_S (3600s) ceiling: two ticks 30 min apart with the poller still missing must produce only one restart, not two. Guards against restart-thrash on a persistently broken poller.'
+  source: conductor-internal-53-56
+  manual: false
+  run:
+    command: cd scripts/watchdog && python3 -m unittest test_watchdog.TestPollerExistence.test_dedup_within_one_hour -v
+    expected: pass
+- id: v1763-watchdog-poller-dedup-expires
+  added: '2026-04-22'
+  task: fix-53-56-watchdog-poller-patrol
+  file: scripts/watchdog/test_watchdog.py
+  test_name: test_dedup_window_expires_after_one_hour
+  purpose: 'v1.7.63 capability A — after POLLER_RESTART_DEDUP_S elapses, a still-missing poller is eligible for another restart. Guards the complementary case of dedup-1h (prevents dedup from becoming permanent block).'
+  source: conductor-internal-53-56
+  manual: false
+  run:
+    command: cd scripts/watchdog && python3 -m unittest test_watchdog.TestPollerExistence.test_dedup_window_expires_after_one_hour -v
+    expected: pass
+- id: v1763-watchdog-poller-no-telegram-channel-ignored
+  added: '2026-04-22'
+  task: fix-53-56-watchdog-poller-patrol
+  file: scripts/watchdog/test_watchdog.py
+  test_name: test_session_without_telegram_channel_ignored
+  purpose: 'v1.7.63 capability A — sessions without plugin:telegram@claude-plugins-official in channels are NOT subject to poller check. Prevents unnecessary restarts on non-telegram sessions.'
+  source: conductor-internal-53-56
+  manual: false
+  run:
+    command: cd scripts/watchdog && python3 -m unittest test_watchdog.TestPollerExistence.test_session_without_telegram_channel_ignored -v
+    expected: pass
+- id: v1763-watchdog-poller-multi-conductor-partial-miss
+  added: '2026-04-22'
+  task: fix-53-56-watchdog-poller-patrol
+  file: scripts/watchdog/test_watchdog.py
+  test_name: test_multi_conductor_only_missing_ones_restart
+  purpose: 'v1.7.63 capability A — with three conductors configured for telegram and only one poller running, watchdog restarts the other two (and only those two). Pins per-session correctness under mixed state.'
+  source: conductor-internal-53-56
+  manual: false
+  run:
+    command: cd scripts/watchdog && python3 -m unittest test_watchdog.TestPollerExistence.test_multi_conductor_only_missing_ones_restart -v
+    expected: pass
+- id: v1763-watchdog-bun-state-dirs-proc-environ
+  added: '2026-04-22'
+  task: fix-53-56-watchdog-poller-patrol
+  file: scripts/watchdog/test_watchdog.py
+  test_name: test_extracts_from_proc_environ
+  purpose: 'v1.7.63 — bun_telegram_state_dirs() correctly parses /proc/<pid>/environ NUL-separated entries and extracts TELEGRAM_STATE_DIR. Pins the low-level /proc reading contract that capability A depends on.'
+  source: conductor-internal-53-56
+  manual: false
+  run:
+    command: cd scripts/watchdog && python3 -m unittest test_watchdog.TestBunTelegramStateDirs.test_extracts_from_proc_environ -v
+    expected: pass
+- id: v1763-watchdog-waiting-first-observation-no-nudge
+  added: '2026-04-22'
+  task: fix-53-56-watchdog-poller-patrol
+  file: scripts/watchdog/test_watchdog.py
+  test_name: test_first_observation_does_not_nudge
+  purpose: 'v1.7.63 capability B — first time we see a child session in waiting state, tracker is seeded but no nudge is sent. Prevents premature firing on transient waiting states.'
+  source: conductor-internal-53-56
+  manual: false
+  run:
+    command: cd scripts/watchdog && python3 -m unittest test_watchdog.TestWaitingTooLong.test_first_observation_does_not_nudge -v
+    expected: pass
+- id: v1763-watchdog-waiting-over-10min-nudges
+  added: '2026-04-22'
+  task: fix-53-56-watchdog-poller-patrol
+  file: scripts/watchdog/test_watchdog.py
+  test_name: test_waiting_over_10min_unchanged_nudges
+  purpose: 'v1.7.63 capability B — child session waiting > WAITING_PATROL_THRESHOLD_S (600s) with unchanged pane hash triggers a "report status?" nudge. Pins the core positive case.'
+  source: conductor-internal-53-56
+  manual: false
+  run:
+    command: cd scripts/watchdog && python3 -m unittest test_watchdog.TestWaitingTooLong.test_waiting_over_10min_unchanged_nudges -v
+    expected: pass
+- id: v1763-watchdog-waiting-pane-change-resets
+  added: '2026-04-22'
+  task: fix-53-56-watchdog-poller-patrol
+  file: scripts/watchdog/test_watchdog.py
+  test_name: test_pane_changed_resets_timer
+  purpose: 'v1.7.63 capability B — ANY pane-output change resets the waiting timer. Without this a session doing real work but staying in waiting state would get false nudges.'
+  source: conductor-internal-53-56
+  manual: false
+  run:
+    command: cd scripts/watchdog && python3 -m unittest test_watchdog.TestWaitingTooLong.test_pane_changed_resets_timer -v
+    expected: pass
+- id: v1763-watchdog-waiting-dedup-1h
+  added: '2026-04-22'
+  task: fix-53-56-watchdog-poller-patrol
+  file: scripts/watchdog/test_watchdog.py
+  test_name: test_dedup_1h_per_session
+  purpose: 'v1.7.63 capability B — WAITING_PATROL_NUDGE_DEDUP_S (3600s) throttles repeat nudges on the same session. Guards against nudge-thrash on a truly stuck child.'
+  source: conductor-internal-53-56
+  manual: false
+  run:
+    command: cd scripts/watchdog && python3 -m unittest test_watchdog.TestWaitingTooLong.test_dedup_1h_per_session -v
+    expected: pass
+- id: v1763-watchdog-waiting-non-child-ignored
+  added: '2026-04-22'
+  task: fix-53-56-watchdog-poller-patrol
+  file: scripts/watchdog/test_watchdog.py
+  test_name: test_no_nudge_for_non_child
+  purpose: 'v1.7.63 capability B — standalone sessions (parent_session_id empty) are NEVER nudged. Patrol is strictly for child / sub-agent sessions.'
+  source: conductor-internal-53-56
+  manual: false
+  run:
+    command: cd scripts/watchdog && python3 -m unittest test_watchdog.TestWaitingTooLong.test_no_nudge_for_non_child -v
+    expected: pass
+- id: v1763-watchdog-waiting-tracker-cleared
+  added: '2026-04-22'
+  task: fix-53-56-watchdog-poller-patrol
+  file: scripts/watchdog/test_watchdog.py
+  test_name: test_tracker_cleared_when_session_leaves_waiting
+  purpose: 'v1.7.63 capability B — when a session transitions out of waiting, its waiting_tracker entry is evicted. Prevents stale tracker data from firing nudges after the session has moved on.'
+  source: conductor-internal-53-56
+  manual: false
+  run:
+    command: cd scripts/watchdog && python3 -m unittest test_watchdog.TestWaitingTooLong.test_tracker_cleared_when_session_leaves_waiting -v
+    expected: pass
+- id: v1763-watchdog-waiting-live-send
+  added: '2026-04-22'
+  task: fix-53-56-watchdog-poller-patrol
+  file: scripts/watchdog/test_watchdog.py
+  test_name: test_live_mode_invokes_session_send
+  purpose: 'v1.7.63 capability B — in non-dry-run mode, an over-threshold unchanged-pane child triggers an actual agent-deck session send --no-wait call carrying the exact WAITING_PATROL_NUDGE_TEXT. Pins the real-side-effect contract.'
+  source: conductor-internal-53-56
+  manual: false
+  run:
+    command: cd scripts/watchdog && python3 -m unittest test_watchdog.TestWaitingTooLong.test_live_mode_invokes_session_send -v
+    expected: pass

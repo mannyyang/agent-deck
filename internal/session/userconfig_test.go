@@ -466,6 +466,46 @@ func TestSaveUserConfig(t *testing.T) {
 	}
 }
 
+func TestClaudeExtraArgsConfigRoundTrip(t *testing.T) {
+	tempDir := t.TempDir()
+	originalHome := os.Getenv("HOME")
+	os.Setenv("HOME", tempDir)
+	defer os.Setenv("HOME", originalHome)
+	ClearUserConfigCache()
+	defer ClearUserConfigCache()
+
+	config := &UserConfig{
+		Claude: ClaudeSettings{
+			ExtraArgs:       []string{"--agent", "reviewer", "--model", "opus"},
+			UseChrome:       true,
+			UseTeammateMode: true,
+		},
+	}
+	if err := SaveUserConfig(config); err != nil {
+		t.Fatalf("SaveUserConfig failed: %v", err)
+	}
+
+	loaded, err := LoadUserConfig()
+	if err != nil {
+		t.Fatalf("LoadUserConfig failed: %v", err)
+	}
+	want := []string{"--agent", "reviewer", "--model", "opus"}
+	if len(loaded.Claude.ExtraArgs) != len(want) {
+		t.Fatalf("Claude.ExtraArgs = %v, want %v", loaded.Claude.ExtraArgs, want)
+	}
+	for i := range want {
+		if loaded.Claude.ExtraArgs[i] != want[i] {
+			t.Fatalf("Claude.ExtraArgs[%d] = %q, want %q", i, loaded.Claude.ExtraArgs[i], want[i])
+		}
+	}
+	if !loaded.Claude.UseChrome {
+		t.Fatal("Claude.UseChrome = false, want true")
+	}
+	if !loaded.Claude.UseTeammateMode {
+		t.Fatal("Claude.UseTeammateMode = false, want true")
+	}
+}
+
 func TestGetTheme_Default(t *testing.T) {
 	// Setup: use temp directory with no config
 	tempDir := t.TempDir()
@@ -1306,6 +1346,160 @@ inject_status_line = true
 	settings := GetTmuxSettings()
 	if !settings.GetInjectStatusLine() {
 		t.Error("GetInjectStatusLine should be true when set to true")
+	}
+}
+
+func TestGetTerminalSettings_ITermBadge_Default(t *testing.T) {
+	// Default (no config) should return false — opt-in. Most users drive
+	// the iTerm2 badge from their shell prompt, so silently overwriting it
+	// every attach is too presumptuous a default.
+	tempDir := t.TempDir()
+	originalHome := os.Getenv("HOME")
+	os.Setenv("HOME", tempDir)
+	defer os.Setenv("HOME", originalHome)
+	ClearUserConfigCache()
+
+	agentDeckDir := filepath.Join(tempDir, ".agent-deck")
+	_ = os.MkdirAll(agentDeckDir, 0700)
+
+	configPath := filepath.Join(agentDeckDir, "config.toml")
+	if err := os.WriteFile(configPath, []byte(""), 0644); err != nil {
+		t.Fatalf("Failed to write config: %v", err)
+	}
+	ClearUserConfigCache()
+
+	settings := GetTerminalSettings()
+	if settings.GetITermBadge() {
+		t.Error("GetITermBadge should default to false (opt-in) when not set")
+	}
+}
+
+func TestGetTerminalSettings_ITermBadge_False(t *testing.T) {
+	tempDir := t.TempDir()
+	originalHome := os.Getenv("HOME")
+	os.Setenv("HOME", tempDir)
+	defer os.Setenv("HOME", originalHome)
+	ClearUserConfigCache()
+
+	agentDeckDir := filepath.Join(tempDir, ".agent-deck")
+	_ = os.MkdirAll(agentDeckDir, 0700)
+
+	configPath := filepath.Join(agentDeckDir, "config.toml")
+	configContent := `
+[terminal]
+iterm_badge = false
+`
+	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+		t.Fatalf("Failed to write config: %v", err)
+	}
+	ClearUserConfigCache()
+
+	settings := GetTerminalSettings()
+	if settings.GetITermBadge() {
+		t.Error("GetITermBadge should be false when set to false")
+	}
+}
+
+func TestGetTerminalSettings_ITermBadge_True(t *testing.T) {
+	tempDir := t.TempDir()
+	originalHome := os.Getenv("HOME")
+	os.Setenv("HOME", tempDir)
+	defer os.Setenv("HOME", originalHome)
+	ClearUserConfigCache()
+
+	agentDeckDir := filepath.Join(tempDir, ".agent-deck")
+	_ = os.MkdirAll(agentDeckDir, 0700)
+
+	configPath := filepath.Join(agentDeckDir, "config.toml")
+	configContent := `
+[terminal]
+iterm_badge = true
+`
+	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+		t.Fatalf("Failed to write config: %v", err)
+	}
+	ClearUserConfigCache()
+
+	settings := GetTerminalSettings()
+	if !settings.GetITermBadge() {
+		t.Error("GetITermBadge should be true when set to true")
+	}
+}
+
+func TestGetTmuxSettings_Mouse_Default(t *testing.T) {
+	// Default (no config) should return true — preserves pre-#730 behavior
+	tempDir := t.TempDir()
+	originalHome := os.Getenv("HOME")
+	os.Setenv("HOME", tempDir)
+	defer os.Setenv("HOME", originalHome)
+	ClearUserConfigCache()
+
+	agentDeckDir := filepath.Join(tempDir, ".agent-deck")
+	_ = os.MkdirAll(agentDeckDir, 0700)
+
+	configPath := filepath.Join(agentDeckDir, "config.toml")
+	if err := os.WriteFile(configPath, []byte(""), 0644); err != nil {
+		t.Fatalf("Failed to write config: %v", err)
+	}
+	ClearUserConfigCache()
+
+	settings := GetTmuxSettings()
+	if !settings.GetMouse() {
+		t.Error("GetMouse should default to true when not set")
+	}
+}
+
+func TestGetTmuxSettings_Mouse_False(t *testing.T) {
+	// Explicit false disables tmux mouse capture so VS Code Linux terminal
+	// can select text natively (issue #730).
+	tempDir := t.TempDir()
+	originalHome := os.Getenv("HOME")
+	os.Setenv("HOME", tempDir)
+	defer os.Setenv("HOME", originalHome)
+	ClearUserConfigCache()
+
+	agentDeckDir := filepath.Join(tempDir, ".agent-deck")
+	_ = os.MkdirAll(agentDeckDir, 0700)
+
+	configPath := filepath.Join(agentDeckDir, "config.toml")
+	configContent := `
+[tmux]
+mouse = false
+`
+	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+		t.Fatalf("Failed to write config: %v", err)
+	}
+	ClearUserConfigCache()
+
+	settings := GetTmuxSettings()
+	if settings.GetMouse() {
+		t.Error("GetMouse should be false when set to false")
+	}
+}
+
+func TestGetTmuxSettings_Mouse_True(t *testing.T) {
+	tempDir := t.TempDir()
+	originalHome := os.Getenv("HOME")
+	os.Setenv("HOME", tempDir)
+	defer os.Setenv("HOME", originalHome)
+	ClearUserConfigCache()
+
+	agentDeckDir := filepath.Join(tempDir, ".agent-deck")
+	_ = os.MkdirAll(agentDeckDir, 0700)
+
+	configPath := filepath.Join(agentDeckDir, "config.toml")
+	configContent := `
+[tmux]
+mouse = true
+`
+	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+		t.Fatalf("Failed to write config: %v", err)
+	}
+	ClearUserConfigCache()
+
+	settings := GetTmuxSettings()
+	if !settings.GetMouse() {
+		t.Error("GetMouse should be true when set to true")
 	}
 }
 

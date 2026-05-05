@@ -815,10 +815,24 @@ type Session struct {
 	// Default: true (set via SetInjectStatusLine from user config)
 	injectStatusLine bool
 
+	// mouse controls whether tmux `mouse on` is set during session creation
+	// and by EnableMouseMode. When false, tmux never captures mouse events so
+	// the terminal emulator keeps them — fixes VS Code Linux integrated
+	// terminal click-drag selection (issue #730).
+	// Default: true (set via SetMouse from user config)
+	mouse bool
+
 	// clearOnRestart controls whether RespawnPane clears the scrollback buffer.
 	// When false (default), previous session output is preserved.
 	// Set via SetClearOnRestart from user config.
 	clearOnRestart bool
+
+	// terminalChromeEnabled controls whether Attach emits outer-terminal
+	// chrome sequences (currently the iTerm2 badge) on attach/detach.
+	// Default: false (opt-in via [terminal].iterm_badge in user config; set
+	// here through SetTerminalChromeEnabled). AGENTDECK_ITERM_BADGE=0|1
+	// overrides this at runtime in either direction; see chrome.go.
+	terminalChromeEnabled bool
 }
 
 type envCacheEntry struct {
@@ -1199,6 +1213,45 @@ func (s *Session) SetInjectStatusLine(inject bool) {
 	s.injectStatusLine = inject
 }
 
+// SetTerminalChromeEnabled controls whether Attach emits outer-terminal
+// chrome (currently the iTerm2 badge) on attach/detach. Mirrors the
+// SetInjectStatusLine plumbing pattern: callers in internal/session read
+// `[terminal].iterm_badge` from user config and forward it here.
+// AGENTDECK_ITERM_BADGE overrides this at runtime; see chrome.go.
+func (s *Session) SetTerminalChromeEnabled(enabled bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.terminalChromeEnabled = enabled
+}
+
+// terminalChromeIsEnabled is the read-side accessor used by Attach. Locked
+// read so a concurrent Set call cannot publish a torn bool — same shape as
+// the other Session getters.
+func (s *Session) terminalChromeIsEnabled() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.terminalChromeEnabled
+}
+
+// SetMouse controls whether tmux mouse mode is enabled for this session.
+// When false, the inline `mouse on` set-option during Start is skipped AND
+// EnableMouseMode becomes a no-op — required for VS Code Linux integrated
+// terminal click-drag selection (issue #730).
+func (s *Session) SetMouse(enabled bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.mouse = enabled
+}
+
+// GetMouse reports whether tmux mouse mode is currently enabled for this
+// session. Used by tests and by the Start / EnableMouseMode code paths to
+// decide whether to set `mouse on`.
+func (s *Session) GetMouse() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.mouse
+}
+
 // SetClearOnRestart controls whether RespawnPane clears the scrollback buffer.
 // When false (default), previous output is preserved on restart.
 func (s *Session) SetClearOnRestart(clear bool) {
@@ -1233,14 +1286,16 @@ func NewSession(name, workDir string) *Session {
 	// Add unique suffix to prevent name collisions
 	uniqueSuffix := generateShortID()
 	return &Session{
-		Name:             SessionPrefix + sanitized + "_" + uniqueSuffix,
-		DisplayName:      name,
-		WorkDir:          workDir,
-		Created:          time.Now(),
-		startupAt:        time.Now(),
-		lastStableStatus: "waiting",
-		toolDetectExpiry: 30 * time.Second, // Re-detect tool every 30 seconds
-		injectStatusLine: true,             // Default: inject status bar
+		Name:                  SessionPrefix + sanitized + "_" + uniqueSuffix,
+		DisplayName:           name,
+		WorkDir:               workDir,
+		Created:               time.Now(),
+		startupAt:             time.Now(),
+		lastStableStatus:      "waiting",
+		toolDetectExpiry:      30 * time.Second, // Re-detect tool every 30 seconds
+		injectStatusLine:      true,             // Default: inject status bar
+		mouse:                 true,             // Default: mouse on (#730 opt-out)
+		terminalChromeEnabled: false,            // Default: opt-in (set true via [terminal].iterm_badge)
 		// stateTracker and promptDetector will be created lazily on first status check
 	}
 }
@@ -1253,16 +1308,18 @@ func NewSession(name, workDir string) *Session {
 // For lazy loading during TUI startup, use ReconnectSessionLazy instead.
 func ReconnectSession(tmuxName, displayName, workDir, command string) *Session {
 	sess := &Session{
-		Name:             tmuxName,
-		DisplayName:      displayName,
-		WorkDir:          workDir,
-		Command:          command,
-		Created:          time.Now(), // Approximate - we don't persist this
-		startupAt:        time.Time{},
-		lastStableStatus: "waiting",
-		toolDetectExpiry: 30 * time.Second,
-		injectStatusLine: true,  // Default: inject status bar
-		configured:       false, // Will be set to true after configuration
+		Name:                  tmuxName,
+		DisplayName:           displayName,
+		WorkDir:               workDir,
+		Command:               command,
+		Created:               time.Now(), // Approximate - we don't persist this
+		startupAt:             time.Time{},
+		lastStableStatus:      "waiting",
+		toolDetectExpiry:      30 * time.Second,
+		injectStatusLine:      true,  // Default: inject status bar
+		mouse:                 true,  // Default: mouse on (#730 opt-out)
+		terminalChromeEnabled: false, // Default: opt-in (set true via [terminal].iterm_badge)
+		configured:            false, // Will be set to true after configuration
 		// stateTracker and promptDetector will be created lazily on first status check
 	}
 
@@ -1321,16 +1378,18 @@ func ReconnectSessionWithStatus(tmuxName, displayName, workDir, command string, 
 // For sessions that need immediate configuration, use ReconnectSession or ReconnectSessionWithStatus.
 func ReconnectSessionLazy(tmuxName, displayName, workDir, command string, previousStatus string) *Session {
 	sess := &Session{
-		Name:             tmuxName,
-		DisplayName:      displayName,
-		WorkDir:          workDir,
-		Command:          command,
-		Created:          time.Now(), // Approximate - we don't persist this
-		startupAt:        time.Time{},
-		lastStableStatus: "waiting",
-		toolDetectExpiry: 30 * time.Second,
-		injectStatusLine: true,  // Default: inject status bar
-		configured:       false, // Explicitly mark as not configured
+		Name:                  tmuxName,
+		DisplayName:           displayName,
+		WorkDir:               workDir,
+		Command:               command,
+		Created:               time.Now(), // Approximate - we don't persist this
+		startupAt:             time.Time{},
+		lastStableStatus:      "waiting",
+		toolDetectExpiry:      30 * time.Second,
+		injectStatusLine:      true,  // Default: inject status bar
+		mouse:                 true,  // Default: mouse on (#730 opt-out)
+		terminalChromeEnabled: false, // Default: opt-in (set true via [terminal].iterm_badge)
+		configured:            false, // Explicitly mark as not configured
 	}
 
 	// Restore state tracker based on previous status (without running tmux commands)
@@ -1795,13 +1854,33 @@ func (s *Session) Start(command string) error {
 	if _, ok := s.OptionOverrides["window-active-style"]; !ok {
 		startArgs = append(startArgs, "set-option", "-t", s.Name, "window-active-style", themeStyle.windowActiveStyle, ";")
 	}
+	// #730: users opt out of mouse capture via [tmux].mouse = false so
+	// terminals like VS Code Linux can do native click-drag selection.
+	if s.mouse {
+		startArgs = append(startArgs,
+			"set-option", "-t", s.Name, "mouse", "on", ";")
+	}
 	startArgs = append(startArgs,
-		"set-option", "-t", s.Name, "mouse", "on", ";",
 		"set-option", "-t", s.Name, "-q", "allow-passthrough", "on", ";",
 		"set-option", "-t", s.Name, "set-clipboard", "on", ";",
 		"set-option", "-t", s.Name, "escape-time", "10", ";",
 		"set", "-sq", "extended-keys", "on", ";",
 		"set", "-asq", "terminal-features", ",*:hyperlinks:extkeys")
+	// Multi-client size negotiation. Web's xterm.js connects via a tmux -C
+	// control client (controlpipe.go) at the same time as native `tmux attach`
+	// clients (Ghostty, iTerm). Default `window-size latest` makes the window
+	// flip to whichever client most recently sent input, so larger clients see
+	// dot-filled void cells and smaller clients clip. `largest` keeps the
+	// window sized to the biggest client; `aggressive-resize` only resizes
+	// windows that are actively viewed (avoids cross-window resize storms).
+	// See tmux(1) "window-size" / "aggressive-resize" and tmux issue #2594.
+	// Both are gated through OptionOverrides so users can opt out.
+	if _, ok := s.OptionOverrides["window-size"]; !ok {
+		startArgs = append(startArgs, ";", "set-option", "-t", s.Name, "window-size", "largest")
+	}
+	if _, ok := s.OptionOverrides["aggressive-resize"]; !ok {
+		startArgs = append(startArgs, ";", "set-window-option", "-t", s.Name, "aggressive-resize", "on")
+	}
 	_ = s.tmuxCmd(startArgs...).Run()
 
 	// Bind Ctrl+Q to detach at the tmux level as fallback for terminals where
@@ -1883,9 +1962,14 @@ func (s *Session) Start(command string) error {
 // Uses cached session list when available (refreshed by RefreshExistingSessions)
 // Falls back to direct tmux call if cache is stale
 func (s *Session) Exists() bool {
-	// Try cache first (O(1) map lookup, no subprocess)
-	if exists, cacheValid := sessionExistsFromCache(s.Name); cacheValid {
-		return exists
+	// The session cache is populated by RefreshSessionCache against
+	// DefaultSocketName() only — entries describe the default tmux server
+	// alone. Sessions on isolated sockets must skip the cache, otherwise
+	// UpdateStatus would stamp StatusError on every poll for them (#755).
+	if strings.TrimSpace(s.SocketName) == DefaultSocketName() {
+		if exists, cacheValid := sessionExistsFromCache(s.Name); cacheValid {
+			return exists
+		}
 	}
 
 	// If PipeManager has a live control connection, the session definitely exists.
@@ -1895,7 +1979,8 @@ func (s *Session) Exists() bool {
 		}
 	}
 
-	// Cache is stale and no live pipe: fall back to direct tmux check.
+	// Cache is stale (or skipped for an isolated socket): fall back to a
+	// direct tmux check on the session's own socket.
 	cmd := s.tmuxCmd("has-session", "-t", s.Name)
 	return cmd.Run() == nil
 }
@@ -2025,11 +2110,16 @@ func (s *Session) ConfigureStatusBar() {
 // Note: With mouse mode on, hold Shift while selecting to use native terminal selection
 // instead of tmux's selection (useful for copying to system clipboard in some terminals)
 func (s *Session) EnableMouseMode() error {
-	// CRITICAL: Mouse mode must succeed - keep as separate call for error handling
-	// This is the only essential feature; all others are enhancements
-	mouseCmd := s.tmuxCmd("set-option", "-t", s.Name, "mouse", "on")
-	if err := mouseCmd.Run(); err != nil {
-		return err
+	// #730: when the user opted out via [tmux].mouse = false, skip the mouse
+	// set-option entirely so terminals like VS Code Linux keep click-drag
+	// selection. Enhancements below are unaffected.
+	if s.mouse {
+		// CRITICAL: Mouse mode must succeed - keep as separate call for error handling
+		// This is the only essential feature; all others are enhancements
+		mouseCmd := s.tmuxCmd("set-option", "-t", s.Name, "mouse", "on")
+		if err := mouseCmd.Run(); err != nil {
+			return err
+		}
 	}
 
 	// PERFORMANCE: Batch all non-fatal enhancements into single subprocess call

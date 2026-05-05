@@ -21,6 +21,8 @@ const (
 	ConfirmInstallHooks
 	ConfirmDeleteRemoteSession
 	ConfirmCloseRemoteSession
+	ConfirmRemoveSession     // status-gated registry-only remove (TUI 'X')
+	ConfirmBulkRemoveErrored // bulk remove of all errored sessions (TUI Ctrl+X)
 )
 
 // ConfirmDialog handles confirmation for destructive actions
@@ -51,6 +53,7 @@ type ConfirmDialog struct {
 	pendingSessionGroupPath  string
 	pendingToolOptionsJSON   json.RawMessage // Generic tool options (claude, codex, etc.)
 	pendingClaudeExtraArgs   []string        // User-supplied claude CLI tokens
+	pendingClaudeStartQuery  string          // Per-session claude startup query (v1.7.67, #725)
 	pendingParentSessionID   string
 	pendingParentProjectPath string
 }
@@ -105,6 +108,31 @@ func (c *ConfirmDialog) ShowCloseRemoteSession(remoteName, sessionID, sessionNam
 	c.focusedButton = 1
 }
 
+// ShowRemoveSession shows confirmation for status-gated registry removal (TUI 'X').
+// Safer than ConfirmDeleteSession: the caller has already verified the
+// session is stopped or errored, and the dialog wording reflects the
+// registry-only intent (transcripts + worktrees are preserved).
+func (c *ConfirmDialog) ShowRemoveSession(sessionID string, sessionName string) {
+	c.visible = true
+	c.confirmType = ConfirmRemoveSession
+	c.targetID = sessionID
+	c.targetName = sessionName
+	c.buttonCount = 2
+	c.focusedButton = 1 // default to Cancel
+}
+
+// ShowBulkRemoveErrored shows confirmation for removing all errored sessions
+// (TUI Ctrl+X). count is the number of errored sessions that will be removed.
+func (c *ConfirmDialog) ShowBulkRemoveErrored(count int) {
+	c.visible = true
+	c.confirmType = ConfirmBulkRemoveErrored
+	c.targetID = ""
+	c.targetName = ""
+	c.mcpCount = count // reuse mcpCount as a generic integer carrier
+	c.buttonCount = 2
+	c.focusedButton = 1
+}
+
 // ShowDeleteGroup shows confirmation for group deletion
 func (c *ConfirmDialog) ShowDeleteGroup(groupPath, groupName string) {
 	c.visible = true
@@ -134,6 +162,7 @@ func (c *ConfirmDialog) ShowCreateDirectory(
 	groupPath string,
 	toolOptionsJSON json.RawMessage,
 	claudeExtraArgs []string,
+	claudeStartQuery string,
 	parentSessionID string,
 	parentProjectPath string,
 ) {
@@ -147,6 +176,7 @@ func (c *ConfirmDialog) ShowCreateDirectory(
 	c.pendingSessionGroupPath = groupPath
 	c.pendingToolOptionsJSON = toolOptionsJSON
 	c.pendingClaudeExtraArgs = claudeExtraArgs
+	c.pendingClaudeStartQuery = claudeStartQuery
 	c.pendingParentSessionID = parentSessionID
 	c.pendingParentProjectPath = parentProjectPath
 	c.buttonCount = 2
@@ -164,8 +194,8 @@ func (c *ConfirmDialog) ShowInstallHooks() {
 }
 
 // GetPendingSession returns the pending session creation data
-func (c *ConfirmDialog) GetPendingSession() (name, path, command, groupPath string, toolOptionsJSON json.RawMessage, claudeExtraArgs []string, parentSessionID, parentProjectPath string) {
-	return c.pendingSessionName, c.pendingSessionPath, c.pendingSessionCommand, c.pendingSessionGroupPath, c.pendingToolOptionsJSON, c.pendingClaudeExtraArgs, c.pendingParentSessionID, c.pendingParentProjectPath
+func (c *ConfirmDialog) GetPendingSession() (name, path, command, groupPath string, toolOptionsJSON json.RawMessage, claudeExtraArgs []string, claudeStartQuery string, parentSessionID, parentProjectPath string) {
+	return c.pendingSessionName, c.pendingSessionPath, c.pendingSessionCommand, c.pendingSessionGroupPath, c.pendingToolOptionsJSON, c.pendingClaudeExtraArgs, c.pendingClaudeStartQuery, c.pendingParentSessionID, c.pendingParentProjectPath
 }
 
 // Hide hides the dialog.
@@ -312,6 +342,28 @@ func (c *ConfirmDialog) View() string {
 			renderButton("Cancel", ColorAccent, c.focusedButton == 1))
 		buttons = lipgloss.JoinVertical(lipgloss.Left, buttonRow,
 			hintStyle.Render("y close · n cancel · ←/→ navigate · Enter select · Esc"))
+
+	case ConfirmRemoveSession:
+		title = "Remove Session?"
+		warning = fmt.Sprintf("Remove this session from the registry:\n\n  \"%s\"", c.targetName)
+		details = "• The session record will be deleted from agent-deck\n• Claude transcripts (~/.claude/projects/) are preserved\n• Git worktrees are preserved (use 'd' to destroy them)"
+		borderColor = ColorYellow
+		buttonRow := lipgloss.JoinHorizontal(lipgloss.Center,
+			renderButton("Remove", ColorYellow, c.focusedButton == 0), "  ",
+			renderButton("Cancel", ColorAccent, c.focusedButton == 1))
+		buttons = lipgloss.JoinVertical(lipgloss.Left, buttonRow,
+			hintStyle.Render("y remove · n cancel · ←/→ navigate · Enter select · Esc"))
+
+	case ConfirmBulkRemoveErrored:
+		title = "Remove All Errored Sessions?"
+		warning = fmt.Sprintf("Remove %d errored session(s) from the registry.", c.mcpCount)
+		details = "• Only sessions currently in the 'error' state are affected\n• Claude transcripts are preserved\n• Git worktrees are preserved"
+		borderColor = ColorYellow
+		buttonRow := lipgloss.JoinHorizontal(lipgloss.Center,
+			renderButton("Remove All", ColorYellow, c.focusedButton == 0), "  ",
+			renderButton("Cancel", ColorAccent, c.focusedButton == 1))
+		buttons = lipgloss.JoinVertical(lipgloss.Left, buttonRow,
+			hintStyle.Render("y remove · n cancel · ←/→ navigate · Enter select · Esc"))
 
 	case ConfirmDeleteGroup:
 		title = "⚠  Delete Group?"

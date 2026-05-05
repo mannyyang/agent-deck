@@ -21,7 +21,14 @@ import (
 )
 
 const attachOutputDrainTimeout = 250 * time.Millisecond
-const attachReplyQuarantine = 2 * time.Second
+
+// attachReplyQuarantine is how long after attach/detach we filter
+// terminal-generated control replies from stdin. Terminal capability
+// reply bursts (DA1/DA2, OSC color queries, etc.) empirically complete
+// within tens of milliseconds. 500ms gives comfortable margin while
+// being short enough that the TUI does not feel frozen on return from
+// an attached session.
+const attachReplyQuarantine = 500 * time.Millisecond
 
 // IndexDetachKey returns the index of a control-key sequence in data, or -1 if
 // not found. detachByte is the raw ASCII byte (e.g. 0x11 for Ctrl+Q).
@@ -127,12 +134,24 @@ func (s *Session) Attach(ctx context.Context, detachByte ...byte) error {
 	// and breaks mouse-wheel / copy-mode navigation (#531).
 	emitScrollbackClear(os.Stdout)
 
+	// Set the iTerm2 badge to the session's display title for the duration
+	// of the attach. Agent-deck owns the outer iTerm2 tty here (no tmux
+	// between us and the terminal), so a direct OSC write reaches iTerm2.
+	// Replaces the external pgrep/ppid/tty-walk in iterm-badge-sync.sh.
+	// Opt-in: no-op outside iTerm2, when [terminal].iterm_badge=false in
+	// user config (the default), or when AGENTDECK_ITERM_BADGE=0 forces
+	// it off at runtime. AGENTDECK_ITERM_BADGE=1 ad-hoc enables.
+	emitITermBadge(os.Stdout, s.DisplayName, s.terminalChromeIsEnabled())
+
 	// Create context with cancel for detach
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	// Start tmux attach command with PTY
-	cmd := exec.CommandContext(ctx, "tmux", "attach-session", "-t", s.Name)
+	// Start tmux attach command with PTY.
+	// Routes through s.attachCmd → s.tmuxCmdContext so the -L <SocketName>
+	// selector lands before the subcommand. Pre-v1.7.55 built argv by hand
+	// and silently attached to the user's default server (#687 follow-up).
+	cmd := s.attachCmd(ctx)
 
 	// Temporarily ignore SIGINT for the duration of the attach session.
 	// The global SIGINT handler in main.go calls os.Exit(0); suppressing
@@ -245,11 +264,15 @@ func (s *Session) Attach(ctx context.Context, detachByte ...byte) error {
 			}
 
 			chunk := buf[:n]
-			if time.Since(startTime) < attachReplyQuarantine || replyFilter.Active() {
-				chunk = replyFilter.Consume(chunk, time.Since(startTime) < attachReplyQuarantine, false)
-				if len(chunk) == 0 {
-					continue
-				}
+			// Always run the reply filter: escape-string replies (DCS/OSC/etc.)
+			// can arrive long after the initial quarantine (e.g. iTerm2
+			// XTVERSION reply on window focus/resize — #731). `armed` stays
+			// gated to the quarantine window so generic CSI pass-through
+			// works for keyboard input outside it.
+			armed := time.Since(startTime) < attachReplyQuarantine
+			chunk = replyFilter.Consume(chunk, armed, false)
+			if len(chunk) == 0 {
+				continue
 			}
 
 			// Check for the detach key anywhere in the input chunk.
@@ -318,6 +341,10 @@ func (s *Session) Attach(ctx context.Context, detachByte ...byte) error {
 		// (#419, #618). emitScrollbackClear emits CSI 3 J + iTerm2-specific OSC 1337
 		// ClearScrollback — both boundaries route through one helper so they cannot drift.
 		emitScrollbackClear(os.Stdout)
+		// Clear the iTerm2 badge so the home view doesn't keep showing the
+		// detached session's title. Symmetric with the on-entry emit above —
+		// both boundaries route through emitITermBadge so they cannot drift.
+		emitITermBadge(os.Stdout, "", s.terminalChromeIsEnabled())
 		// Reset OSC-8 hyperlink state + SGR attributes before Bubble Tea redraws.
 		_, _ = os.Stdout.WriteString(terminalStyleReset)
 	}
@@ -363,9 +390,11 @@ func (s *Session) AttachWindow(ctx context.Context, windowIndex int, detachByte 
 		return fmt.Errorf("session %s does not exist", s.Name)
 	}
 
-	// Select the target window before attaching
-	target := fmt.Sprintf("%s:%d", s.Name, windowIndex)
-	if err := exec.Command("tmux", "select-window", "-t", target).Run(); err != nil {
+	// Select the target window before attaching. Routes through
+	// s.selectWindowCmd → s.tmuxCmd so isolation-configured sessions
+	// don't select a same-named window on the default server (#687).
+	if err := s.selectWindowCmd(windowIndex).Run(); err != nil {
+		target := fmt.Sprintf("%s:%d", s.Name, windowIndex)
 		return fmt.Errorf("failed to select window %s: %w", target, err)
 	}
 
@@ -374,9 +403,10 @@ func (s *Session) AttachWindow(ctx context.Context, windowIndex int, detachByte 
 
 // Resize changes the terminal size of the tmux session
 func (s *Session) Resize(cols, rows int) error {
-	// Resize the tmux window
-	cmd := exec.Command("tmux", "resize-window", "-t", s.Name, "-x", fmt.Sprintf("%d", cols), "-y", fmt.Sprintf("%d", rows))
-	if err := cmd.Run(); err != nil {
+	// Resize the tmux window. Routes through s.resizeCmd so isolation-
+	// configured sessions resize the real pane, not a default-server ghost
+	// (#687 follow-up).
+	if err := s.resizeCmd(cols, rows).Run(); err != nil {
 		return fmt.Errorf("failed to resize window: %w", err)
 	}
 	return nil
@@ -395,8 +425,10 @@ func (s *Session) AttachReadOnly(ctx context.Context) error {
 	}
 	defer func() { _ = term.Restore(int(os.Stdin.Fd()), oldState) }()
 
-	// Start tmux attach command in read-only mode
-	cmd := exec.CommandContext(ctx, "tmux", "attach-session", "-r", "-t", s.Name)
+	// Start tmux attach command in read-only mode. Routes through
+	// s.attachReadOnlyCmd so read-only attach respects socket isolation
+	// (#687 follow-up).
+	cmd := s.attachReadOnlyCmd(ctx)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -426,8 +458,10 @@ func (s *Session) StreamOutput(ctx context.Context, w io.Writer) error {
 		return fmt.Errorf("session %s does not exist", s.Name)
 	}
 
-	// Use tmux pipe-pane to stream output
-	cmd := exec.CommandContext(ctx, "tmux", "pipe-pane", "-t", s.Name, "-o", "cat")
+	// Use tmux pipe-pane to stream output. Routes through
+	// s.pipePaneStartCmd so the stream targets the session's actual server
+	// under socket isolation (#687 follow-up).
+	cmd := s.pipePaneStartCmd(ctx)
 	cmd.Stdout = w
 	cmd.Stderr = os.Stderr
 
@@ -448,9 +482,9 @@ func (s *Session) StreamOutput(ctx context.Context, w io.Writer) error {
 	select {
 	case <-ctx.Done():
 		// Stop pipe-pane - error is intentionally ignored since we're
-		// already returning ctx.Err() and cleanup failure is non-fatal
-		stopCmd := exec.Command("tmux", "pipe-pane", "-t", s.Name)
-		_ = stopCmd.Run()
+		// already returning ctx.Err() and cleanup failure is non-fatal.
+		// Socket-aware via s.pipePaneStopCmd (#687 follow-up).
+		_ = s.pipePaneStopCmd().Run()
 		// Wait for the goroutine to complete before returning
 		wg.Wait()
 		return ctx.Err()
@@ -460,4 +494,41 @@ func (s *Session) StreamOutput(ctx context.Context, w io.Writer) error {
 		}
 		return nil
 	}
+}
+
+// The following Session command-builder helpers are the seams the
+// socket-isolation-at-attach fix (#687 follow-up, v1.7.55) routes
+// through. Each returns an *exec.Cmd via s.tmuxCmd / s.tmuxCmdContext so
+// every tmux subprocess spawned for this session carries `-L <SocketName>`
+// when isolation is configured, and byte-identical plain argv when it is
+// not. Keeping these as named methods gives the regression lint a stable
+// target to assert argv shape against without spawning PTYs.
+
+func (s *Session) attachCmd(ctx context.Context) *exec.Cmd {
+	return s.tmuxCmdContext(ctx, "attach-session", "-t", s.Name)
+}
+
+func (s *Session) attachReadOnlyCmd(ctx context.Context) *exec.Cmd {
+	return s.tmuxCmdContext(ctx, "attach-session", "-r", "-t", s.Name)
+}
+
+func (s *Session) resizeCmd(cols, rows int) *exec.Cmd {
+	return s.tmuxCmd(
+		"resize-window", "-t", s.Name,
+		"-x", fmt.Sprintf("%d", cols),
+		"-y", fmt.Sprintf("%d", rows),
+	)
+}
+
+func (s *Session) selectWindowCmd(windowIndex int) *exec.Cmd {
+	target := fmt.Sprintf("%s:%d", s.Name, windowIndex)
+	return s.tmuxCmd("select-window", "-t", target)
+}
+
+func (s *Session) pipePaneStartCmd(ctx context.Context) *exec.Cmd {
+	return s.tmuxCmdContext(ctx, "pipe-pane", "-t", s.Name, "-o", "cat")
+}
+
+func (s *Session) pipePaneStopCmd() *exec.Cmd {
+	return s.tmuxCmd("pipe-pane", "-t", s.Name)
 }

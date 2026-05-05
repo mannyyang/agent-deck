@@ -82,6 +82,62 @@ func TestApplyCreateSessionToolOverrides_NonGeminiNoop(t *testing.T) {
 	}
 }
 
+func TestPersistClaudeDialogDefaults(t *testing.T) {
+	origHome := os.Getenv("HOME")
+	tmpHome := t.TempDir()
+	os.Setenv("HOME", tmpHome)
+	session.ClearUserConfigCache()
+	defer func() {
+		os.Setenv("HOME", origHome)
+		session.ClearUserConfigCache()
+	}()
+
+	persistClaudeDialogDefaults(&session.ClaudeOptions{
+		SkipPermissions:      false,
+		AllowSkipPermissions: true,
+		AutoMode:             true,
+		UseChrome:            true,
+		UseTeammateMode:      true,
+	}, []string{"--agent", "reviewer", "", " --model "})
+	cfg, err := session.LoadUserConfig()
+	if err != nil {
+		t.Fatalf("LoadUserConfig: %v", err)
+	}
+	want := []string{"--agent", "reviewer", "--model"}
+	if len(cfg.Claude.ExtraArgs) != len(want) {
+		t.Fatalf("Claude.ExtraArgs = %v, want %v", cfg.Claude.ExtraArgs, want)
+	}
+	for i := range want {
+		if cfg.Claude.ExtraArgs[i] != want[i] {
+			t.Fatalf("Claude.ExtraArgs[%d] = %q, want %q", i, cfg.Claude.ExtraArgs[i], want[i])
+		}
+	}
+	if cfg.Claude.DangerousMode == nil || *cfg.Claude.DangerousMode {
+		t.Fatalf("Claude.DangerousMode = %v, want explicit false", cfg.Claude.DangerousMode)
+	}
+	if !cfg.Claude.AllowDangerousMode {
+		t.Fatal("Claude.AllowDangerousMode = false, want true")
+	}
+	if !cfg.Claude.AutoMode {
+		t.Fatal("Claude.AutoMode = false, want true")
+	}
+	if !cfg.Claude.UseChrome {
+		t.Fatal("Claude.UseChrome = false, want true")
+	}
+	if !cfg.Claude.UseTeammateMode {
+		t.Fatal("Claude.UseTeammateMode = false, want true")
+	}
+
+	persistClaudeDialogDefaults(&session.ClaudeOptions{}, nil)
+	cfg, err = session.LoadUserConfig()
+	if err != nil {
+		t.Fatalf("LoadUserConfig after clear: %v", err)
+	}
+	if cfg.Claude.ExtraArgs != nil {
+		t.Fatalf("Claude.ExtraArgs should clear to nil, got %v", cfg.Claude.ExtraArgs)
+	}
+}
+
 // Co-credit @masta-g3 (PR #674): TUI session creation must produce
 // Tool="pi" rather than Tool="shell" with Command="pi", matching the
 // tmux/userconfig wiring already present.
@@ -89,6 +145,16 @@ func TestCreateSessionTool_Pi(t *testing.T) {
 	tool, command := createSessionTool("pi")
 	if tool != "pi" || command != "pi" {
 		t.Fatalf("createSessionTool(\"pi\") = (%q, %q), want (\"pi\", \"pi\")", tool, command)
+	}
+}
+
+// TUI session creation must produce Tool="copilot" rather than
+// Tool="shell" with Command="copilot", matching the tmux/userconfig
+// wiring already present since v1.7.26.
+func TestCreateSessionTool_Copilot(t *testing.T) {
+	tool, command := createSessionTool("copilot")
+	if tool != "copilot" || command != "copilot" {
+		t.Fatalf("createSessionTool(\"copilot\") = (%q, %q), want (\"copilot\", \"copilot\")", tool, command)
 	}
 }
 
@@ -1271,27 +1337,10 @@ func TestRemoteRestartReturnsRemoteCommand(t *testing.T) {
 	_ = h
 }
 
-func TestRemoteSelectionNOpensNewDialog(t *testing.T) {
-	home := NewHome()
-	home.width = 100
-	home.height = 30
-
-	remote := session.RemoteSessionInfo{ID: "remote-123", Title: "remote-session", RemoteName: "myserver"}
-	home.flatItems = []session.Item{{Type: session.ItemTypeRemoteSession, RemoteSession: &remote, RemoteName: "myserver"}}
-	home.cursor = 0
-
-	model, cmd := home.handleMainKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
-	h, ok := model.(*Home)
-	if !ok {
-		t.Fatal("handleMainKey should return *Home")
-	}
-	if cmd != nil {
-		t.Fatal("pressing n on remote selection should not execute remote attach command")
-	}
-	if !h.newDialog.IsVisible() {
-		t.Fatal("pressing n on remote selection should open new session dialog")
-	}
-}
+// TestRemoteSelectionNOpensNewDialog was removed with the #743 fix: it
+// codified d9a5de8's broken contract (n on a remote session opens the local
+// dialog). The regression guard now lives in
+// TestRegression743_NOnRemoteSession_QuickCreatesNoDialog.
 
 func TestSelectedRemotePreviewTarget(t *testing.T) {
 	home := NewHome()
@@ -1365,26 +1414,9 @@ func TestRenderRemotePreviewIncludesCachedResponse(t *testing.T) {
 	}
 }
 
-func TestRemoteGroupSelectionNOpensNewDialog(t *testing.T) {
-	home := NewHome()
-	home.width = 100
-	home.height = 30
-
-	home.flatItems = []session.Item{{Type: session.ItemTypeRemoteGroup, RemoteName: "myserver", Path: "remotes/myserver"}}
-	home.cursor = 0
-
-	model, cmd := home.handleMainKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
-	h, ok := model.(*Home)
-	if !ok {
-		t.Fatal("handleMainKey should return *Home")
-	}
-	if cmd != nil {
-		t.Fatal("pressing n on remote group should not execute remote attach command")
-	}
-	if !h.newDialog.IsVisible() {
-		t.Fatal("pressing n on remote group should open new session dialog")
-	}
-}
+// TestRemoteGroupSelectionNOpensNewDialog was removed with the #743 fix —
+// see the note on TestRemoteSelectionNOpensNewDialog above. Guard lives in
+// TestRegression743_NOnRemoteGroup_QuickCreatesNoDialog.
 
 func TestRenderRemotePreviewShowsEmptyStateAfterFetch(t *testing.T) {
 	home := NewHome()
@@ -1971,7 +2003,13 @@ func TestMouseYToItemIndex(t *testing.T) {
 			home := newTestHomeWithItems(100, 30, items)
 			home.viewOffset = tc.viewOffset
 			if tc.banners {
-				home.updateInfo = &update.UpdateInfo{Available: true, CurrentVersion: "1.0", LatestVersion: "2.0"}
+				// v1.7.59: the update banner now renders via ShouldNudge,
+				// which requires ReleasesBehind > NudgeThreshold. Any
+				// value >5 flips the same banner path this test measured.
+				home.updateInfo = &update.UpdateInfo{
+					Available: true, CurrentVersion: "1.0", LatestVersion: "2.0",
+					ReleasesBehind: 30,
+				}
 				home.maintenanceMsg = "test maintenance"
 			}
 
@@ -2830,4 +2868,134 @@ func TestHandleMainKeyQuickApproveSkipsNonClaudeTool(t *testing.T) {
 	if _, ok := model.(*Home); !ok {
 		t.Fatal("handleMainKey should return *Home")
 	}
+}
+
+// TestRegression743_NOnRemoteSession_QuickCreatesNoDialog guards #743.
+// v1.7.68 shipped d9a5de8 which removed the remote early-return from the `n`
+// key handler, so pressing `n` on a remote session opened the local
+// newDialog and created a LOCAL session instead of a remote one. Restoring
+// the pre-d9a5de8 behavior: `n` on a remote-session cursor issues the remote
+// quick-create command and does NOT open the local new-session dialog.
+func TestRegression743_NOnRemoteSession_QuickCreatesNoDialog(t *testing.T) {
+	home := NewHome()
+	home.width = 100
+	home.height = 30
+
+	remote := session.RemoteSessionInfo{ID: "remote-123", Title: "remote-session", RemoteName: "myserver"}
+	home.flatItems = []session.Item{{Type: session.ItemTypeRemoteSession, RemoteSession: &remote, RemoteName: "myserver"}}
+	home.cursor = 0
+
+	model, cmd := home.handleMainKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
+	h, ok := model.(*Home)
+	if !ok {
+		t.Fatal("handleMainKey should return *Home")
+	}
+	if cmd == nil {
+		t.Fatal("pressing n on a remote session must issue the remote quick-create command (was local dialog)")
+	}
+	if h.newDialog.IsVisible() {
+		t.Fatal("pressing n on a remote session must NOT open the local new-session dialog")
+	}
+}
+
+// TestRegression743_NOnRemoteGroup_QuickCreatesNoDialog — same contract for
+// cursor on a remote group header row.
+func TestRegression743_NOnRemoteGroup_QuickCreatesNoDialog(t *testing.T) {
+	home := NewHome()
+	home.width = 100
+	home.height = 30
+
+	home.flatItems = []session.Item{{Type: session.ItemTypeRemoteGroup, RemoteName: "myserver", Path: "remotes/myserver"}}
+	home.cursor = 0
+
+	model, cmd := home.handleMainKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
+	h, ok := model.(*Home)
+	if !ok {
+		t.Fatal("handleMainKey should return *Home")
+	}
+	if cmd == nil {
+		t.Fatal("pressing n on a remote group must issue the remote quick-create command")
+	}
+	if h.newDialog.IsVisible() {
+		t.Fatal("pressing n on a remote group must NOT open the local new-session dialog")
+	}
+}
+
+// TestHome_TerminalNavigationKeys verifies the PgUp/PgDn/Home/End bindings
+// added alongside the existing vi-style pagination (#38). PgUp/PgDn are
+// half-page aliases of Ctrl+U/Ctrl+D; Home/End jump to the first/last item
+// (End fills the gap where no single-key jump-to-bottom existed, since G
+// opens global search).
+func TestHome_TerminalNavigationKeys(t *testing.T) {
+	// Build a 100-item list so pagination + absolute jumps have room to move.
+	items := make([]session.Item, 100)
+	for i := range items {
+		items[i] = session.Item{
+			Type:    session.ItemTypeSession,
+			Session: &session.Instance{ID: fmt.Sprintf("s%d", i), Title: fmt.Sprintf("S%d", i)},
+			Level:   0,
+		}
+	}
+
+	const width, height = 100, 30
+
+	// Compute half-page from the actual getVisibleHeight so the test
+	// stays correct if the viewport formula changes.
+	h0 := newTestHomeWithItems(width, height, items)
+	halfPage := h0.getVisibleHeight() / 2
+	if halfPage < 1 {
+		halfPage = 1
+	}
+	last := len(items) - 1
+
+	tests := []struct {
+		name        string
+		key         tea.KeyMsg
+		startCursor int
+		wantCursor  int
+	}{
+		{"PgUp from middle", tea.KeyMsg{Type: tea.KeyPgUp}, 50, 50 - halfPage},
+		{"PgUp clamps at top", tea.KeyMsg{Type: tea.KeyPgUp}, 0, 0},
+		{"PgDown from middle", tea.KeyMsg{Type: tea.KeyPgDown}, 10, 10 + halfPage},
+		{"PgDown clamps at bottom", tea.KeyMsg{Type: tea.KeyPgDown}, last, last},
+		{"Home from middle", tea.KeyMsg{Type: tea.KeyHome}, 50, 0},
+		{"Home at top no-op", tea.KeyMsg{Type: tea.KeyHome}, 0, 0},
+		{"End from middle", tea.KeyMsg{Type: tea.KeyEnd}, 5, last},
+		{"End at bottom no-op", tea.KeyMsg{Type: tea.KeyEnd}, last, last},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newTestHomeWithItems(width, height, items)
+			h.cursor = tc.startCursor
+			h.previewScrollOffset = 42 // non-zero to verify reset contract
+			updated, _ := h.Update(tc.key)
+			got := updated.(*Home).cursor
+			if got != tc.wantCursor {
+				t.Fatalf("cursor = %d, want %d (halfPage=%d)", got, tc.wantCursor, halfPage)
+			}
+			if updated.(*Home).previewScrollOffset != 0 {
+				t.Fatalf("previewScrollOffset = %d, want 0 (nav handlers must reset)",
+					updated.(*Home).previewScrollOffset)
+			}
+		})
+	}
+
+	t.Run("End on empty list does not crash", func(t *testing.T) {
+		h := newTestHomeWithItems(width, height, nil)
+		updated, _ := h.Update(tea.KeyMsg{Type: tea.KeyEnd})
+		got := updated.(*Home).cursor
+		if got != 0 {
+			t.Fatalf("cursor = %d, want 0 on empty list", got)
+		}
+	})
+
+	t.Run("Home on empty list does not crash", func(t *testing.T) {
+		h := newTestHomeWithItems(width, height, nil)
+		updated, _ := h.Update(tea.KeyMsg{Type: tea.KeyHome})
+		got := updated.(*Home).cursor
+		if got != 0 {
+			t.Fatalf("cursor = %d, want 0 on empty list", got)
+		}
+	})
 }

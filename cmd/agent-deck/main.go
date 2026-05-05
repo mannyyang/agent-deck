@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"math"
 	"os"
@@ -35,7 +36,7 @@ import (
 	"github.com/asheshgoplani/agent-deck/internal/web"
 )
 
-var Version = "1.7.50" // overridden at build time via -ldflags "-X main.Version=..."
+var Version = "1.7.81" // overridden at build time via -ldflags "-X main.Version=..."
 
 // Table column widths for list command output
 const (
@@ -55,6 +56,18 @@ func init() {
 func initUpdateSettings() {
 	settings := session.GetUpdateSettings()
 	update.SetCheckInterval(settings.CheckIntervalHours)
+}
+
+// writeVersionOutput prints `Agent Deck vX.Y.Z` to `w`, appending
+// ` (update available: vA.B.C)` when the on-disk cache says the user
+// is behind. Offline — never touches the network. Conductor task #45.
+func writeVersionOutput(w io.Writer, currentVersion string) {
+	fmt.Fprintf(w, "Agent Deck v%s", currentVersion)
+	info, err := update.CachedUpdateInfo(currentVersion)
+	if err == nil && info != nil && info.Available {
+		fmt.Fprintf(w, " (update available: v%s)", info.LatestVersion)
+	}
+	fmt.Fprintln(w)
 }
 
 // printUpdateNotice checks for updates and prints a one-liner if available
@@ -204,6 +217,11 @@ func main() {
 	// the installation-wide fallback for callers without a session handle.
 	tmux.SetDefaultSocketName(session.GetTmuxSettings().GetSocketName())
 
+	// Nudge macOS users whose tmux predates the upstream fix for the
+	// control-mode NULL-deref (tmux #4980, issue #737). Once per process,
+	// no-op on non-macOS, suppressible via AGENTDECK_SUPPRESS_TMUX_WARNING.
+	tmux.WarnIfVulnerableTmux()
+
 	var webEnabled bool
 	var webArgs []string
 
@@ -211,7 +229,7 @@ func main() {
 	if len(args) > 0 {
 		switch args[0] {
 		case "version", "--version", "-v":
-			fmt.Printf("Agent Deck v%s\n", Version)
+			writeVersionOutput(os.Stdout, Version)
 			return
 		case "help", "--help", "-h":
 			printHelp()
@@ -304,6 +322,9 @@ func main() {
 			return
 		case "notify-daemon":
 			handleNotifyDaemon(args[1:])
+			return
+		case "inbox":
+			handleInbox(args[1:])
 			return
 		case "feedback":
 			handleFeedback(args[1:])
@@ -506,7 +527,10 @@ func main() {
 
 	// Extract --group / -g flag here (TUI-only path; subcommands consume their own -g)
 	var groupScope string
-	groupScope, _ = extractGroupFlag(args)
+	groupScope, args = extractGroupFlag(args)
+	// Extract --select flag (#709): preselect a session without scoping groups.
+	var initialSelect string
+	initialSelect, _ = extractSelectFlag(args)
 
 	// v1.7.41: record TUI launch for feedback-prompt pacing. Seeds
 	// FirstSeenAt on the very first launch and bumps LaunchCount on every
@@ -539,6 +563,38 @@ func main() {
 			fmt.Fprintf(os.Stderr, "Warning: could not verify group '%s' (storage error)\n", groupScope)
 		}
 		homeModel.SetGroupScope(normalizedGroup)
+	}
+	// Apply preselection if specified via --select (#709).
+	// When both -g and --select are given, the preselect runs AFTER the group
+	// scope is applied: Home.applyInitialSelection will fail silently if the
+	// session is outside the scope; we pre-warn here so the user sees both
+	// outputs without digging through logs.
+	if initialSelect != "" {
+		homeModel.SetInitialSelection(initialSelect)
+		if groupScope != "" {
+			if storage, err := session.NewStorageWithProfile(profile); err == nil {
+				if instances, _, err := storage.LoadWithGroups(); err == nil {
+					normalizedGroup := normalizeGroupPath(groupScope)
+					found := false
+					for _, inst := range instances {
+						if inst == nil {
+							continue
+						}
+						if inst.ID != initialSelect && !strings.EqualFold(inst.Title, initialSelect) {
+							continue
+						}
+						gp := inst.GroupPath
+						if gp == normalizedGroup || strings.HasPrefix(gp, normalizedGroup+"/") {
+							found = true
+						}
+						break
+					}
+					if !found {
+						fmt.Fprintf(os.Stderr, "Warning: --select %q is not in group %q; cursor will not be repositioned\n", initialSelect, groupScope)
+					}
+				}
+			}
+		}
 	}
 
 	// ═══════════════════════════════════════════════════════════════════
@@ -638,7 +694,7 @@ func main() {
 		liveMenuData := web.NewMemoryMenuData(fallbackMenuData)
 		homeModel.SetWebMenuData(liveMenuData)
 
-		server, err := buildWebServer(effectiveProfile, webArgs, liveMenuData)
+		server, err := buildWebServer(effectiveProfile, webArgs, liveMenuData, ui.NewWebMutator(homeModel))
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: web server setup failed: %v\n", err)
 			os.Exit(1)
@@ -761,6 +817,34 @@ func extractGroupFlag(args []string) (string, []string) {
 	}
 
 	return group, remaining
+}
+
+// extractSelectFlag extracts --select <session-id-or-title> from args (#709).
+// Unlike -g / --group, --select does NOT scope the TUI to one group — it only
+// positions the cursor on a matching session while keeping every group visible.
+func extractSelectFlag(args []string) (string, []string) {
+	var selectVal string
+	var remaining []string
+
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+
+		if strings.HasPrefix(arg, "--select=") {
+			selectVal = strings.TrimPrefix(arg, "--select=")
+			continue
+		}
+		if arg == "--select" {
+			if i+1 < len(args) {
+				selectVal = args[i+1]
+				i++
+				continue
+			}
+		}
+
+		remaining = append(remaining, arg)
+	}
+
+	return selectVal, remaining
 }
 
 // reorderArgsForFlagParsing moves the path argument to the end of args
@@ -948,6 +1032,11 @@ func handleAdd(profile string, args []string) {
 	parentShort := fs.String("p", "", "Parent session (short)")
 	noParent := fs.Bool("no-parent", false, "Disable automatic parent linking (use 'session set-parent' later to link manually)")
 	noTransitionNotify := fs.Bool("no-transition-notify", false, "Suppress transition event notifications to parent session")
+	// #697: conductor-friendly title lock. When set, Claude's session name
+	// (--name / /rename) never overwrites the agent-deck title. --no-title-sync
+	// is an alias for discoverability.
+	titleLock := fs.Bool("title-lock", false, "Lock session title so Claude's session name never overrides it (#697)")
+	noTitleSync := fs.Bool("no-title-sync", false, "Alias for --title-lock")
 	quickCreate := fs.Bool("quick", false, "Auto-generate session name (adjective-noun)")
 	quickCreateShort := fs.Bool("Q", false, "Auto-generate session name (short)")
 	jsonOutput := fs.Bool("json", false, "Output as JSON")
@@ -1133,18 +1222,10 @@ func handleAdd(profile string, args []string) {
 	}
 
 	if explicitPathProvided {
-		if rawPathArg == "." {
-			path, err = os.Getwd()
-			if err != nil {
-				fmt.Printf("Error: failed to get current directory: %v\n", err)
-				os.Exit(1)
-			}
-		} else {
-			path, err = filepath.Abs(rawPathArg)
-			if err != nil {
-				fmt.Printf("Error: failed to resolve path: %v\n", err)
-				os.Exit(1)
-			}
+		path, err = resolveAddPath(rawPathArg)
+		if err != nil {
+			fmt.Printf("Error: failed to resolve path: %v\n", err)
+			os.Exit(1)
 		}
 	} else {
 		// No explicit path provided: use group default path first, then cwd fallback.
@@ -1185,8 +1266,8 @@ func handleAdd(profile string, args []string) {
 	// Handle worktree creation
 	var worktreePath, worktreeRepoRoot string
 	if wtBranch != "" {
-		// Validate path is a git repo
-		if !git.IsGitRepo(path) {
+		// Validate path is a git repo (or a bare-repo project root with nested .bare/)
+		if !git.IsGitRepoOrBareProjectRoot(path) {
 			fmt.Fprintf(os.Stderr, "Error: %s is not a git repository\n", path)
 			os.Exit(1)
 		}
@@ -1247,7 +1328,7 @@ func handleAdd(profile string, args []string) {
 
 			// Create worktree atomically (git handles existence checks).
 			// This avoids a TOCTOU race from separate check-then-create steps.
-			setupErr, err := git.CreateWorktreeWithSetup(repoRoot, worktreePath, wtBranch, os.Stdout, os.Stderr)
+			setupErr, err := git.CreateWorktreeWithSetup(repoRoot, worktreePath, wtBranch, os.Stdout, os.Stderr, session.GetWorktreeSettings().SetupTimeout())
 			if err != nil {
 				if isWorktreeAlreadyExistsError(err) {
 					fmt.Fprintf(os.Stderr, "Error: worktree already exists at %s\n", worktreePath)
@@ -1319,6 +1400,11 @@ func handleAdd(profile string, args []string) {
 	// Suppress transition notifications if requested
 	if *noTransitionNotify {
 		newInstance.NoTransitionNotify = true
+	}
+
+	// #697: title-lock blocks Claude's session-name sync. Either flag triggers it.
+	if *titleLock || *noTitleSync {
+		newInstance.TitleLocked = true
 	}
 
 	// Set command if provided
@@ -1806,8 +1892,11 @@ func handleRemove(profile string, args []string) {
 
 	// Always attempt to kill the tmux session, even if Exists() returns false.
 	// The saved status may be stale (e.g., "error" in DB but tmux session still alive).
-	// Kill() is safe to call on non-existent sessions (returns error which we handle).
-	if err := inst.Kill(); err != nil {
+	// KillAndWait is safe to call on non-existent sessions (returns error which we handle).
+	// Uses the synchronous variant so the SIGTERM→SIGKILL escalation finishes
+	// before this short-lived CLI exits — otherwise SIGHUP-immune claude
+	// processes survive as orphans (issue #59, v1.7.68).
+	if err := inst.KillAndWait(); err != nil {
 		// Only warn if the session actually existed (ignore "not found" errors)
 		if inst.Exists() && !*jsonOutput {
 			fmt.Printf("Warning: failed to kill tmux session: %v\n", err)
@@ -2593,11 +2682,12 @@ func printHelp() {
 	fmt.Printf("Agent Deck v%s\n", Version)
 	fmt.Println("Terminal session manager for AI coding agents")
 	fmt.Println()
-	fmt.Println("Usage: agent-deck [-p profile] [-g group] [command]")
+	fmt.Println("Usage: agent-deck [-p profile] [-g group] [--select id|title] [command]")
 	fmt.Println()
 	fmt.Println("Global Options:")
 	fmt.Println("  -p, --profile <name>   Use specific profile (default: 'default')")
 	fmt.Println("  -g, --group <name>     Launch TUI scoped to a specific group")
+	fmt.Println("  --select <id|title>    Launch TUI with cursor on a specific session (all groups stay visible)")
 	fmt.Println()
 	fmt.Println("Commands:")
 	fmt.Println("  (none)           Start the TUI")
@@ -2616,6 +2706,7 @@ func printHelp() {
 	fmt.Println("  group            Manage groups")
 	fmt.Println("  worktree, wt     Manage git worktrees")
 	fmt.Println("  web              Start TUI with web UI server running alongside")
+	fmt.Println("  remote           Manage remote agent-deck instances")
 	fmt.Println("  conductor        Manage conductor meta-agent orchestration")
 	fmt.Println("  profile          Manage profiles")
 	fmt.Println("  update           Check for and install updates")
@@ -2664,6 +2755,17 @@ func printHelp() {
 	fmt.Println("  conductor teardown        Stop conductor and remove bridge daemon")
 	fmt.Println("  conductor status          Show conductor health across profiles")
 	fmt.Println("  conductor list            List configured conductors")
+	fmt.Println()
+	fmt.Println("Remote Commands:")
+	fmt.Println("  remote add <name> <user@host>             Register a remote agent-deck instance")
+	fmt.Println("    --agent-deck-path <path>                Path to agent-deck binary on remote (default: agent-deck)")
+	fmt.Println("    --profile <name>                        Remote profile to use (default: default)")
+	fmt.Println("  remote remove, rm <name>                  Remove a remote")
+	fmt.Println("  remote list, ls [--json]                  List configured remotes")
+	fmt.Println("  remote sessions [name] [--json]           Show sessions on remote(s)")
+	fmt.Println("  remote attach <name> <session>            Attach to a remote session")
+	fmt.Println("  remote rename <name> <session> <title>    Rename a remote session")
+	fmt.Println("  remote update [name]                      Install/upgrade agent-deck on remote(s)")
 	fmt.Println()
 	fmt.Println("Worktree Commands:")
 	fmt.Println("  worktree list             List worktrees with session associations")

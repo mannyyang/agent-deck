@@ -161,6 +161,21 @@ type UserConfig struct {
 	// Mirrors the opt-out in ~/.agent-deck/feedback-state.json so it is visible
 	// to the user and editable without running `agent-deck feedback`.
 	Feedback FeedbackSettings `toml:"feedback"`
+
+	// Terminal defines outer-terminal chrome settings — sequences agent-deck
+	// writes directly to the host terminal (iTerm2 badge, etc), distinct
+	// from anything tmux draws. Empty/absent uses defaults; see TerminalSettings.
+	Terminal TerminalSettings `toml:"terminal"`
+
+	// Web defines `agent-deck web` HTTP server settings.
+	Web WebSettings `toml:"web"`
+}
+
+// WebSettings configures the `agent-deck web` HTTP server.
+type WebSettings struct {
+	// MutationsEnabled controls whether POST/PATCH/DELETE endpoints accept
+	// requests. nil (omitted) defaults to true. Forced off by --read-only.
+	MutationsEnabled *bool `toml:"mutations_enabled"`
 }
 
 // FeedbackSettings controls the in-product feedback prompts.
@@ -222,6 +237,10 @@ func (rc RemoteConfig) GetProfile() string {
 type ProfileSettings struct {
 	// Claude defines Claude Code overrides for a specific profile.
 	Claude ProfileClaudeSettings `toml:"claude"`
+	// Costs defines profile-specific cost-tracking overrides.
+	// Nil pointer means "no [profiles.<name>.costs] block in TOML"; the
+	// resolver falls through to global [costs] settings.
+	Costs *ProfileCosts `toml:"costs"`
 }
 
 // ProfileClaudeSettings defines profile-specific Claude overrides.
@@ -652,6 +671,17 @@ type ClaudeSettings struct {
 	// Default: false
 	AutoMode bool `toml:"auto_mode"`
 
+	// ExtraArgs are user-supplied Claude CLI flags used as the New Session
+	// dialog default. They are persisted as discrete TOML array entries and
+	// copied to Instance.ExtraArgs when a Claude session is created.
+	ExtraArgs []string `toml:"extra_args"`
+
+	// UseChrome enables --chrome by default for Claude sessions.
+	UseChrome bool `toml:"use_chrome"`
+
+	// UseTeammateMode enables --teammate-mode tmux by default for Claude sessions.
+	UseTeammateMode bool `toml:"use_teammate_mode"`
+
 	// EnvFile is a .env file specific to Claude sessions
 	// Sourced AFTER global [shell].env_files
 	// Path can be absolute, ~ for home, $HOME/${VAR} for env vars, or relative to session working directory
@@ -825,6 +855,47 @@ type WorktreeSettings struct {
 	// Set to "" to disable auto-prefixing (just the session name).
 	// Default: "feature/" when not set.
 	BranchPrefix *string `toml:"branch_prefix"`
+
+	// SetupTimeoutSeconds caps how long .agent-deck/worktree-setup.sh may run.
+	// Pointer (not plain int) so the loader can distinguish three cases:
+	//   nil         → field unset → 60s default (backward compat, GH #724)
+	//   *0          → explicit unlimited (no deadline) — #727 follow-up
+	//   *N (N > 0)  → N seconds
+	//   *N (N < 0)  → treated as unset (60s default)
+	// The `*0 = unlimited` convention matches standard CLI tooling (curl,
+	// systemd, docker). Reporter @Clindbergh flagged the v1.7.65 behaviour
+	// (`0 = default`) as counter-convention in the PR review for #727.
+	SetupTimeoutSeconds *int `toml:"setup_timeout_seconds"`
+}
+
+// DefaultWorktreeSetupTimeout is the fallback used when no explicit value is
+// configured. Kept small and visible so the git package can share it.
+const DefaultWorktreeSetupTimeout = 60 * time.Second
+
+// UnlimitedWorktreeSetupTimeout is the sentinel returned by SetupTimeout()
+// when the user has configured `setup_timeout_seconds = 0`. The git layer
+// interprets this as "no deadline" (context.Background() instead of
+// context.WithTimeout). Value chosen as 0 so the config value flows straight
+// through to the git layer unchanged.
+const UnlimitedWorktreeSetupTimeout time.Duration = 0
+
+// SetupTimeout returns the configured worktree-setup-script timeout.
+// Semantics (post-#727 follow-up):
+//   - field unset (nil) or negative → DefaultWorktreeSetupTimeout (60s)
+//   - explicit 0                    → UnlimitedWorktreeSetupTimeout (no deadline)
+//   - positive N                    → N seconds
+func (w WorktreeSettings) SetupTimeout() time.Duration {
+	if w.SetupTimeoutSeconds == nil {
+		return DefaultWorktreeSetupTimeout
+	}
+	v := *w.SetupTimeoutSeconds
+	if v < 0 {
+		return DefaultWorktreeSetupTimeout
+	}
+	if v == 0 {
+		return UnlimitedWorktreeSetupTimeout
+	}
+	return time.Duration(v) * time.Second
 }
 
 // Template returns the path template if set, or empty string if nil.
@@ -1049,6 +1120,15 @@ type TmuxSettings struct {
 	// Default: true (nil = use default true)
 	InjectStatusLine *bool `toml:"inject_status_line"`
 
+	// Mouse controls whether agent-deck enables tmux mouse mode on new
+	// sessions. When false, tmux `mouse on` is never set, so the terminal
+	// emulator keeps raw control of mouse events — required by the VS Code
+	// Linux integrated terminal to let users click-drag to select text
+	// (issue #730). Affects both the inline set-option during session
+	// creation and the separate EnableMouseMode() path used on reconnect.
+	// Default: true (nil = use default true, preserves pre-#730 behavior)
+	Mouse *bool `toml:"mouse"`
+
 	// LaunchInUserScope starts new tmux servers via `systemd-run --user --scope`
 	// so the tmux server lives under the user's systemd manager instead of the
 	// current login session scope. This keeps tmux alive when an SSH session
@@ -1151,6 +1231,16 @@ func (t TmuxSettings) GetInjectStatusLine() bool {
 // Instance creation — sees the same sanitised value.
 func (t TmuxSettings) GetSocketName() string {
 	return strings.TrimSpace(t.SocketName)
+}
+
+// GetMouse returns whether tmux mouse mode should be enabled, defaulting to
+// true. Issue #730: users on VS Code's Linux integrated terminal need mouse
+// OFF so the terminal can handle click-drag selection natively.
+func (t TmuxSettings) GetMouse() bool {
+	if t.Mouse == nil {
+		return true
+	}
+	return *t.Mouse
 }
 
 // GetLaunchInUserScope returns whether new tmux servers should be launched
@@ -1820,6 +1910,17 @@ func GetDefaultTool() string {
 	return config.DefaultTool
 }
 
+// GetWebMutationsEnabled returns whether `agent-deck web` should accept
+// mutating HTTP requests (POST/PATCH/DELETE). Defaults to true when the
+// `[web].mutations_enabled` key is omitted from config.toml.
+func GetWebMutationsEnabled() bool {
+	config, err := LoadUserConfig()
+	if err != nil || config == nil || config.Web.MutationsEnabled == nil {
+		return true
+	}
+	return *config.Web.MutationsEnabled
+}
+
 // GetHotkeyOverrides returns user-configured hotkey overrides from config.toml.
 //
 // Merge order (issue #434):
@@ -2100,6 +2201,55 @@ func GetTmuxSettings() TmuxSettings {
 	return config.Tmux
 }
 
+// TerminalSettings controls outer-terminal chrome agent-deck writes directly
+// to the host terminal (bypassing tmux). These settings affect what the
+// terminal emulator displays — currently only iTerm2's badge.
+//
+// Example config.toml:
+//
+//	[terminal]
+//	iterm_badge = true
+type TerminalSettings struct {
+	// ITermBadge controls whether agent-deck sets the iTerm2 badge to the
+	// attached session's title for the duration of the attach, and refreshes
+	// it when Claude renames the session mid-attach. No-op outside iTerm2.
+	//
+	// AGENTDECK_ITERM_BADGE env var overrides this in either direction
+	// (=1/true/yes/on force on, =0/false/no/off force off; unset defers to
+	// this config). Caveat: env reliably reaches the attach/detach path
+	// (agent-deck reads its own env directly) but the rename-while-attached
+	// path runs in a hook subprocess spawned through agent-deck → tmux →
+	// Claude → hook, and Claude may filter custom env vars. For consistent
+	// behavior on both paths, prefer this config setting — every process
+	// re-reads it from disk, so propagation is independent of the spawn
+	// chain.
+	//
+	// Default: false (opt-in). Most users have their own iTerm2 badge scheme
+	// (e.g. host/cwd via shell PROMPT_COMMAND), so silently overwriting it on
+	// every attach is too presumptuous a default. Users who want the
+	// per-session badge set this to true explicitly.
+	ITermBadge *bool `toml:"iterm_badge"`
+}
+
+// GetITermBadge returns whether the iTerm2 badge integration is enabled,
+// defaulting to false (opt-in). Mirrors the GetInjectStatusLine pattern but
+// with the inverse default — see ITermBadge field doc for rationale.
+func (t TerminalSettings) GetITermBadge() bool {
+	if t.ITermBadge == nil {
+		return false
+	}
+	return *t.ITermBadge
+}
+
+// GetTerminalSettings returns terminal-chrome settings from config.
+func GetTerminalSettings() TerminalSettings {
+	config, err := LoadUserConfig()
+	if err != nil || config == nil {
+		return TerminalSettings{}
+	}
+	return config.Terminal
+}
+
 // GetInstanceSettings returns instance behavior settings
 func GetInstanceSettings() InstanceSettings {
 	config, err := LoadUserConfig()
@@ -2211,6 +2361,11 @@ func CreateExampleConfig() error {
 # config_dir = "~/.claude-work"
 # Enable --dangerously-skip-permissions by default (default: false)
 # dangerous_mode = true
+# Extra Claude CLI flags remembered from the New Session dialog
+# extra_args = ["--agent", "reviewer"]
+# Enable Chrome / teammate mode by default
+# use_chrome = false
+# use_teammate_mode = false
 
 # Gemini CLI integration
 # [gemini]
@@ -2297,6 +2452,12 @@ auto_cleanup = true
 # agent-deck stops mutating the global tmux notification bar / number key bindings
 # Default: true (agent-deck injects its own status bar with session info)
 # inject_status_line = false
+# mouse controls whether agent-deck enables tmux mouse mode.
+# Set this to false if your terminal (e.g. VS Code's Linux integrated terminal)
+# interprets mouse events at the terminal layer and you want click-drag text
+# selection to bypass tmux entirely. Issue #730.
+# Default: true (tmux mouse mode is enabled — scrolling, pane resize, selection in tmux)
+# mouse = false
 # launch_in_user_scope starts new tmux servers with systemd-run --user --scope
 # so they survive when the current login session is torn down (e.g. SSH logout).
 # Default: true on Linux+systemd hosts where 'systemd-run --user --version'
@@ -2323,6 +2484,21 @@ auto_cleanup = true
 # options = { "allow-passthrough" = "all", "history-limit" = "50000" }
 # Example: keep agent-deck notifications but use a 2-line status bar
 # options = { "status" = "2" }
+
+# Outer-terminal chrome (sequences agent-deck writes to the host terminal,
+# bypassing tmux). Currently controls the iTerm2 badge; future window-title
+# integrations will live in the same section.
+# [terminal]
+# iterm_badge sets the iTerm2 badge to the attached session's title for the
+# duration of the attach (cleared on detach), and refreshes it when Claude
+# renames the session mid-attach. Opt-in because most users already drive
+# the badge from their shell prompt. No-op outside iTerm2.
+# Override at runtime: AGENTDECK_ITERM_BADGE=1 forces on, =0 forces off.
+# Caveat: the env var reliably reaches the attach/detach path but is
+# unreliable for rename-while-attached (Claude may filter env vars when
+# spawning hook subprocesses). Prefer this config setting for both paths.
+# Default: false
+# iterm_badge = true
 
 # ============================================================================
 # MCP Server Definitions
@@ -2537,11 +2713,76 @@ func GetMCPDef(name string) *MCPDef {
 
 // CostsSettings configures cost tracking, budgets, and pricing overrides.
 type CostsSettings struct {
-	Currency      string          `toml:"currency"`
-	Timezone      string          `toml:"timezone"`
-	RetentionDays int             `toml:"retention_days"`
-	Budgets       BudgetSettings  `toml:"budgets"`
-	Pricing       PricingSettings `toml:"pricing"`
+	Currency      string `toml:"currency"`
+	Timezone      string `toml:"timezone"`
+	RetentionDays int    `toml:"retention_days"`
+	// CostLineTemplate overrides the home status-bar cost segment.
+	// Three-state pointer: nil falls through to the next layer
+	// (profile -> global -> hardcoded); explicit empty string disables.
+	CostLineTemplate *string `toml:"cost_line_template"`
+	// CostLineHideWhenZero hides the segment when every recognized variable
+	// in the active template renders to $0.00. Three-state pointer; default
+	// is true (preserves the legacy "no events, no segment" behavior).
+	CostLineHideWhenZero *bool           `toml:"cost_line_hide_when_zero"`
+	Budgets              BudgetSettings  `toml:"budgets"`
+	Pricing              PricingSettings `toml:"pricing"`
+}
+
+// ProfileCosts holds per-profile overrides for cost-related settings.
+// Pointer fields use the same fall-through semantics as CostsSettings.
+type ProfileCosts struct {
+	CostLineTemplate     *string `toml:"cost_line_template"`
+	CostLineHideWhenZero *bool   `toml:"cost_line_hide_when_zero"`
+}
+
+// defaultCostLineTemplate is the hardcoded fallback that preserves the
+// pre-template status-bar segment exactly: render today's total and hide
+// when zero events have been recorded.
+const defaultCostLineTemplate = "{cost_today} today"
+
+// ResolveCostLineTemplate returns the active status-bar cost-line template
+// and hide-when-zero flag, applying the resolution chain:
+//
+//	profile.costs > [costs] > hardcoded "{cost_today} today" (template, default true for hide)
+//
+// Pointer semantics:
+//   - nil at any level falls through to the next level
+//   - explicit empty string for template disables the segment (returned as "")
+//   - explicit bool for hide_when_zero is honored at that level
+//
+// Safe to call with cfg == nil; returns the hardcoded default + true.
+func ResolveCostLineTemplate(cfg *UserConfig, profile string) (template string, hideWhenZero bool) {
+	template = defaultCostLineTemplate
+	hideWhenZero = true
+
+	if cfg == nil {
+		return
+	}
+
+	var profileCosts *ProfileCosts
+	if cfg.Profiles != nil {
+		if p, ok := cfg.Profiles[profile]; ok {
+			profileCosts = p.Costs
+		}
+	}
+
+	// Template: profile (set) > global (set) > hardcoded
+	switch {
+	case profileCosts != nil && profileCosts.CostLineTemplate != nil:
+		template = *profileCosts.CostLineTemplate
+	case cfg.Costs.CostLineTemplate != nil:
+		template = *cfg.Costs.CostLineTemplate
+	}
+
+	// Hide flag: profile (set) > global (set) > true
+	switch {
+	case profileCosts != nil && profileCosts.CostLineHideWhenZero != nil:
+		hideWhenZero = *profileCosts.CostLineHideWhenZero
+	case cfg.Costs.CostLineHideWhenZero != nil:
+		hideWhenZero = *cfg.Costs.CostLineHideWhenZero
+	}
+
+	return
 }
 
 type BudgetSettings struct {

@@ -20,17 +20,35 @@ func FindWorktreeSetupScript(repoDir string) string {
 	return ""
 }
 
-// worktreeSetupTimeout is the maximum time a setup script is allowed to run.
-var worktreeSetupTimeout = 60 * time.Second
-
 // RunWorktreeSetupScript executes the setup script with AGENT_DECK_REPO_ROOT
 // and AGENT_DECK_WORKTREE_PATH environment variables set. Working directory
 // is set to worktreePath. Output is streamed to the provided writers.
-func RunWorktreeSetupScript(scriptPath, repoDir, worktreePath string, stdout, stderr io.Writer) error {
-	ctx, cancel := context.WithTimeout(context.Background(), worktreeSetupTimeout)
+//
+// Dispatch (#773):
+//   - If scriptPath has the user-executable bit set, the script is invoked
+//     directly so the kernel honors its shebang line (e.g. #!/usr/bin/env bash,
+//     #!/usr/bin/env python3). This lets users write the setup script in any
+//     language they like.
+//   - Otherwise (legacy 0644 setups predating #773), fall back to `sh -e
+//     <path>` so existing repos keep working without a chmod.
+//
+// Timeout semantics (post-#727 follow-up):
+//   - timeout > 0  → bounded by context.WithTimeout
+//   - timeout <= 0 → unlimited (context.Background, no deadline)
+//
+// The session layer resolves the legacy 60s default before calling here;
+// callers that want bounded runs must pass a positive duration explicitly.
+func RunWorktreeSetupScript(scriptPath, repoDir, worktreePath string, stdout, stderr io.Writer, timeout time.Duration) error {
+	var ctx context.Context
+	var cancel context.CancelFunc
+	if timeout > 0 {
+		ctx, cancel = context.WithTimeout(context.Background(), timeout)
+	} else {
+		ctx, cancel = context.WithCancel(context.Background())
+	}
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "sh", "-e", scriptPath)
+	cmd := buildSetupCmd(ctx, scriptPath)
 	cmd.Dir = worktreePath
 	cmd.Env = append(os.Environ(),
 		"AGENT_DECK_REPO_ROOT="+repoDir,
@@ -43,7 +61,7 @@ func RunWorktreeSetupScript(scriptPath, repoDir, worktreePath string, stdout, st
 	err := cmd.Run()
 
 	if ctx.Err() == context.DeadlineExceeded {
-		return fmt.Errorf("worktree setup script timed out after %s", worktreeSetupTimeout)
+		return fmt.Errorf("worktree setup script timed out after %s", timeout)
 	}
 	if err != nil {
 		return fmt.Errorf("worktree setup script failed: %w", err)
@@ -51,10 +69,28 @@ func RunWorktreeSetupScript(scriptPath, repoDir, worktreePath string, stdout, st
 	return nil
 }
 
+// buildSetupCmd picks how to invoke the setup script (#773). Executable
+// scripts run directly so the kernel honors their shebang line; legacy
+// non-executable scripts run via `sh -e <path>` for backwards compatibility.
+func buildSetupCmd(ctx context.Context, scriptPath string) *exec.Cmd {
+	if info, err := os.Stat(scriptPath); err == nil && info.Mode()&0o111 != 0 {
+		return exec.CommandContext(ctx, scriptPath)
+	}
+	return exec.CommandContext(ctx, "sh", "-e", scriptPath)
+}
+
 // CreateWorktreeWithSetup creates a worktree and runs the setup script if present.
 // Setup script failure is non-fatal: the worktree is still valid.
-// Output is streamed to the provided writers.
-func CreateWorktreeWithSetup(repoDir, worktreePath, branchName string, stdout, stderr io.Writer) (setupErr error, err error) {
+// Output is streamed to the provided writers. A non-positive setupTimeout
+// means "no deadline" — see RunWorktreeSetupScript for the full semantic.
+//
+// User-visible progress (#768): the start preamble, an explicit completion
+// line on success, and an explicit failure line on error are written to
+// stderr so callers (CLI streaming directly, TUI capturing into a buffer
+// for later display) can show the user what happened. Without these,
+// users couldn't tell whether the script had run, finished, or finished
+// cleanly before claude started.
+func CreateWorktreeWithSetup(repoDir, worktreePath, branchName string, stdout, stderr io.Writer, setupTimeout time.Duration) (setupErr error, err error) {
 	if err = CreateWorktree(repoDir, worktreePath, branchName); err != nil {
 		return nil, err
 	}
@@ -65,6 +101,13 @@ func CreateWorktreeWithSetup(repoDir, worktreePath, branchName string, stdout, s
 	}
 
 	fmt.Fprintln(stderr, "Running worktree setup script...")
-	setupErr = RunWorktreeSetupScript(scriptPath, repoDir, worktreePath, stdout, stderr)
+	start := time.Now()
+	setupErr = RunWorktreeSetupScript(scriptPath, repoDir, worktreePath, stdout, stderr, setupTimeout)
+	elapsed := time.Since(start).Round(100 * time.Millisecond)
+	if setupErr != nil {
+		fmt.Fprintf(stderr, "Worktree setup script failed after %s: %v\n", elapsed, setupErr)
+	} else {
+		fmt.Fprintf(stderr, "Worktree setup script completed in %s\n", elapsed)
+	}
 	return setupErr, nil
 }

@@ -328,12 +328,15 @@ func (c *csiuReader) Read(p []byte) (int, error) {
 		n, err := c.src.Read(tmp)
 		if n > 0 {
 			chunk := tmp[:n]
-			if termreply.Active() || c.replyFilter.Active() {
-				chunk = c.replyFilter.Consume(chunk, termreply.Active(), false)
-			}
+			// Always run the reply filter. Escape-string families (DCS/OSC/
+			// APC/PM/SOS) are never keyboard input and can arrive outside
+			// any explicit quarantine window (e.g. iTerm2 XTVERSION reply on
+			// focus/resize — #731). `armed` stays tied to termreply.Active()
+			// so generic CSI pass-through works for keyboard input.
+			chunk = c.replyFilter.Consume(chunk, termreply.Active(), false)
 			c.inBuf = append(c.inBuf, chunk...)
 		}
-		if err == io.EOF && (termreply.Active() || c.replyFilter.Active()) {
+		if err == io.EOF {
 			c.inBuf = append(c.inBuf, c.replyFilter.Consume(nil, termreply.Active(), true)...)
 		}
 
@@ -374,12 +377,50 @@ func (c *csiuReader) translate(final bool) []byte {
 			continue
 		}
 
-		// Preserve a lone ESC as-is to avoid hanging standalone escape.
+		// Lone ESC at buffer end: if mid-stream, buffer it for the next Read so
+		// SS3 (ESC OH / ESC OF) can be detected when the next byte arrives. On
+		// final flush we pass it through to avoid hanging a standalone escape.
 		if i+1 >= len(c.inBuf) {
+			if !final {
+				break
+			}
 			out = append(out, c.inBuf[i])
 			i++
 			continue
 		}
+
+		// SS3 (ESC O) handling: rewrite ESC OH / ESC OF to ESC [H / ESC [F
+		// so Bubble Tea's escSeq table recognizes Home/End. Terminals that
+		// emit application-mode (DECKPAM) SS3 sequences for Home/End include
+		// iTerm2's default macOS profile over direct SSH. Other SS3 sequences
+		// (arrows ESC OA-D, function keys ESC OP-S) are already in Bubble
+		// Tea's escSeq table and must pass through unchanged.
+		if c.inBuf[i+1] == 'O' {
+			if i+2 >= len(c.inBuf) {
+				if !final {
+					break // buffer ESC O, wait for third byte
+				}
+				// final: pass through ESC O as-is.
+				out = append(out, c.inBuf[i:i+2]...)
+				i += 2
+				continue
+			}
+			switch c.inBuf[i+2] {
+			case 'H':
+				out = append(out, 0x1b, '[', 'H')
+				i += 3
+				continue
+			case 'F':
+				out = append(out, 0x1b, '[', 'F')
+				i += 3
+				continue
+			}
+			// Other ESC O* sequence — Bubble Tea handles natively.
+			out = append(out, c.inBuf[i:i+3]...)
+			i += 3
+			continue
+		}
+
 		if c.inBuf[i+1] != '[' {
 			out = append(out, c.inBuf[i])
 			i++

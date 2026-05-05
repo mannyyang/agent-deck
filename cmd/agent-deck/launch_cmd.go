@@ -30,6 +30,10 @@ func handleLaunch(profile string, args []string) {
 	parentShort := fs.String("p", "", "Parent session (short)")
 	noParent := fs.Bool("no-parent", false, "Disable automatic parent linking")
 	noTransitionNotify := fs.Bool("no-transition-notify", false, "Suppress transition event notifications to parent session")
+	// #697: conductor-friendly title lock. Prevents Claude's session name
+	// from overwriting the agent-deck title.
+	titleLock := fs.Bool("title-lock", false, "Lock session title so Claude's session name never overrides it (#697)")
+	noTitleSync := fs.Bool("no-title-sync", false, "Alias for --title-lock")
 	jsonOutput := fs.Bool("json", false, "Output as JSON")
 	quiet := fs.Bool("quiet", false, "Minimal output")
 	quietShort := fs.Bool("q", false, "Minimal output (short)")
@@ -169,7 +173,7 @@ func handleLaunch(profile string, args []string) {
 	// Handle worktree creation
 	var worktreePath, worktreeRepoRoot string
 	if wtBranch != "" {
-		if !git.IsGitRepo(path) {
+		if !git.IsGitRepoOrBareProjectRoot(path) {
 			out.Error(fmt.Sprintf("%s is not a git repository", path), ErrCodeInvalidOperation)
 			os.Exit(1)
 		}
@@ -223,7 +227,7 @@ func handleLaunch(profile string, args []string) {
 				os.Exit(1)
 			}
 
-			setupErr, err := git.CreateWorktreeWithSetup(repoRoot, worktreePath, wtBranch, os.Stdout, os.Stderr)
+			setupErr, err := git.CreateWorktreeWithSetup(repoRoot, worktreePath, wtBranch, os.Stdout, os.Stderr, session.GetWorktreeSettings().SetupTimeout())
 			if err != nil {
 				out.Error(fmt.Sprintf("failed to create worktree: %v", err), ErrCodeInvalidOperation)
 				os.Exit(1)
@@ -310,6 +314,11 @@ func handleLaunch(profile string, args []string) {
 
 	if *noTransitionNotify {
 		newInstance.NoTransitionNotify = true
+	}
+
+	// #697: title-lock blocks Claude's session-name sync.
+	if *titleLock || *noTitleSync {
+		newInstance.TitleLocked = true
 	}
 
 	if sessionCommandInput != "" {
@@ -413,8 +422,13 @@ func handleLaunch(profile string, args []string) {
 
 	// Send message only for --no-wait mode.
 	// Non --no-wait mode already sent via StartWithMessage above.
-	// Even in no-wait mode, run a short send-verification loop so Enter-loss
+	// Even in no-wait mode, run a send-verification loop so Enter-loss
 	// races don't silently drop the initial prompt.
+	//
+	// v1.7.64 (internal task "54-launch-verify-prompt"): after the initial
+	// sendWithRetryTarget pass, run verifyPromptConsumedAfterLaunch to catch
+	// the welcome-screen race where claude eats the first Enter. 10s budget
+	// per window + single retry + stderr warning on persistent no-op.
 	if initialMessage != "" && *noWait {
 		tmuxSess := newInstance.GetTmuxSession()
 		if tmuxSess != nil {
@@ -425,6 +439,11 @@ func handleLaunch(profile string, args []string) {
 				out.Error(fmt.Sprintf("failed to send initial message: %v", err), ErrCodeInvalidOperation)
 				os.Exit(1)
 			}
+			verifyPromptConsumedAfterLaunch(
+				tmuxSess, initialMessage,
+				10*time.Second, 250*time.Millisecond,
+				os.Stderr,
+			)
 		}
 	}
 

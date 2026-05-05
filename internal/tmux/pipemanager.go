@@ -2,12 +2,14 @@ package tmux
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"maps"
 	"os"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -464,14 +466,99 @@ func killStaleControlClients(sessionName, socketName string) {
 		if pid == myPID {
 			continue // don't kill our own process
 		}
-		// Kill the stale control-mode client process
-		if proc, err := os.FindProcess(pid); err == nil {
-			_ = proc.Kill()
-			pipeLog.Debug("killed_stale_control_client",
-				slog.String("session", sessionName),
-				slog.Int("pid", pid))
+		// Soft-kill the stale control-mode client process.
+		// On macOS Homebrew tmux 3.6a there is an unfixed NULL-deref in the
+		// control-mode notify path that races with client teardown (#737).
+		// SIGKILL'ing a TUI while it holds an active control client can crash
+		// the entire tmux server, wiping every agent-deck session. A SIGTERM
+		// lets the client drain and exit cleanly; SIGKILL is retained as a
+		// 500ms fallback for clients that ignore TERM.
+		usedSIGKILL := softKillProcess(pid, controlClientKillGrace)
+		pipeLog.Debug("killed_stale_control_client",
+			slog.String("session", sessionName),
+			slog.Int("pid", pid),
+			slog.Bool("used_sigkill", usedSIGKILL))
+	}
+}
+
+// controlClientKillGrace is how long softKillProcess waits after SIGTERM
+// before escalating to SIGKILL. 500ms matches empirical clean-shutdown
+// times for `tmux -C attach-session` on macOS + Linux.
+const controlClientKillGrace = 500 * time.Millisecond
+
+// softKillProcess sends SIGTERM to pid, polls every 25ms up to grace for the
+// process to exit, and escalates to SIGKILL if it doesn't. Returns true iff
+// SIGKILL was ultimately used. A non-existent pid (ESRCH) is treated as
+// already-dead and returns false without escalation.
+func softKillProcess(pid int, grace time.Duration) bool {
+	// Initial SIGTERM. If the process is already gone, we're done.
+	if err := syscall.Kill(pid, syscall.SIGTERM); err != nil {
+		if errors.Is(err, syscall.ESRCH) {
+			return false
+		}
+		// Permission or other error — try SIGKILL as last resort.
+		_ = syscall.Kill(pid, syscall.SIGKILL)
+		return true
+	}
+
+	// Poll for exit. syscall.Kill(pid, 0) returns ESRCH once the process
+	// is fully reaped; until then it returns nil (alive or zombie). The
+	// poll is aggressive (5ms) so a clean SIGTERM→exit→reap chain in a test
+	// environment, where the child is a process of the test binary and must
+	// wait on the runtime's goroutine scheduler to pick up cmd.Wait(), has
+	// plenty of chances to observe ESRCH within the grace window.
+	const pollInterval = 5 * time.Millisecond
+	deadline := time.Now().Add(grace)
+	for time.Now().Before(deadline) {
+		time.Sleep(pollInterval)
+		if err := syscall.Kill(pid, 0); err != nil && errors.Is(err, syscall.ESRCH) {
+			return false
 		}
 	}
+
+	// Still alive after grace — escalate.
+	_ = syscall.Kill(pid, syscall.SIGKILL)
+	return true
+}
+
+// softKillProcessGroup is the process-group analogue of softKillProcess.
+// It sends SIGTERM to the entire group (-pgid), polls every 5ms up to grace
+// for the group to drain, and escalates to SIGKILL if any process in the
+// group is still alive at the deadline. Returns true iff SIGKILL was
+// ultimately used. An empty group (ESRCH on initial SIGTERM) is treated as
+// already-dead and returns false without escalation.
+//
+// Used by ControlPipe.Close() to tear down the agent-deck-owned
+// `tmux -C attach-session` child without racing tmux's control-mode
+// notify path. The original Close() implementation SIGKILL'd the group
+// immediately, which on macOS Homebrew tmux 3.6a races the unfixed
+// NULL-deref in tmux's notify path (tmux/tmux#4980) and crashes the
+// server — wiping every agent-deck session. The mitigation in #739
+// only covered killStaleControlClients (the post-restart cleanup path);
+// the active-pipe close path still SIGKILL'd. This helper closes that gap.
+func softKillProcessGroup(pgid int, grace time.Duration) bool {
+	if err := syscall.Kill(-pgid, syscall.SIGTERM); err != nil {
+		if errors.Is(err, syscall.ESRCH) {
+			return false
+		}
+		// Permission or other error — fall back to SIGKILL on the group.
+		_ = syscall.Kill(-pgid, syscall.SIGKILL)
+		return true
+	}
+
+	const pollInterval = 5 * time.Millisecond
+	deadline := time.Now().Add(grace)
+	for time.Now().Before(deadline) {
+		time.Sleep(pollInterval)
+		// kill(-pgid, 0) returns ESRCH only when no process in the group
+		// remains; until then it returns nil (some member alive or zombie).
+		if err := syscall.Kill(-pgid, 0); err != nil && errors.Is(err, syscall.ESRCH) {
+			return false
+		}
+	}
+
+	_ = syscall.Kill(-pgid, syscall.SIGKILL)
+	return true
 }
 
 // tmuxSessionExistsOnSocket targets an explicit tmux server. socketName is the

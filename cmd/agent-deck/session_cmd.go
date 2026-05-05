@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -32,6 +33,8 @@ func handleSession(profile string, args []string) {
 		handleSessionStart(profile, args[1:])
 	case "stop":
 		handleSessionStop(profile, args[1:])
+	case "remove":
+		handleSessionRemove(profile, args[1:])
 	case "restart":
 		handleSessionRestart(profile, args[1:])
 	case "revive":
@@ -50,6 +53,8 @@ func handleSession(profile string, args []string) {
 		handleSessionUnsetParent(profile, args[1:])
 	case "set-transition-notify":
 		handleSessionSetTransitionNotify(profile, args[1:])
+	case "set-title-lock":
+		handleSessionSetTitleLock(profile, args[1:])
 	case "set":
 		handleSessionSet(profile, args[1:])
 	case "move", "mv":
@@ -78,7 +83,8 @@ func printSessionHelp() {
 	fmt.Println("Commands:")
 	fmt.Println("  start <id>              Start a session's tmux process")
 	fmt.Println("  stop <id>               Stop/kill session process")
-	fmt.Println("  restart <id>            Restart session (Claude: reload MCPs)")
+	fmt.Println("  remove <id>             Remove session from registry (stopped/error only; --force to bypass)")
+	fmt.Println("  restart [id] [--all]    Restart session (Claude: reload MCPs)")
 	fmt.Println("  revive [--all|--name]   Rebuild dead control pipes for errored sessions")
 	fmt.Println("  fork <id>               Fork Claude session with context")
 	fmt.Println("  attach <id>             Attach to session interactively")
@@ -92,6 +98,7 @@ func printSessionHelp() {
 	fmt.Println("  set-parent <id> <parent>  Link session as sub-session of parent")
 	fmt.Println("  unset-parent <id>       Remove sub-session link")
 	fmt.Println("  set-transition-notify <id> <on|off>  Enable/disable transition notifications")
+	fmt.Println("  set-title-lock <id> <on|off>         Lock/unlock title from Claude session-name sync (#697)")
 	fmt.Println()
 	fmt.Println("Global Options:")
 	fmt.Println("  -p, --profile <name>   Use specific profile")
@@ -102,6 +109,7 @@ func printSessionHelp() {
 	fmt.Println("  agent-deck session start my-project")
 	fmt.Println("  agent-deck session stop abc123")
 	fmt.Println("  agent-deck session restart my-project")
+	fmt.Println("  agent-deck session restart --all                # Restart all active sessions")
 	fmt.Println("  agent-deck session fork my-project -t \"my-project-fork\"")
 	fmt.Println("  agent-deck session attach my-project")
 	fmt.Println("  agent-deck session show                  # Auto-detect current session")
@@ -110,6 +118,8 @@ func printSessionHelp() {
 	fmt.Println("  agent-deck session unset-parent sub-task             # Remove sub-session link")
 	fmt.Println("  agent-deck session set-transition-notify worker off    # Suppress notifications")
 	fmt.Println("  agent-deck session set-transition-notify worker on     # Re-enable notifications")
+	fmt.Println("  agent-deck session set-title-lock SCRUM-351 on         # Prevent Claude from renaming it")
+	fmt.Println("  agent-deck session set-title-lock SCRUM-351 off        # Re-enable title sync")
 	fmt.Println("  agent-deck session output my-project                 # Get last response from session")
 	fmt.Println("  agent-deck session output my-project --json          # Get response as JSON")
 	fmt.Println()
@@ -311,16 +321,17 @@ func handleSessionStop(profile string, args []string) {
 	})
 }
 
-// handleSessionRestart restarts a session
+// handleSessionRestart restarts a session (or all active sessions with --all)
 func handleSessionRestart(profile string, args []string) {
 	fs := flag.NewFlagSet("session restart", flag.ExitOnError)
 	jsonOutput := fs.Bool("json", false, "Output as JSON")
 	quiet := fs.Bool("quiet", false, "Minimal output")
 	quietShort := fs.Bool("q", false, "Minimal output (short)")
 	force := fs.Bool("force", false, "Restart even if the session is already healthy and fresh (bypasses issue #30 guard)")
+	all := fs.Bool("all", false, "Restart all active sessions")
 
 	fs.Usage = func() {
-		fmt.Println("Usage: agent-deck session restart <id|title> [options]")
+		fmt.Println("Usage: agent-deck session restart [id|title] [options]")
 		fmt.Println()
 		fmt.Println("Restart a session. For Claude sessions, this reloads MCPs.")
 		fmt.Println()
@@ -331,13 +342,16 @@ func handleSessionRestart(profile string, args []string) {
 		fmt.Println()
 		fmt.Println("Options:")
 		fs.PrintDefaults()
+		fmt.Println()
+		fmt.Println("Examples:")
+		fmt.Println("  agent-deck session restart my-project")
+		fmt.Println("  agent-deck session restart --all")
 	}
 
 	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
 		os.Exit(1)
 	}
 
-	identifier := fs.Arg(0)
 	quietMode := *quiet || *quietShort
 	out := NewCLIOutput(*jsonOutput, quietMode)
 
@@ -345,6 +359,18 @@ func handleSessionRestart(profile string, args []string) {
 	storage, instances, groups, err := loadSessionData(profile)
 	if err != nil {
 		out.Error(err.Error(), ErrCodeNotFound)
+		os.Exit(1)
+	}
+
+	if *all {
+		restartAllSessions(out, storage, instances, groups)
+		return
+	}
+
+	identifier := fs.Arg(0)
+	if identifier == "" {
+		out.Error("session identifier required (or use --all)", ErrCodeInvalidOperation)
+		fs.Usage()
 		os.Exit(1)
 	}
 
@@ -409,6 +435,94 @@ func handleSessionRestart(profile string, args []string) {
 		data["warning"] = warning
 	}
 	out.Success(fmt.Sprintf("Restarted session: %s", inst.Title), data)
+}
+
+// restartAllSessions restarts every active session one by one.
+func restartAllSessions(out *CLIOutput, storage *session.Storage, instances []*session.Instance, groups []*session.GroupData) {
+	var active []*session.Instance
+	for _, inst := range instances {
+		if inst.Exists() {
+			active = append(active, inst)
+		}
+	}
+
+	if len(active) == 0 {
+		out.Error("no active sessions to restart", ErrCodeNotFound)
+		os.Exit(1)
+	}
+
+	var results []map[string]interface{}
+	var failed int
+
+	for _, inst := range active {
+		result := map[string]interface{}{
+			"id":    inst.ID,
+			"title": inst.Title,
+		}
+
+		if !out.jsonMode {
+			fmt.Printf("Restarting %s...\n", inst.Title)
+		}
+
+		if err := inst.Restart(); err != nil {
+			errMsg := fmt.Sprintf("failed to restart session '%s': %v", inst.Title, err)
+			if !out.jsonMode {
+				fmt.Fprintf(os.Stderr, "  Error: %s\n", errMsg)
+			}
+			result["success"] = false
+			result["error"] = errMsg
+			failed++
+			results = append(results, result)
+			continue
+		}
+		inst.LastStartedAt = time.Now()
+
+		warning := inst.ConsumeCodexRestartWarning()
+		if warning != "" && !out.jsonMode {
+			fmt.Fprintf(os.Stderr, "  Warning: %s\n", warning)
+		}
+
+		// If restart created a fresh session (no prior ID), capture the new ID
+		if session.IsClaudeCompatible(inst.Tool) && inst.ClaudeSessionID == "" {
+			inst.PostStartSync(3 * time.Second)
+		}
+
+		result["success"] = true
+		if warning != "" {
+			result["warning"] = warning
+		}
+		results = append(results, result)
+
+		if !out.jsonMode {
+			fmt.Printf("  Done: %s\n", inst.Title)
+		}
+	}
+
+	// Save updated state after all restarts
+	if err := saveSessionData(storage, instances, groups); err != nil {
+		out.Error(fmt.Sprintf("failed to save session state: %v", err), ErrCodeInvalidOperation)
+		os.Exit(1)
+	}
+
+	if out.jsonMode {
+		out.Success("", map[string]interface{}{
+			"success":   failed == 0,
+			"total":     len(active),
+			"restarted": len(active) - failed,
+			"failed":    failed,
+			"sessions":  results,
+		})
+	} else if !out.quietMode {
+		fmt.Printf("Restarted %d/%d sessions", len(active)-failed, len(active))
+		if failed > 0 {
+			fmt.Printf(" (%d failed)", failed)
+		}
+		fmt.Println()
+	}
+
+	if failed > 0 {
+		os.Exit(1)
+	}
 }
 
 // handleSessionFork forks a Claude session
@@ -517,7 +631,7 @@ func handleSessionFork(profile string, args []string) {
 	// Handle worktree creation
 	var opts *session.ClaudeOptions
 	if wtBranch != "" {
-		if !git.IsGitRepo(inst.ProjectPath) {
+		if !git.IsGitRepoOrBareProjectRoot(inst.ProjectPath) {
 			out.Error("session path is not a git repository", ErrCodeInvalidOperation)
 			os.Exit(1)
 		}
@@ -559,7 +673,7 @@ func handleSessionFork(profile string, args []string) {
 				os.Exit(1)
 			}
 
-			setupErr, err := git.CreateWorktreeWithSetup(repoRoot, worktreePath, wtBranch, os.Stdout, os.Stderr)
+			setupErr, err := git.CreateWorktreeWithSetup(repoRoot, worktreePath, wtBranch, os.Stdout, os.Stderr, session.GetWorktreeSettings().SetupTimeout())
 			if err != nil {
 				out.Error(fmt.Sprintf("worktree creation failed: %v", err), ErrCodeInvalidOperation)
 				os.Exit(1)
@@ -770,6 +884,7 @@ func handleSessionShow(profile string, args []string) {
 		"parent_session_id":    inst.ParentSessionID,
 		"parent_project_path":  inst.ParentProjectPath,
 		"no_transition_notify": inst.NoTransitionNotify,
+		"title_locked":         inst.TitleLocked,
 		"tool":                 inst.Tool,
 		"created_at":           inst.CreatedAt.Format(time.RFC3339),
 	}
@@ -935,31 +1050,6 @@ func handleSessionSet(profile string, args []string) {
 	quietMode := *quiet || *quietShort
 	out := NewCLIOutput(*jsonOutput, quietMode)
 
-	// Validate field name
-	validFields := map[string]bool{
-		"title":             true,
-		"path":              true,
-		"command":           true,
-		"tool":              true,
-		"wrapper":           true,
-		"channels":          true,
-		"extra-args":        true,
-		"color":             true,
-		"claude-session-id": true,
-		"gemini-session-id": true,
-	}
-
-	if !validFields[field] {
-		out.Error(
-			fmt.Sprintf(
-				"invalid field: %s\nValid fields: title, path, command, tool, wrapper, channels, extra-args, color, claude-session-id, gemini-session-id",
-				field,
-			),
-			ErrCodeInvalidOperation,
-		)
-		os.Exit(1)
-	}
-
 	// Load sessions
 	storage, instances, groupsData, err := loadSessionData(profile)
 	if err != nil {
@@ -978,103 +1068,19 @@ func handleSessionSet(profile string, args []string) {
 		return // unreachable, satisfies staticcheck SA5011
 	}
 
-	// Store old value for output
-	var oldValue string
-
-	// Apply the update
-	switch field {
-	case "title":
-		oldValue = inst.Title
-		inst.Title = value
-		inst.SyncTmuxDisplayName()
-	case "path":
-		oldValue = inst.ProjectPath
-		inst.ProjectPath = value
-	case "command":
-		oldValue = inst.Command
-		inst.Command = value
-	case "tool":
-		oldValue = inst.Tool
-		inst.Tool = value
-	case "wrapper":
-		oldValue = inst.Wrapper
-		inst.Wrapper = value
-	case "channels":
-		// channels is a Claude Code CLI flag; only meaningful for claude sessions.
-		if inst.Tool != "claude" {
-			out.Error(
-				fmt.Sprintf("channels only supported for claude sessions (this session's tool is %q); requires --channels on the claude binary", inst.Tool),
-				ErrCodeInvalidOperation,
-			)
-			os.Exit(1)
-		}
-		oldValue = strings.Join(inst.Channels, ",")
-		// Parse CSV value: trim whitespace, drop empties.
-		parsed := []string{}
-		for _, raw := range strings.Split(value, ",") {
-			if s := strings.TrimSpace(raw); s != "" {
-				parsed = append(parsed, s)
-			}
-		}
-		inst.Channels = parsed
-	case "color":
-		// Per-session color tint (issue #391). Opt-in; empty clears.
-		oldValue = inst.Color
-		trimmed := strings.TrimSpace(value)
-		if !isValidSessionColor(trimmed) {
-			out.Error(
-				fmt.Sprintf("invalid color %q — expected '#RRGGBB', ANSI '0'..'255', or '' to clear", trimmed),
-				ErrCodeInvalidOperation,
-			)
-			os.Exit(1)
-		}
-		inst.Color = trimmed
-	case "extra-args":
-		// extra-args are passed to the claude binary by buildClaudeExtraFlags;
-		// only meaningful for claude sessions. Every positional arg after the
-		// field name is treated as one already-tokenised extra arg. Use `--`
-		// so Go's flag package leaves tokens starting with `-` alone:
-		//   agent-deck session set <id> extra-args -- --model opus
-		// Empty string clears all extra args. Empty tokens mixed with real
-		// ones are dropped (avoid emitting literal `''` to claude).
-		//
-		// Note: extra-args persist in state.db as plaintext. Do NOT pass
-		// secrets like API keys via --extra-arg.
-		if inst.Tool != "claude" {
-			out.Error(
-				fmt.Sprintf("extra-args only supported for claude sessions (this session's tool is %q); claude is the only tool whose builder appends user extra args", inst.Tool),
-				ErrCodeInvalidOperation,
-			)
-			os.Exit(1)
-		}
-		oldValue = strings.Join(inst.ExtraArgs, " ")
-		cleaned := make([]string, 0, len(extraArgTokens))
-		for _, tok := range extraArgTokens {
-			if tok != "" {
-				cleaned = append(cleaned, tok)
-			}
-		}
-		if len(cleaned) == 0 {
-			inst.ExtraArgs = nil
-		} else {
-			inst.ExtraArgs = cleaned
-		}
-	case "claude-session-id":
-		oldValue = inst.ClaudeSessionID
-		inst.ClaudeSessionID = value
-		inst.ClaudeDetectedAt = time.Now()
-		// Also update tmux environment if session is running
-		if tmuxSess := inst.GetTmuxSession(); tmuxSess != nil && tmuxSess.Exists() {
-			_ = tmux.Exec(inst.TmuxSocketName, "set-environment", "-t", tmuxSess.Name, "CLAUDE_SESSION_ID", value).Run()
-		}
-	case "gemini-session-id":
-		oldValue = inst.GeminiSessionID
-		inst.GeminiSessionID = value
-		inst.GeminiDetectedAt = time.Now()
-		// Also update tmux environment if session is running
-		if tmuxSess := inst.GetTmuxSession(); tmuxSess != nil && tmuxSess.Exists() {
-			_ = tmux.Exec(inst.TmuxSocketName, "set-environment", "-t", tmuxSess.Name, "GEMINI_SESSION_ID", value).Run()
-		}
+	// Delegate to session.SetField so CLI and TUI share validation. The
+	// extraArgTokens slice carries pre-tokenized argv for extra-args (CLI
+	// preserves values with spaces); SetField ignores it for other fields.
+	oldValue, postCommit, setErr := session.SetField(inst, field, value, extraArgTokens)
+	if setErr != nil {
+		out.Error(setErr.Error(), ErrCodeInvalidOperation)
+		os.Exit(1)
+		return // unreachable, satisfies staticcheck SA5011
+	}
+	// CLI holds no lock — run tmux side effects inline. TUI defers them
+	// until after instancesMu.Unlock.
+	if postCommit != nil {
+		postCommit()
 	}
 
 	// Save
@@ -1094,18 +1100,23 @@ func handleSessionSet(profile string, args []string) {
 		"new_value": value,
 	})
 
-	// v1.7.22: emit telegram topology warnings whenever the signals the
-	// validator cares about change (wrapper or channels). The silent-path
-	// case writes nothing — see ValidateTelegramTopology (#658).
-	if field == "wrapper" || field == "channels" {
-		cfgDir := session.GetClaudeConfigDirForGroup(inst.GroupPath)
-		globalTelegramEnabled, _ := readTelegramGloballyEnabled(cfgDir)
-		emitTelegramWarnings(os.Stderr, session.TelegramValidatorInput{
-			GlobalEnabled:   globalTelegramEnabled,
-			SessionChannels: inst.Channels,
-			SessionWrapper:  inst.Wrapper,
-		})
+	maybeEmitSessionSetTelegramWarnings(os.Stderr, session.GetClaudeConfigDirForGroup(inst.GroupPath), inst, field)
+}
+
+// maybeEmitSessionSetTelegramWarnings is the post-mutation telegram-topology
+// hook for `agent-deck session set` (v1.7.22 / #658). Gated to wrapper and
+// channels — other fields are silent. claudeCfgDir lets tests inject a temp
+// dir without touching the real ~/.claude lookup.
+func maybeEmitSessionSetTelegramWarnings(out io.Writer, claudeCfgDir string, inst *session.Instance, field string) {
+	if field != "wrapper" && field != "channels" {
+		return
 	}
+	globalTelegramEnabled, _ := readTelegramGloballyEnabled(claudeCfgDir)
+	emitTelegramWarnings(out, session.TelegramValidatorInput{
+		GlobalEnabled:   globalTelegramEnabled,
+		SessionChannels: inst.Channels,
+		SessionWrapper:  inst.Wrapper,
+	})
 }
 
 // loadSessionData loads storage and session data for a profile
@@ -1280,12 +1291,17 @@ func handleSessionSetParent(profile string, args []string) {
 	jsonOutput := fs.Bool("json", false, "Output as JSON")
 	quiet := fs.Bool("quiet", false, "Minimal output")
 	quietShort := fs.Bool("q", false, "Minimal output (short)")
+	// #786: post-hoc set-parent must not silently rewrite the child's
+	// group. Inheritance is opt-in via this flag.
+	inheritGroup := fs.Bool("inherit-group", false,
+		"Also rewrite child's group to match parent's (off by default; #786)")
 
 	fs.Usage = func() {
-		fmt.Println("Usage: agent-deck session set-parent <session> <parent>")
+		fmt.Println("Usage: agent-deck session set-parent <session> <parent> [--inherit-group]")
 		fmt.Println()
 		fmt.Println("Link a session as a sub-session of another session.")
-		fmt.Println("The session will inherit the parent's group.")
+		fmt.Println("The session's group is preserved by default; pass --inherit-group")
+		fmt.Println("to also adopt the parent's group.")
 		fmt.Println("This works for any session, including those created with --no-parent.")
 		fmt.Println()
 		fmt.Println("Options:")
@@ -1352,9 +1368,12 @@ func handleSessionSetParent(profile string, args []string) {
 		}
 	}
 
-	// Set parent (with project path for --add-dir access) and inherit group
+	// Set parent (with project path for --add-dir access). Group is only
+	// rewritten on explicit --inherit-group opt-in; see #786.
 	inst.SetParentWithPath(parentInst.ID, parentInst.ProjectPath)
-	inst.GroupPath = parentInst.GroupPath
+	if *inheritGroup {
+		inst.GroupPath = parentInst.GroupPath
+	}
 
 	// Save
 	groupTree := session.NewGroupTreeWithGroups(instances, groupsData)
@@ -1369,7 +1388,8 @@ func handleSessionSetParent(profile string, args []string) {
 		"session_title":   inst.Title,
 		"parent_id":       parentInst.ID,
 		"parent_title":    parentInst.Title,
-		"inherited_group": inst.GroupPath,
+		"group":           inst.GroupPath,
+		"group_inherited": *inheritGroup,
 	})
 }
 
@@ -1532,6 +1552,90 @@ func handleSessionSetTransitionNotify(profile string, args []string) {
 		"session_id":           inst.ID,
 		"session_title":        inst.Title,
 		"no_transition_notify": suppress,
+	})
+}
+
+// handleSessionSetTitleLock toggles Instance.TitleLocked (#697). When on, the
+// claude-hook name-sync path (applyClaudeTitleSync) is a no-op for this
+// session, preserving the conductor-assigned title across Claude renames.
+func handleSessionSetTitleLock(profile string, args []string) {
+	fs := flag.NewFlagSet("session set-title-lock", flag.ExitOnError)
+	jsonOutput := fs.Bool("json", false, "Output as JSON")
+	quiet := fs.Bool("quiet", false, "Minimal output")
+	quietShort := fs.Bool("q", false, "Minimal output (short)")
+
+	fs.Usage = func() {
+		fmt.Println("Usage: agent-deck session set-title-lock <session> <on|off|true|false>")
+		fmt.Println()
+		fmt.Println("Lock or unlock a session's title from Claude session-name sync (#697).")
+		fmt.Println("When locked, Claude's --name / /rename will not overwrite the")
+		fmt.Println("agent-deck title. Conductors rely on this so semantic titles like")
+		fmt.Println("'SCRUM-351' survive Claude's auto-generated summaries.")
+		fmt.Println()
+		fmt.Println("Options:")
+		fs.PrintDefaults()
+		fmt.Println()
+		fmt.Println("Examples:")
+		fmt.Println("  agent-deck session set-title-lock SCRUM-351 on")
+		fmt.Println("  agent-deck session set-title-lock SCRUM-351 off")
+		fmt.Println("  agent-deck session set-title-lock worker true")
+	}
+
+	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
+		os.Exit(1)
+	}
+
+	if fs.NArg() < 2 {
+		fs.Usage()
+		os.Exit(1)
+	}
+
+	sessionID := fs.Arg(0)
+	value := strings.ToLower(strings.TrimSpace(fs.Arg(1)))
+	quietMode := *quiet || *quietShort
+	out := NewCLIOutput(*jsonOutput, quietMode)
+
+	var locked bool
+	switch value {
+	case "on", "true", "1", "yes":
+		locked = true
+	case "off", "false", "0", "no":
+		locked = false
+	default:
+		out.Error(fmt.Sprintf("invalid value %q: must be 'on' or 'off' (also true/false/1/0)", value), ErrCodeInvalidOperation)
+		os.Exit(1)
+	}
+
+	storage, instances, groupsData, err := loadSessionData(profile)
+	if err != nil {
+		out.Error(err.Error(), ErrCodeNotFound)
+		os.Exit(1)
+	}
+
+	inst, errMsg, errCode := ResolveSession(sessionID, instances)
+	if inst == nil {
+		out.Error(errMsg, errCode)
+		os.Exit(2)
+		return
+	}
+
+	inst.TitleLocked = locked
+
+	groupTree := session.NewGroupTreeWithGroups(instances, groupsData)
+	if err := storage.SaveWithGroups(instances, groupTree); err != nil {
+		out.Error(fmt.Sprintf("failed to save: %v", err), ErrCodeInvalidOperation)
+		os.Exit(1)
+	}
+
+	stateStr := "off"
+	if locked {
+		stateStr = "on"
+	}
+	out.Success(fmt.Sprintf("Title lock for '%s': %s", inst.Title, stateStr), map[string]interface{}{
+		"success":       true,
+		"session_id":    inst.ID,
+		"session_title": inst.Title,
+		"title_locked":  locked,
 	})
 }
 
@@ -2504,44 +2608,13 @@ func matchInstanceDataByTmuxName(instances []*session.InstanceData, tmuxSessionN
 	return nil
 }
 
-// isValidSessionColor validates a per-session color tint (issue #391).
-// Accepts:
-//   - "" (empty / opt-out)
-//   - "#RRGGBB" or "#rrggbb" (24-bit truecolor hex, exactly 6 hex digits)
-//   - "0".."255" (ANSI 256-palette index, decimal)
-//
-// Rejects everything else so typos like "red" or "#12" don't quietly persist
-// into the TUI render layer where they'd fall through to lipgloss defaults
-// with surprising results. Kept as a pure function so the test table stays
-// CLI-free (see TestIsValidSessionColor).
+// isValidSessionColor is a thin delegator to session.IsValidSessionColor
+// (issue #391). The validator now lives in the session package so the TUI
+// EditSessionDialog and CLI session_set share one source of truth; this
+// wrapper stays so cmd-package callers and the existing
+// TestIsValidSessionColor table in session_color_test.go keep working.
 func isValidSessionColor(v string) bool {
-	if v == "" {
-		return true
-	}
-	// Truecolor hex: '#' + 6 hex digits exactly.
-	if len(v) == 7 && v[0] == '#' {
-		for i := 1; i < 7; i++ {
-			c := v[i]
-			ok := (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
-			if !ok {
-				return false
-			}
-		}
-		return true
-	}
-	// ANSI 256-palette index: 0..255 as decimal.
-	n := 0
-	if len(v) == 0 || len(v) > 3 {
-		return false
-	}
-	for i := 0; i < len(v); i++ {
-		c := v[i]
-		if c < '0' || c > '9' {
-			return false
-		}
-		n = n*10 + int(c-'0')
-	}
-	return n >= 0 && n <= 255
+	return session.IsValidSessionColor(v)
 }
 
 // handleSessionSearch implements issue #483 — search across Claude session
