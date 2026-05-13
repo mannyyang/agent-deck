@@ -356,8 +356,32 @@ func SaveConductorMeta(meta *ConductorMeta) error {
 	if len(meta.Env) > 0 || meta.EnvFile != "" {
 		perm = 0o600 // restrict access when env vars contain secrets
 	}
-	if err := os.WriteFile(metaPath, data, perm); err != nil {
-		return fmt.Errorf("failed to write meta.json: %w", err)
+	// Write atomically via unique temp-file + rename so a crash mid-write
+	// cannot truncate or corrupt meta.json. Same pattern used by
+	// event_writer.go, mcp_catalog.go, transition_notifier.go, and
+	// userconfig.go. We use a unique suffix (CreateTemp) so concurrent
+	// writers don't clobber each other's staging file.
+	tmpFile, err := os.CreateTemp(dir, "meta.json.tmp.*")
+	if err != nil {
+		return fmt.Errorf("failed to create meta.json temp: %w", err)
+	}
+	tmpPath := tmpFile.Name()
+	if _, werr := tmpFile.Write(data); werr != nil {
+		_ = tmpFile.Close()
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("failed to write meta.json temp: %w", werr)
+	}
+	if cerr := tmpFile.Close(); cerr != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("failed to close meta.json temp: %w", cerr)
+	}
+	if cerr := os.Chmod(tmpPath, perm); cerr != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("failed to chmod meta.json temp: %w", cerr)
+	}
+	if rerr := os.Rename(tmpPath, metaPath); rerr != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("failed to rename meta.json temp: %w", rerr)
 	}
 	return nil
 }
@@ -431,15 +455,17 @@ func matchesTemplateContent(actual, expected string) bool {
 
 // SetupConductor creates a Claude conductor for backward compatibility.
 // New callers should prefer SetupConductorWithAgent.
-func SetupConductor(name, profile string, heartbeatEnabled bool, clearOnCompact bool, description string, customClaudeMD string, customPolicyMD string, env map[string]string, envFile string) error {
-	return SetupConductorWithAgent(name, profile, ConductorAgentClaude, heartbeatEnabled, clearOnCompact, description, customClaudeMD, customPolicyMD, env, envFile)
+func SetupConductor(name, profile string, heartbeatEnabled bool, clearOnCompact bool, description string, customClaudeMD string, customPolicyMD string, customHeartbeatRulesMD string, env map[string]string, envFile string) error {
+	return SetupConductorWithAgent(name, profile, ConductorAgentClaude, heartbeatEnabled, clearOnCompact, description, customClaudeMD, customPolicyMD, customHeartbeatRulesMD, env, envFile)
 }
 
 // SetupConductorWithAgent creates the conductor directory, agent-specific instructions file, and meta.json.
 // If customInstructionsMD is provided, creates a symlink instead of writing the template.
 // If customPolicyMD is provided, creates a per-conductor POLICY.md symlink (overrides the shared POLICY.md).
+// If customHeartbeatRulesMD is provided, creates a per-conductor HEARTBEAT_RULES.md symlink
+// (overrides the shared HEARTBEAT_RULES.md and any per-profile override).
 // It does NOT register the session (that's done by the CLI handler which has access to storage).
-func SetupConductorWithAgent(name, profile, agent string, heartbeatEnabled bool, clearOnCompact bool, description string, customInstructionsMD string, customPolicyMD string, env map[string]string, envFile string) error {
+func SetupConductorWithAgent(name, profile, agent string, heartbeatEnabled bool, clearOnCompact bool, description string, customInstructionsMD string, customPolicyMD string, customHeartbeatRulesMD string, env map[string]string, envFile string) error {
 	if err := ValidateConductorName(name); err != nil {
 		return err
 	}
@@ -493,6 +519,16 @@ func SetupConductorWithAgent(name, profile, agent string, heartbeatEnabled bool,
 		policyPath := filepath.Join(dir, "POLICY.md")
 		if err := createSymlinkWithExpansion(policyPath, customPolicyMD); err != nil {
 			return fmt.Errorf("failed to create POLICY.md symlink: %w", err)
+		}
+	}
+
+	// Write per-conductor HEARTBEAT_RULES.md symlink if custom path provided.
+	// Takes precedence over the per-profile and global HEARTBEAT_RULES.md
+	// (lookup order is mirrored by both conductor/bridge.py and the OS heartbeat script).
+	if customHeartbeatRulesMD != "" {
+		rulesPath := filepath.Join(dir, "HEARTBEAT_RULES.md")
+		if err := createSymlinkWithExpansion(rulesPath, customHeartbeatRulesMD); err != nil {
+			return fmt.Errorf("failed to create HEARTBEAT_RULES.md symlink: %w", err)
 		}
 	}
 
@@ -736,8 +772,31 @@ fi
 # Only send if the session is running
 STATUS=$(agent-deck -p "$PROFILE" session show "$SESSION" --json 2>/dev/null | awk -F'"' '/"status"/{print $4; exit}')
 
+# Resolve HEARTBEAT_RULES.md (per-conductor, then per-profile, then global fallback).
+# Mirrors the lookup order used by conductor/bridge.py since PR #218.
+RULES_FILE=""
+for candidate in \
+    "$HOME/.agent-deck/conductor/{NAME}/HEARTBEAT_RULES.md" \
+    "$HOME/.agent-deck/conductor/{PROFILE}/HEARTBEAT_RULES.md" \
+    "$HOME/.agent-deck/conductor/HEARTBEAT_RULES.md"; do
+    if [ -f "$candidate" ]; then
+        RULES_FILE="$candidate"
+        break
+    fi
+done
+
+MSG="[HEARTBEAT] Check sessions in your group ({NAME}). List any that are waiting, auto-respond where safe, and report what needs my attention."
+if [ -n "$RULES_FILE" ]; then
+    RULES=$(cat "$RULES_FILE")
+    if [ -n "$RULES" ]; then
+        MSG="$MSG
+
+$RULES"
+    fi
+fi
+
 if [ "$STATUS" = "idle" ] || [ "$STATUS" = "waiting" ]; then
-    agent-deck -p "$PROFILE" session send "$SESSION" "Heartbeat: Check sessions in your group ({NAME}). List any that are waiting, auto-respond where safe, and report what needs my attention." --no-wait -q
+    agent-deck -p "$PROFILE" session send "$SESSION" "$MSG" --no-wait -q
 fi
 `
 
@@ -784,7 +843,7 @@ const conductorHeartbeatPlistTemplate = `<?xml version="1.0" encoding="UTF-8"?>
 // SetupConductorProfile creates a default Claude conductor for a profile.
 // Deprecated: Use SetupConductor instead. Kept for backward compatibility.
 func SetupConductorProfile(profile string) error {
-	return SetupConductor(profile, profile, true, true, "", "", "", nil, "")
+	return SetupConductor(profile, profile, true, true, "", "", "", "", nil, "")
 }
 
 // createSymlinkWithExpansion creates a symlink from target to source, with ~ expansion and validation.

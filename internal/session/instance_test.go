@@ -1401,6 +1401,7 @@ func TestBuildCodexCommand_CustomWrapperPreservesToolIdentity(t *testing.T) {
 	}
 
 	cfg := &UserConfig{
+		Codex: CodexSettings{Command: "codex-v2"},
 		Tools: map[string]ToolDef{
 			"my-codex": {
 				Command:        "codex-wrapper",
@@ -1431,6 +1432,218 @@ func TestBuildCodexCommand_CustomWrapperPreservesToolIdentity(t *testing.T) {
 	cmd = inst.buildCodexCommand(inst.Command)
 	if !strings.Contains(cmd, "codex-wrapper resume 019d1af6-c425-7791-8fd1-38c0fc43062c") {
 		t.Fatalf("buildCodexCommand should resume through the custom wrapper, got %q", cmd)
+	}
+}
+
+func TestBuildCodexCommand_UsesConfiguredCommandForBuiltinCodex(t *testing.T) {
+	tmpDir := t.TempDir()
+	originalHome := os.Getenv("HOME")
+	os.Setenv("HOME", tmpDir)
+	defer os.Setenv("HOME", originalHome)
+	ClearUserConfigCache()
+	defer ClearUserConfigCache()
+
+	cfg := &UserConfig{Codex: CodexSettings{Command: "codex-v2", YoloMode: true}}
+	if err := SaveUserConfig(cfg); err != nil {
+		t.Fatalf("SaveUserConfig: %v", err)
+	}
+	ClearUserConfigCache()
+
+	inst := NewInstanceWithTool("configured", "/tmp/configured", "codex")
+	cmd := inst.buildCodexCommand("codex")
+	if !strings.Contains(cmd, "codex-v2 --yolo") {
+		t.Fatalf("configured Codex command should be used with yolo flag, got %q", cmd)
+	}
+	if strings.Contains(cmd, " codex --yolo") {
+		t.Fatalf("default codex command should not be used when [codex].command is set, got %q", cmd)
+	}
+}
+
+func TestBuildCodexCommand_ConfiguredCommandResume(t *testing.T) {
+	tmpDir := t.TempDir()
+	originalHome := os.Getenv("HOME")
+	os.Setenv("HOME", tmpDir)
+	defer os.Setenv("HOME", originalHome)
+	originalCodexHome := os.Getenv("CODEX_HOME")
+	os.Unsetenv("CODEX_HOME")
+	defer func() {
+		if originalCodexHome != "" {
+			_ = os.Setenv("CODEX_HOME", originalCodexHome)
+		}
+	}()
+	ClearUserConfigCache()
+	defer ClearUserConfigCache()
+
+	cfg := &UserConfig{Codex: CodexSettings{Command: "codex-v2"}}
+	if err := SaveUserConfig(cfg); err != nil {
+		t.Fatalf("SaveUserConfig: %v", err)
+	}
+	ClearUserConfigCache()
+
+	inst := NewInstanceWithTool("configured-resume", "/tmp/configured-resume", "codex")
+	id := "bbbbbbbb-1111-2222-3333-444444444444"
+	inst.CodexSessionID = id
+	writeFakeCodexRollout(t, filepath.Join(tmpDir, ".codex"), id)
+
+	cmd := inst.buildCodexCommand("codex")
+	if !strings.Contains(cmd, "codex-v2 resume "+id) {
+		t.Fatalf("configured Codex command should be used for resume, got %q", cmd)
+	}
+}
+
+func TestBuildCodexCommand_ExplicitCommandBeatsConfiguredCommand(t *testing.T) {
+	tmpDir := t.TempDir()
+	originalHome := os.Getenv("HOME")
+	os.Setenv("HOME", tmpDir)
+	defer os.Setenv("HOME", originalHome)
+	ClearUserConfigCache()
+	defer ClearUserConfigCache()
+
+	cfg := &UserConfig{Codex: CodexSettings{Command: "codex-v2"}}
+	if err := SaveUserConfig(cfg); err != nil {
+		t.Fatalf("SaveUserConfig: %v", err)
+	}
+	ClearUserConfigCache()
+
+	inst := NewInstanceWithTool("explicit", "/tmp/explicit", "codex")
+	cmd := inst.buildCodexCommand("codex-nightly")
+	if !strings.Contains(cmd, "codex-nightly") {
+		t.Fatalf("explicit Codex command should be preserved, got %q", cmd)
+	}
+	if strings.Contains(cmd, "codex-v2") {
+		t.Fatalf("configured command should not override explicit session command, got %q", cmd)
+	}
+}
+
+func TestBuildCodexCommand_InlineCodexHomeForRolloutCheck(t *testing.T) {
+	tmpDir := t.TempDir()
+	originalHome := os.Getenv("HOME")
+	os.Setenv("HOME", tmpDir)
+	defer os.Setenv("HOME", originalHome)
+	originalCodexHome := os.Getenv("CODEX_HOME")
+	os.Unsetenv("CODEX_HOME")
+	defer func() {
+		if originalCodexHome != "" {
+			_ = os.Setenv("CODEX_HOME", originalCodexHome)
+		}
+	}()
+	ClearUserConfigCache()
+	defer ClearUserConfigCache()
+
+	codexHome := filepath.Join(tmpDir, ".codex-work")
+	cfg := &UserConfig{Codex: CodexSettings{Command: "CODEX_HOME=" + codexHome + " codex"}}
+	if err := SaveUserConfig(cfg); err != nil {
+		t.Fatalf("SaveUserConfig: %v", err)
+	}
+	ClearUserConfigCache()
+
+	inst := NewInstanceWithTool("inline-home", "/tmp/inline-home", "codex")
+	id := "cccccccc-1111-2222-3333-444444444444"
+	inst.CodexSessionID = id
+	writeFakeCodexRollout(t, codexHome, id)
+
+	cmd := inst.buildCodexCommand("codex")
+	if !strings.Contains(cmd, "CODEX_HOME="+codexHome+" codex resume "+id) {
+		t.Fatalf("inline CODEX_HOME command should resume from configured home, got %q", cmd)
+	}
+}
+
+func TestBuildCodexCommand_QuotedInlineCodexHomeWithSpaces(t *testing.T) {
+	tmpDir := t.TempDir()
+	originalHome := os.Getenv("HOME")
+	os.Setenv("HOME", tmpDir)
+	defer os.Setenv("HOME", originalHome)
+	originalCodexHome := os.Getenv("CODEX_HOME")
+	os.Unsetenv("CODEX_HOME")
+	defer func() {
+		if originalCodexHome != "" {
+			_ = os.Setenv("CODEX_HOME", originalCodexHome)
+		}
+	}()
+	ClearUserConfigCache()
+	defer ClearUserConfigCache()
+
+	codexHome := filepath.Join(tmpDir, "codex work")
+	cfg := &UserConfig{Codex: CodexSettings{Command: `CODEX_HOME="` + codexHome + `" codex`}}
+	if err := SaveUserConfig(cfg); err != nil {
+		t.Fatalf("SaveUserConfig: %v", err)
+	}
+	ClearUserConfigCache()
+
+	inst := NewInstanceWithTool("quoted-inline-home", "/tmp/quoted-inline-home", "codex")
+	id := "eeeeeeee-1111-2222-3333-444444444444"
+	inst.CodexSessionID = id
+	writeFakeCodexRollout(t, codexHome, id)
+
+	cmd := inst.buildCodexCommand("codex")
+	if !strings.Contains(cmd, `CODEX_HOME="`+codexHome+`" codex resume `+id) {
+		t.Fatalf("quoted inline CODEX_HOME command should resume from configured home, got %q", cmd)
+	}
+	if inst.CodexSessionID != id {
+		t.Fatalf("CodexSessionID should be preserved when quoted CODEX_HOME rollout exists, got %q", inst.CodexSessionID)
+	}
+}
+
+func TestCodexHomeFromCommand_PreservesQuotedAssignmentSpaces(t *testing.T) {
+	tmpDir := t.TempDir()
+	codexHome := filepath.Join(tmpDir, "codex work")
+
+	got := codexHomeFromCommand(`FOO=bar CODEX_HOME="` + codexHome + `" codex`)
+	if got != codexHome {
+		t.Fatalf("codexHomeFromCommand() = %q, want %q", got, codexHome)
+	}
+
+	got = codexHomeFromCommand(`CODEX_HOME='` + codexHome + `' codex`)
+	if got != codexHome {
+		t.Fatalf("codexHomeFromCommand() single quoted = %q, want %q", got, codexHome)
+	}
+}
+
+func TestBuildCodexCommand_InlineCodexHomeDropsStaleID(t *testing.T) {
+	tmpDir := t.TempDir()
+	originalHome := os.Getenv("HOME")
+	os.Setenv("HOME", tmpDir)
+	defer os.Setenv("HOME", originalHome)
+	originalCodexHome := os.Getenv("CODEX_HOME")
+	os.Unsetenv("CODEX_HOME")
+	defer func() {
+		if originalCodexHome != "" {
+			_ = os.Setenv("CODEX_HOME", originalCodexHome)
+		}
+	}()
+	ClearUserConfigCache()
+	defer ClearUserConfigCache()
+
+	if err := os.MkdirAll(filepath.Join(tmpDir, ".agent-deck", "hooks"), 0o700); err != nil {
+		t.Fatalf("mkdir hooks: %v", err)
+	}
+
+	codexHome := filepath.Join(tmpDir, ".codex-work")
+	cfg := &UserConfig{Codex: CodexSettings{Command: "CODEX_HOME=" + codexHome + " codex"}}
+	if err := SaveUserConfig(cfg); err != nil {
+		t.Fatalf("SaveUserConfig: %v", err)
+	}
+	ClearUserConfigCache()
+
+	inst := NewInstanceWithTool("inline-stale", "/tmp/inline-stale", "codex")
+	id := "dddddddd-1111-2222-3333-444444444444"
+	inst.CodexSessionID = id
+	inst.CodexDetectedAt = time.Now()
+	WriteHookSessionAnchor(inst.ID, id)
+	writeFakeCodexRollout(t, filepath.Join(tmpDir, ".codex"), id)
+	if err := os.MkdirAll(filepath.Join(codexHome, "sessions", "2026", "04", "24"), 0o755); err != nil {
+		t.Fatalf("mkdir custom codex sessions: %v", err)
+	}
+
+	cmd := inst.buildCodexCommand("codex")
+	if strings.Contains(cmd, "resume "+id) {
+		t.Fatalf("resume should be dropped when rollout is absent from inline CODEX_HOME, got %q", cmd)
+	}
+	if inst.CodexSessionID != "" {
+		t.Fatalf("CodexSessionID should be cleared after stale-id drop, got %q", inst.CodexSessionID)
+	}
+	if got := ReadHookSessionAnchor(inst.ID); got != "" {
+		t.Fatalf(".sid anchor should be cleared after stale-id drop, got %q", got)
 	}
 }
 
@@ -3042,6 +3255,15 @@ func TestExtractCodexSessionIDFromPath_DeletedSuffix(t *testing.T) {
 	}
 }
 
+func TestExtractCodexSessionIDFromPath_CustomCodexHome(t *testing.T) {
+	path := "/tmp/codex-work/sessions/2026/02/28/rollout-2026-02-28T00-42-18-019c9ffa-c9d6-7be1-9e1c-527080e68951.jsonl"
+	got := extractCodexSessionIDFromPath(path)
+	want := "019c9ffa-c9d6-7be1-9e1c-527080e68951"
+	if got != want {
+		t.Fatalf("extractCodexSessionIDFromPath() custom home = %q, want %q", got, want)
+	}
+}
+
 func TestParsePSParentChildMap(t *testing.T) {
 	procTable := []byte("100 1\n101 100\n102 100\n103 101\nbad-line\n104 invalid\n105 0\n")
 	got := parsePSParentChildMap(procTable)
@@ -3146,6 +3368,38 @@ func TestInstance_UpdateHookStatus_Nil(t *testing.T) {
 
 	if inst.hookStatus != "" {
 		t.Errorf("hookStatus should be empty, got %q", inst.hookStatus)
+	}
+}
+
+func TestInstance_ClearHookStatus_RemovesPersistedHookFile(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	inst := NewInstanceWithTool("test", "/tmp", "codex")
+	inst.ID = "clear-hook-file"
+
+	hooksDir := GetHooksDir()
+	if err := os.MkdirAll(hooksDir, 0o755); err != nil {
+		t.Fatalf("mkdir hooks: %v", err)
+	}
+	hookPath := filepath.Join(hooksDir, inst.ID+".json")
+	if err := os.WriteFile(hookPath, []byte(`{"status":"running","event":"UserPromptSubmit","ts":1}`), 0o644); err != nil {
+		t.Fatalf("write hook file: %v", err)
+	}
+
+	inst.UpdateHookStatus(&HookStatus{
+		Status:    "running",
+		Event:     "UserPromptSubmit",
+		UpdatedAt: time.Now(),
+	})
+
+	inst.ClearHookStatus()
+
+	if status, fresh := inst.GetHookStatus(); status != "" || fresh {
+		t.Fatalf("hook status = %q fresh=%v, want cleared", status, fresh)
+	}
+	if _, err := os.Stat(hookPath); !os.IsNotExist(err) {
+		t.Fatalf("hook file still exists or stat failed with unexpected error: %v", err)
 	}
 }
 
@@ -3569,6 +3823,82 @@ func TestInstance_BuildClaudeResumeCommand_AfterFlap_ResumesRichID(t *testing.T)
 	}
 	if strings.Contains(cmd, freshID) {
 		t.Fatalf("buildClaudeResumeCommand = %q, must NOT reference freshID %q", cmd, freshID)
+	}
+}
+
+// TestInstance_UpdateHookStatus_ClearCreatesNewSession_RebindsRegardlessOfSize
+// pins issue #856. When the user runs `/clear` (or any user-initiated session
+// switch) the new jsonl is by definition smaller than the dormant old one, so
+// the strict size guard added in v1.7.23 rejects it on every poll until the
+// new conversation outgrows the old one in bytes.
+//
+// The discriminator is mtime gap: in a flap (issue #661) the user keeps typing
+// into the rich session so its mtime stays fresh; in /clear the user abandons
+// the old session, so its mtime stales while the new jsonl's mtime advances.
+// When the candidate's jsonl is significantly newer than the current's (by
+// more than the mtime-grace threshold), this is a user-initiated new session
+// and must rebind regardless of size.
+func TestInstance_UpdateHookStatus_ClearCreatesNewSession_RebindsRegardlessOfSize(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(tmpHome, ".claude"))
+	ClearUserConfigCache()
+	t.Cleanup(ClearUserConfigCache)
+
+	projectPath := filepath.Join(tmpHome, "project")
+	if err := os.MkdirAll(projectPath, 0o755); err != nil {
+		t.Fatalf("mkdir project: %v", err)
+	}
+	inst := NewInstanceWithTool("hook-clear-rebind", projectPath, "claude")
+
+	oldID := "5ea244ce-0000-0000-0000-000000000001"
+	newID := "2266314c-0000-0000-0000-000000000002"
+
+	// Old rich session (~209KB, like the issue's evidence).
+	oldPath := seedClaudeJSONL(t, inst, oldID, 200, 1024)
+	// User runs /clear, then sends a prompt → new session writes 1 record.
+	newPath := seedClaudeJSONL(t, inst, newID, 1, 8)
+
+	// Mtime gap: the old session is dormant (last touched ~2 minutes ago),
+	// the new session's jsonl is fresh (just written). This mirrors the real
+	// /clear timeline — between the user's last interaction with the old
+	// session and the first prompt of the new one, time has passed.
+	now := time.Now()
+	oldMtime := now.Add(-2 * time.Minute)
+	if err := os.Chtimes(oldPath, oldMtime, oldMtime); err != nil {
+		t.Fatalf("chtimes old: %v", err)
+	}
+	if err := os.Chtimes(newPath, now, now); err != nil {
+		t.Fatalf("chtimes new: %v", err)
+	}
+
+	inst.ClaudeSessionID = oldID
+
+	inst.UpdateHookStatus(&HookStatus{
+		Status:    "running",
+		SessionID: newID,
+		Event:     "UserPromptSubmit",
+		UpdatedAt: time.Now(),
+	})
+
+	if inst.ClaudeSessionID != newID {
+		t.Fatalf("ClaudeSessionID = %q, want %q (/clear-created new session must win even though smaller)",
+			inst.ClaudeSessionID, newID)
+	}
+
+	// And the lifecycle log must record this as a rebind, not a reject.
+	events := readLifecycleEvents(t)
+	sawRebind := false
+	for _, ev := range events {
+		if ev.Action == "reject" && ev.Reason == "candidate_has_less_conversation_data" {
+			t.Fatalf("expected rebind for /clear-created session, got reject: %+v", ev)
+		}
+		if ev.Action == "rebind" && ev.NewID == newID {
+			sawRebind = true
+		}
+	}
+	if !sawRebind {
+		t.Fatalf("expected rebind event with new_id=%s; events: %+v", newID, events)
 	}
 }
 

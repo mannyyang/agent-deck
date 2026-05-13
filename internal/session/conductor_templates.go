@@ -780,11 +780,13 @@ def run_cli(
     try:
         # Use Popen + communicate(timeout=) so we have the proc object available
         # when TimeoutExpired fires — subprocess.run() does NOT set exc.proc.
+        # errors="replace" handles non-UTF-8 bytes in CLI output (ANSI escapes etc.).
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            errors="replace",
             start_new_session=True,  # own process group → killpg kills grandchildren too
         )
         try:
@@ -823,13 +825,23 @@ def get_session_status(session: str, profile: str | None = None) -> str:
 
 
 def get_session_output(session: str, profile: str | None = None) -> str:
-    """Get the last response from a session."""
+    """Get the last response from a session.
+
+    Uses --json mode so we get the structured 'content' field (the actual
+    assistant reply) instead of the raw pane capture (which includes the
+    cosmetic frame / statusline at the top and can be mistaken for a reply).
+    """
     result = run_cli(
-        "session", "output", session, "-q", profile=profile, timeout=30
+        "session", "output", session, "--json", profile=profile, timeout=30
     )
     if result.returncode != 0:
         return f"[Error getting output: {result.stderr.strip()}]"
-    return result.stdout.strip()
+    try:
+        data = json.loads(result.stdout)
+        return (data.get("content") or "").strip()
+    except json.JSONDecodeError:
+        # Fallback: stdout might be the legacy raw-text format.
+        return result.stdout.strip()
 
 
 def send_to_conductor(
@@ -844,8 +856,12 @@ def send_to_conductor(
     Returns (success, response_text). When wait_for_reply=False, response_text is "".
     """
     if wait_for_reply:
-        # Single-call flow: send + wait + print raw response.
-        # Avoids extra status/output polling round-trips.
+        # ` + "`" + `session send --wait` + "`" + ` returns only the send-confirmation as JSON;
+        # the response itself is printed as a raw pane capture afterward.
+        # We ignore that stdout entirely and re-fetch via ` + "`" + `session output
+        # --json` + "`" + `, which DOES return a clean { content, role, ... } object.
+        # ` + "`" + `--wait` + "`" + ` blocks until the assistant's JSONL entry is flushed, so
+        # the subsequent output call sees the new reply.
         result = run_cli(
             "session", "send", session, message,
             "--wait", "--timeout", f"{response_timeout}s", "-q",
@@ -862,6 +878,9 @@ def send_to_conductor(
             "Failed to send to conductor: %s", result.stderr.strip()
         )
         return False, ""
+    if wait_for_reply:
+        # Now fetch the clean assistant reply.
+        return True, get_session_output(session, profile=profile)
     return True, result.stdout.strip()
 
 

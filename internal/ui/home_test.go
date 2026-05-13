@@ -2487,29 +2487,57 @@ func TestRebuildFlatItemsKeepsValidStatusFilter(t *testing.T) {
 }
 
 func TestMatchesStatusFilter(t *testing.T) {
+	// Default matches upstream's original hardcoded behavior so existing
+	// users see no change unless they opt into a narrower exclude-set.
+	defaultExcludes := map[session.Status]bool{
+		session.StatusError:   true,
+		session.StatusStopped: true,
+	}
+	errorOnly := map[session.Status]bool{session.StatusError: true}
+	excludeNothing := map[session.Status]bool{}
+
 	tests := []struct {
-		filter session.Status
-		status session.Status
-		want   bool
+		name     string
+		filter   session.Status
+		status   session.Status
+		excludes map[session.Status]bool
+		want     bool
 	}{
-		// Active filter: excludes error and stopped only
-		{FilterModeActive, session.StatusRunning, true},
-		{FilterModeActive, session.StatusWaiting, true},
-		{FilterModeActive, session.StatusIdle, true},
-		{FilterModeActive, session.StatusStarting, true},
-		{FilterModeActive, session.StatusError, false},
-		{FilterModeActive, session.StatusStopped, false},
-		// Concrete status filters: exact match
-		{session.StatusRunning, session.StatusRunning, true},
-		{session.StatusRunning, session.StatusWaiting, false},
-		{session.StatusError, session.StatusError, true},
-		{session.StatusError, session.StatusStopped, false},
+		// Default exclude-set ({error, stopped}): % hides both, matching
+		// upstream's prior hardcoded behavior exactly.
+		{"default-running", FilterModeActive, session.StatusRunning, defaultExcludes, true},
+		{"default-waiting", FilterModeActive, session.StatusWaiting, defaultExcludes, true},
+		{"default-idle", FilterModeActive, session.StatusIdle, defaultExcludes, true},
+		{"default-starting", FilterModeActive, session.StatusStarting, defaultExcludes, true},
+		{"default-error-hidden", FilterModeActive, session.StatusError, defaultExcludes, false},
+		{"default-stopped-hidden", FilterModeActive, session.StatusStopped, defaultExcludes, false},
+
+		// Opt-in via active_filter_excludes = ["error"]: closed/stopped
+		// sessions remain visible — the regression fix for users who
+		// found the upstream default too aggressive.
+		{"erronly-stopped-visible", FilterModeActive, session.StatusStopped, errorOnly, true},
+		{"erronly-error-hidden", FilterModeActive, session.StatusError, errorOnly, false},
+		{"erronly-running-visible", FilterModeActive, session.StatusRunning, errorOnly, true},
+
+		// Empty exclude-set: % filter shows everything (degenerate but valid).
+		{"empty-error-visible", FilterModeActive, session.StatusError, excludeNothing, true},
+		{"empty-stopped-visible", FilterModeActive, session.StatusStopped, excludeNothing, true},
+
+		// Concrete status filters ignore the exclude-set entirely.
+		{"concrete-running-match", session.StatusRunning, session.StatusRunning, defaultExcludes, true},
+		{"concrete-running-no-match", session.StatusRunning, session.StatusWaiting, defaultExcludes, false},
+		{"concrete-error-match", session.StatusError, session.StatusError, defaultExcludes, true},
+		{"concrete-error-no-stopped", session.StatusError, session.StatusStopped, defaultExcludes, false},
 	}
 	for _, tt := range tests {
-		got := matchesStatusFilter(tt.filter, tt.status)
-		if got != tt.want {
-			t.Errorf("matchesStatusFilter(%q, %q) = %v, want %v", tt.filter, tt.status, got, tt.want)
-		}
+		t.Run(tt.name, func(t *testing.T) {
+			h := &Home{activeFilterExcludes: tt.excludes}
+			got := h.matchesStatusFilter(tt.filter, tt.status)
+			if got != tt.want {
+				t.Errorf("matchesStatusFilter(%q, %q, %v) = %v, want %v",
+					tt.filter, tt.status, tt.excludes, got, tt.want)
+			}
+		})
 	}
 }
 
@@ -2705,6 +2733,44 @@ func TestStatusUpdateMsg_PreservesSelectedSessionAcrossRebuild(t *testing.T) {
 
 	if got := selectedSessionID(home); got != s2.ID {
 		t.Fatalf("selected session = %q, want %q", got, s2.ID)
+	}
+}
+
+func TestStatusUpdateMsg_ReconcilesAttachedSessionBeforeRender(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	h := newAttachReturnTestHome()
+	inst := session.NewInstanceWithGroupAndTool("exited", "/tmp/exited", "work", "codex")
+	inst.ID = "exited-session"
+	inst.CreatedAt = time.Now().Add(-2 * time.Second)
+	inst.Status = session.StatusRunning
+	setAttachReturnTestInstances(h, []*session.Instance{inst})
+
+	hooksDir := session.GetHooksDir()
+	if err := os.MkdirAll(hooksDir, 0o755); err != nil {
+		t.Fatalf("mkdir hooks: %v", err)
+	}
+	hookPath := filepath.Join(hooksDir, inst.ID+".json")
+	hookBody := fmt.Sprintf(
+		`{"status":"running","session_id":"stale-session","event":"UserPromptSubmit","ts":%d}`,
+		time.Now().Unix(),
+	)
+	if err := os.WriteFile(hookPath, []byte(hookBody), 0o644); err != nil {
+		t.Fatalf("write stale hook: %v", err)
+	}
+
+	model, _ := h.Update(statusUpdateMsg{attachedSessionID: inst.ID})
+	home := model.(*Home)
+
+	if got := inst.GetStatusThreadSafe(); got != session.StatusError {
+		t.Fatalf("attached session status = %q, want %q", got, session.StatusError)
+	}
+	if got := home.getSessionRenderState(inst).status; got != session.StatusError {
+		t.Fatalf("render snapshot status = %q, want %q", got, session.StatusError)
+	}
+	if _, err := os.Stat(hookPath); !os.IsNotExist(err) {
+		t.Fatalf("stale hook file still exists or stat failed with unexpected error: %v", err)
 	}
 }
 

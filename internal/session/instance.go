@@ -34,7 +34,7 @@ import (
 var (
 	sessionLog                  = logging.ForComponent(logging.CompSession)
 	mcpLog                      = logging.ForComponent(logging.CompMCP)
-	codexSessionIDPathPatternRE = regexp.MustCompile(`/.codex/sessions/\S*/rollout-\S*-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl`)
+	codexSessionIDPathPatternRE = regexp.MustCompile(`/sessions/\S*/rollout-\S*-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl`)
 	uuidPatternRE               = regexp.MustCompile(`[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}`)
 	geminiPromptRE              = regexp.MustCompile(`^(>|>>>|\$|❯|➜|gemini>|✦)\s*$`)
 	shellPromptRE               = regexp.MustCompile(`^[\s]*(>|>>>|\$|❯|➜|#|%)\s*$`)
@@ -50,6 +50,10 @@ const (
 	StatusError    Status = "error"
 	StatusStarting Status = "starting" // Session is being created (tmux initializing)
 	StatusStopped  Status = "stopped"  // Session intentionally stopped by user (not crashed)
+	// StatusQueued: session is waiting for group capacity. v1.9.1 introduces
+	// group max_concurrent caps; a launch into a group at cap stores the
+	// instance with this status and starts it once a running session ends.
+	StatusQueued Status = "queued"
 )
 
 const wrapperPlaceholder = "{command}"
@@ -194,6 +198,33 @@ type Instance struct {
 	// no inbound delivery) which silently drops Telegram/Discord/Slack
 	// messages on conductor restart.
 	Channels []string `json:"channels,omitempty"`
+
+	// Plugins is the catalog-key list of Claude Code plugins enabled for
+	// this session via `agent-deck add --plugin <name>` /
+	// `session set <id> plugins <csv>`. Names are short catalog keys (NOT
+	// fully-qualified `<name>@<source>` ids) and resolve through the
+	// [plugins.<name>] table in ~/.agent-deck/config.toml at spawn time.
+	// When non-empty on a claude session, EnsureWorkerScratchConfigDir
+	// writes enabledPlugins[<id>] = true into the scratch settings.json so
+	// the plugin loads only for this session, not globally.
+	// RFC: docs/rfc/PLUGIN_ATTACH.md.
+	Plugins []string `json:"plugins,omitempty"`
+
+	// PluginChannelLinkDisabled opts the session out of the catalog-driven
+	// auto-link between Plugins and Channels (RFC §4.7). When true, an
+	// `--plugin foo` whose catalog entry has EmitsChannel=true does NOT
+	// auto-add `plugin:foo@source` to Channels. Useful for tools-only
+	// usage of channel-emitting plugins. CLI flag: `--no-channel-link`.
+	PluginChannelLinkDisabled bool `json:"plugin_channel_link_disabled,omitempty"`
+
+	// AutoLinkedChannels is the persisted set of channel ids that
+	// syncPluginChannels last added via the auto-link mechanism. Lets
+	// reconciliation distinguish "channel I owned" from "channel the
+	// user added manually" — without it, a plugin removed from the
+	// catalog or an opt-out toggle would leave stale autolinks behind
+	// (G4 / C2). Updated on every Plugins mutation; never written
+	// directly by users.
+	AutoLinkedChannels []string `json:"auto_linked_channels,omitempty"`
 
 	// WorkerScratchConfigDir is the ephemeral CLAUDE_CONFIG_DIR prepared
 	// for a non-conductor claude worker (issue #59, v1.7.68). The
@@ -497,7 +528,7 @@ func NewInstance(title, projectPath string) *Instance {
 	tmuxSess.SetClearOnRestart(GetTmuxSettings().ClearOnRestart)
 	tmuxSess.SetTerminalChromeEnabled(GetTerminalSettings().GetITermBadge())
 
-	return &Instance{
+	inst := &Instance{
 		ID:             id,
 		Title:          title,
 		ProjectPath:    projectPath,
@@ -508,6 +539,21 @@ func NewInstance(title, projectPath string) *Instance {
 		TmuxSocketName: socket,
 		tmuxSession:    tmuxSess,
 	}
+	logSessionCreated(inst)
+	return inst
+}
+
+// logSessionCreated emits one INFO record per new session. Single source of
+// truth so each NewInstance* constructor logs identically. See
+// logging-review G1 (2026-05-07).
+func logSessionCreated(inst *Instance) {
+	sessionLog.Info("session_created",
+		slog.String("instance_id", inst.ID),
+		slog.String("title", inst.Title),
+		slog.String("project_path", inst.ProjectPath),
+		slog.String("tool", inst.Tool),
+		slog.String("group_path", inst.GroupPath),
+	)
 }
 
 // NewInstanceWithGroup creates a new session instance with explicit group
@@ -544,6 +590,7 @@ func NewInstanceWithTool(title, projectPath, tool string) *Instance {
 	// Claude session ID will be detected from files Claude creates
 	// No pre-assignment needed
 
+	logSessionCreated(inst)
 	return inst
 }
 
@@ -597,24 +644,29 @@ func (i *Instance) buildClaudeCommandWithMessage(baseCommand, message string) st
 	claudeCmd := GetClaudeCommand()
 	hasCustomCommand := claudeCmd != "claude"
 
-	// Check if CLAUDE_CONFIG_DIR is explicitly configured (env var or config.toml)
-	// If NOT explicit, we don't set it in the command - let the shell's environment handle it.
-	// This is critical for WSL and other environments where users have CLAUDE_CONFIG_DIR
-	// set in their .bashrc/.zshrc - we should NOT override that with a default path.
-	// Also skip if using a custom command (alias handles config dir)
+	// Resolve CLAUDE_CONFIG_DIR for this spawn. Three branches, in order:
+	//   1. Custom command (alias like cdw/cdp) — handles config_dir itself, skip.
+	//   2. WorkerScratchConfigDir is prepared — ALWAYS route through scratch.
+	//      Scratch is the whole point of the indirection: it carries the
+	//      mutated enabledPlugins (per-session plugin attach state, issue #59
+	//      and RFC PLUGIN_ATTACH.md). Without exporting it here, claude reads
+	//      the ambient `~/.claude/settings.json` and a globally-enabled
+	//      catalog plugin (e.g. a prior `/plugin install fakechat`) bleeds
+	//      through into the worker — defeating detach.
+	//   3. Explicit config_dir from env/config — pass through unchanged.
+	//
+	// Branch 2 is always-on regardless of branch 3 because scratch is
+	// derived from the resolved source dir AND mutates settings.json on top
+	// — strictly an override.
 	configDirPrefix := ""
-	if !hasCustomCommand && IsClaudeConfigDirExplicitForInstance(i) {
-		configDir := GetClaudeConfigDirForInstance(i)
-		// Worker scratch dir override: if a per-instance scratch
-		// CLAUDE_CONFIG_DIR has been prepared (issue #59, v1.7.68),
-		// route the claude binary through it so it loads the mutated
-		// settings.json with the telegram plugin pinned off. Conductors
-		// and explicit channel owners leave WorkerScratchConfigDir
-		// empty and use the ambient profile — see worker_scratch.go.
-		if i.WorkerScratchConfigDir != "" {
-			configDir = i.WorkerScratchConfigDir
+	if !hasCustomCommand {
+		switch {
+		case i.WorkerScratchConfigDir != "":
+			configDirPrefix = fmt.Sprintf("CLAUDE_CONFIG_DIR=%s ", i.WorkerScratchConfigDir)
+		case IsClaudeConfigDirExplicitForInstance(i):
+			configDir := GetClaudeConfigDirForInstance(i)
+			configDirPrefix = fmt.Sprintf("CLAUDE_CONFIG_DIR=%s ", configDir)
 		}
-		configDirPrefix = fmt.Sprintf("CLAUDE_CONFIG_DIR=%s ", configDir)
 	}
 
 	// AGENTDECK_INSTANCE_ID is set as an inline env var so Claude's hook subprocesses
@@ -734,19 +786,18 @@ func (i *Instance) buildClaudeCommandWithMessage(baseCommand, message string) st
 }
 
 // buildBashExportPrefix builds the export prefix used in bash -c commands.
-// It always exports AGENTDECK_INSTANCE_ID, and conditionally adds CLAUDE_CONFIG_DIR.
+// Always exports AGENTDECK_INSTANCE_ID. CLAUDE_CONFIG_DIR is exported when
+// a worker scratch dir is prepared (always wins) OR when the user has
+// explicit config_dir — same priority as buildClaudeCommandWithMessage
+// and buildClaudeResumeCommand. Scratch is the override for the
+// per-session enabledPlugins overlay (RFC PLUGIN_ATTACH.md).
 func (i *Instance) buildBashExportPrefix() string {
 	prefix := fmt.Sprintf("export AGENTDECK_INSTANCE_ID=%s; ", i.ID)
-	if IsClaudeConfigDirExplicitForInstance(i) {
+	switch {
+	case i.WorkerScratchConfigDir != "":
+		prefix += fmt.Sprintf("export CLAUDE_CONFIG_DIR=%s; ", i.WorkerScratchConfigDir)
+	case IsClaudeConfigDirExplicitForInstance(i):
 		configDir := GetClaudeConfigDirForInstance(i)
-		// Worker scratch dir override (issue #59, v1.7.68). Mirrors the
-		// same override in the inline CLAUDE_CONFIG_DIR= prefix path
-		// above — both must route workers through the scratch dir so
-		// the telegram plugin is pinned off regardless of which
-		// command-build branch runs.
-		if i.WorkerScratchConfigDir != "" {
-			configDir = i.WorkerScratchConfigDir
-		}
 		prefix += fmt.Sprintf("export CLAUDE_CONFIG_DIR=%s; ", configDir)
 	}
 	return prefix
@@ -993,6 +1044,100 @@ func (i *Instance) resolveCodexYoloFlag() string {
 	return ""
 }
 
+func (i *Instance) resolveCodexCommand(baseCommand string) string {
+	command := strings.TrimSpace(baseCommand)
+	if i.Tool == "codex" && (command == "" || command == "codex") {
+		return GetCodexCommand()
+	}
+	if command == "" {
+		return "codex"
+	}
+	return command
+}
+
+func codexHomeFromCommand(command string) string {
+	rest := strings.TrimSpace(command)
+	for rest != "" {
+		token, remainder, ok := nextShellWord(rest)
+		if !ok {
+			return ""
+		}
+		if !isShellEnvAssignment(token) {
+			return ""
+		}
+		key, value, ok := strings.Cut(token, "=")
+		if !ok {
+			return ""
+		}
+		if key == "CODEX_HOME" && strings.TrimSpace(value) != "" {
+			return ExpandPath(strings.TrimSpace(value))
+		}
+		rest = strings.TrimLeft(remainder, " \t\r\n")
+	}
+	return ""
+}
+
+func nextShellWord(s string) (word string, remainder string, ok bool) {
+	s = strings.TrimLeft(s, " \t\r\n")
+	if s == "" {
+		return "", "", false
+	}
+
+	var b strings.Builder
+	quote := byte(0)
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if quote == 0 {
+			if c == ' ' || c == '\t' || c == '\r' || c == '\n' {
+				return b.String(), s[i:], true
+			}
+			switch c {
+			case '\'', '"':
+				quote = c
+			case '\\':
+				if i+1 < len(s) {
+					i++
+					b.WriteByte(s[i])
+				} else {
+					b.WriteByte(c)
+				}
+			default:
+				b.WriteByte(c)
+			}
+			continue
+		}
+
+		if c == quote {
+			quote = 0
+			continue
+		}
+		if quote == '"' && c == '\\' && i+1 < len(s) {
+			i++
+			b.WriteByte(s[i])
+			continue
+		}
+		b.WriteByte(c)
+	}
+	if quote != 0 {
+		return "", "", false
+	}
+	return b.String(), "", true
+}
+
+func getCodexHomeDirForCommand(command string) string {
+	if codexHome := codexHomeFromCommand(command); codexHome != "" {
+		return codexHome
+	}
+	return getCodexHomeDir()
+}
+
+func (i *Instance) getCodexHomeDir() string {
+	if i == nil {
+		return getCodexHomeDir()
+	}
+	return getCodexHomeDirForCommand(i.resolveCodexCommand(i.Command))
+}
+
 // Codex stores sessions in ~/.codex/sessions/YYYY/MM/DD/*.jsonl
 // Resume: codex resume <session-id> or codex resume --last
 // Also sources .env files from [shell].env_files
@@ -1007,11 +1152,8 @@ func (i *Instance) buildCodexCommand(baseCommand string) string {
 	envPrefix += agentdeckEnvPrefix
 
 	yoloFlag := i.resolveCodexYoloFlag()
-
-	command := strings.TrimSpace(baseCommand)
-	if command == "" {
-		command = "codex"
-	}
+	command := i.resolveCodexCommand(baseCommand)
+	codexHome := getCodexHomeDirForCommand(command)
 
 	// Issue #756: Gate `codex resume <sid>` on rollout-file existence.
 	// If Codex died before flushing its rollout JSONL (tmux crash, kill -9
@@ -1021,12 +1163,12 @@ func (i *Instance) buildCodexCommand(baseCommand string) string {
 	// flipping the session back to error in an infinite loop. Drop the
 	// stale ID, clear the .sid sidecar so the next hook tick rebinds
 	// cleanly, and spawn fresh.
-	if i.CodexSessionID != "" && !codexRolloutExists(i.CodexSessionID) {
+	if i.CodexSessionID != "" && !codexRolloutExistsInHome(i.CodexSessionID, codexHome) {
 		sessionLog.Warn("codex_resume_stale_sid_dropped",
 			slog.String("instance_id", i.ID),
 			slog.String("title", i.Title),
 			slog.String("sid", i.CodexSessionID),
-			slog.String("codex_home", getCodexHomeDir()))
+			slog.String("codex_home", codexHome))
 		i.CodexSessionID = ""
 		i.CodexDetectedAt = time.Time{}
 		ClearHookSessionAnchor(i.ID)
@@ -1046,11 +1188,15 @@ func (i *Instance) buildCodexCommand(baseCommand string) string {
 //
 // Codex layout: $CODEX_HOME/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl
 func codexRolloutExists(sessionID string) bool {
+	return codexRolloutExistsInHome(sessionID, getCodexHomeDir())
+}
+
+func codexRolloutExistsInHome(sessionID, codexHome string) bool {
 	sessionID = strings.TrimSpace(sessionID)
 	if sessionID == "" {
 		return false
 	}
-	pattern := filepath.Join(getCodexHomeDir(), "sessions", "*", "*", "*",
+	pattern := filepath.Join(codexHome, "sessions", "*", "*", "*",
 		"rollout-*-"+sessionID+".jsonl")
 	matches, err := filepath.Glob(pattern)
 	if err != nil {
@@ -1366,7 +1512,7 @@ func (i *Instance) detectCodexSessionAsync() {
 
 func getCodexHomeDir() string {
 	if codexHome := strings.TrimSpace(os.Getenv("CODEX_HOME")); codexHome != "" {
-		return codexHome
+		return ExpandPath(codexHome)
 	}
 
 	home, err := os.UserHomeDir()
@@ -1413,7 +1559,7 @@ const codexWalkDirTimeout = 5 * time.Second
 //  1. Prefer sessions whose JSONL metadata matches this instance's project path.
 //  2. Optionally allow unscoped fallback (no cwd metadata) for initial bootstrap.
 func (i *Instance) queryCodexSession(excludeIDs map[string]bool, allowUnscoped bool) string {
-	sessionsDir := filepath.Join(getCodexHomeDir(), "sessions")
+	sessionsDir := filepath.Join(i.getCodexHomeDir(), "sessions")
 	if _, err := os.Stat(sessionsDir); os.IsNotExist(err) {
 		return ""
 	}
@@ -1835,7 +1981,7 @@ func (i *Instance) queryCodexSessionFromDockerProcFD() (string, string) {
 for f in /proc/[0-9]*/fd/*; do
 	t=$(readlink "$f" 2>/dev/null || true)
 	case "$t" in
-		*/.codex/sessions/*rollout-*.jsonl*)
+		*/sessions/*rollout-*.jsonl*)
 			printf '%%s\n' "$t"
 			;;
 	esac
@@ -2266,7 +2412,7 @@ func (i *Instance) Start() error {
 	// (issue #59, v1.7.68). Runs before command-building so the
 	// CLAUDE_CONFIG_DIR= prefix picks up the scratch path. No-op for
 	// conductors, explicit telegram channel owners, and non-claude tools.
-	i.prepareWorkerScratchConfigDirForSpawn()
+	i.prepareWorkerScratchConfigDirForSpawn() // also runs plugin auto-install per fix C1
 
 	// Build command based on tool type
 	// Priority: claude-compatible (built-in + custom wrapping claude) → built-in tools → custom tools → raw command
@@ -2444,7 +2590,7 @@ func (i *Instance) StartWithMessage(message string) error {
 	// Prepare scratch CLAUDE_CONFIG_DIR for non-conductor claude workers
 	// (issue #59, v1.7.68). Same call as in Start() — both spawn paths
 	// must pin the telegram plugin off for workers.
-	i.prepareWorkerScratchConfigDirForSpawn()
+	i.prepareWorkerScratchConfigDirForSpawn() // also runs plugin auto-install per fix C1
 
 	// Start session normally (no embedded message logic)
 	// Priority: built-in tools (claude, gemini, opencode, codex) → custom tools from config.toml → raw command
@@ -2755,6 +2901,14 @@ const errorRecheckInterval = 30 * time.Second
 // observed to finish within ~100-150ms in practice; 200ms gives headroom
 // without noticeably slowing the restart path when there truly is no jsonl.
 var resumeCheckRetryDelay = 200 * time.Millisecond
+
+// clearRebindMtimeGrace is the mtime gap (candidate.mtime - current.mtime)
+// above which UpdateHookStatus treats a smaller candidate as a legitimate
+// user-initiated new session (e.g. /clear) instead of a stale flap (issue
+// #856). 5s is well above the ~2s hook poll cadence — a #661 flap touches
+// both files within that window — but well below the time it takes a user
+// to type /clear and a follow-up prompt.
+var clearRebindMtimeGrace = 5 * time.Second
 
 func hookFastPathFreshnessForTool(tool, hookStatus string) time.Duration {
 	if !IsCodexCompatible(tool) {
@@ -3171,16 +3325,32 @@ func (i *Instance) UpdateHookStatus(status *HookStatus) {
 		// Byte size is a robust proxy for "how much history this session
 		// holds" — immune to record-count ties and faster than re-scanning
 		// the file.
+		//
+		// Issue #856: but a strict size-only rule rejects user-initiated
+		// new sessions (e.g. /clear) indefinitely, since they're smaller by
+		// definition. Mtime gap is the discriminator: in a flap the user
+		// keeps typing into the rich session so its mtime stays fresh; in
+		// /clear the user abandons the old session, so its mtime stales
+		// while the new jsonl's mtime advances. If the candidate's jsonl
+		// is significantly newer than the current's (clearRebindMtimeGrace),
+		// treat it as a user-initiated new session and rebind regardless
+		// of size.
 		if sessionHasConversationData(i, i.ClaudeSessionID) {
 			currentSize := sessionConversationByteSize(i, i.ClaudeSessionID)
 			candidateSize := sessionConversationByteSize(i, sessionID)
 			if candidateSize <= currentSize {
-				_ = WriteSessionIDLifecycleEvent(SessionIDLifecycleEvent{
-					InstanceID: i.ID, Tool: i.Tool, Action: "reject",
-					Source: hookSource, OldID: i.ClaudeSessionID, Candidate: sessionID,
-					HookEvent: status.Event, Reason: "candidate_has_less_conversation_data",
-				})
-				return
+				currentMtime := sessionConversationMtime(i, i.ClaudeSessionID)
+				candidateMtime := sessionConversationMtime(i, sessionID)
+				clearRebind := !currentMtime.IsZero() && !candidateMtime.IsZero() &&
+					candidateMtime.Sub(currentMtime) >= clearRebindMtimeGrace
+				if !clearRebind {
+					_ = WriteSessionIDLifecycleEvent(SessionIDLifecycleEvent{
+						InstanceID: i.ID, Tool: i.Tool, Action: "reject",
+						Source: hookSource, OldID: i.ClaudeSessionID, Candidate: sessionID,
+						HookEvent: status.Event, Reason: "candidate_has_less_conversation_data",
+					})
+					return
+				}
 			}
 		}
 		i.bindClaudeSessionFromHook(sessionID, hookSource, status.Event, "rebind")
@@ -3236,14 +3406,22 @@ func (i *Instance) GetHookStatus() (string, bool) {
 	return i.hookStatus, fresh
 }
 
-// ClearHookStatus resets the hook-based status, forcing the next UpdateStatus()
-// to fall through to polling. Used when the user manually overrides status (e.g., pressing 'u'
-// to unacknowledge after an Escape interrupt where the Stop hook didn't fire).
+// ClearHookStatus resets the hook-based status and removes the persisted hook
+// record, forcing the next UpdateStatus() to fall through to polling. Used
+// when the user manually overrides status (e.g., pressing 'u' to unacknowledge
+// after an Escape interrupt where the Stop hook didn't fire).
 func (i *Instance) ClearHookStatus() {
 	i.mu.Lock()
-	defer i.mu.Unlock()
 	i.hookStatus = ""
 	i.hookLastUpdate = time.Time{}
+	i.mu.Unlock()
+
+	if err := os.Remove(filepath.Join(GetHooksDir(), i.ID+".json")); err != nil && !os.IsNotExist(err) {
+		sessionLog.Debug("clear_hook_status_file_failed",
+			slog.String("instance", i.ID),
+			slog.String("error", err.Error()),
+		)
+	}
 }
 
 // ForceNextStatusCheck clears the idle polling optimization so the next
@@ -4414,6 +4592,16 @@ func (i *Instance) Restart() error {
 	// Skip if MCP dialog just wrote the config (avoids race condition).
 	i.prepareRestartMCPConfig()
 
+	// Regenerate worker-scratch CLAUDE_CONFIG_DIR before restart so
+	// changes to Instance.Plugins (added/removed via TUI Plugin Manager
+	// or `agent-deck plugin attach/detach`) propagate into the scratch
+	// settings.json before claude re-reads it. Without this, the
+	// respawn-pane fast path below uses the OLD scratch and claude
+	// sees the plugin enablement state from session creation, not the
+	// current state. Same call as Start()/recreate paths — idempotent
+	// per (sourceProfileDir, plugins-set) and best-effort on failure.
+	i.prepareWorkerScratchConfigDirForSpawn()
+
 	// If Claude session with known ID AND tmux session exists, use respawn-pane.
 	if IsClaudeCompatible(i.Tool) && i.ClaudeSessionID != "" && i.tmuxSession != nil && i.tmuxSession.Exists() {
 		resumeCmd, containerName, err := i.prepareCommand(i.buildClaudeResumeCommand())
@@ -4657,7 +4845,7 @@ func (i *Instance) Restart() error {
 
 	// Prepare scratch CLAUDE_CONFIG_DIR for non-conductor claude workers
 	// on the restart path too (issue #59, v1.7.68).
-	i.prepareWorkerScratchConfigDirForSpawn()
+	i.prepareWorkerScratchConfigDirForSpawn() // also runs plugin auto-install per fix C1
 
 	var command string
 	if IsClaudeCompatible(i.Tool) && i.ClaudeSessionID != "" {
@@ -4804,22 +4992,20 @@ func (i *Instance) buildClaudeResumeCommand() string {
 	claudeCmd := GetClaudeCommand()
 	hasCustomCommand := claudeCmd != "claude"
 
-	// Check if CLAUDE_CONFIG_DIR is explicitly configured
-	// If NOT explicit, don't set it - let the shell's environment handle it
-	// Also skip if using a custom command (alias handles config dir)
+	// Resolve CLAUDE_CONFIG_DIR for this restart. Mirrors the three-branch
+	// logic in buildClaudeCommandWithMessage — scratch always wins when
+	// prepared, otherwise pass through any explicit config. See the comment
+	// there for why scratch is unconditional (it carries per-session
+	// enabledPlugins and a deny-pinned telegram plugin).
 	configDirPrefix := ""
-	if !hasCustomCommand && IsClaudeConfigDirExplicitForInstance(i) {
-		configDir := GetClaudeConfigDirForInstance(i)
-		// Worker scratch dir override: if a per-instance scratch
-		// CLAUDE_CONFIG_DIR has been prepared (issue #59, v1.7.68),
-		// route the claude binary through it so it loads the mutated
-		// settings.json with the telegram plugin pinned off. Conductors
-		// and explicit channel owners leave WorkerScratchConfigDir
-		// empty and use the ambient profile — see worker_scratch.go.
-		if i.WorkerScratchConfigDir != "" {
-			configDir = i.WorkerScratchConfigDir
+	if !hasCustomCommand {
+		switch {
+		case i.WorkerScratchConfigDir != "":
+			configDirPrefix = fmt.Sprintf("CLAUDE_CONFIG_DIR=%s ", i.WorkerScratchConfigDir)
+		case IsClaudeConfigDirExplicitForInstance(i):
+			configDir := GetClaudeConfigDirForInstance(i)
+			configDirPrefix = fmt.Sprintf("CLAUDE_CONFIG_DIR=%s ", configDir)
 		}
-		configDirPrefix = fmt.Sprintf("CLAUDE_CONFIG_DIR=%s ", configDir)
 	}
 
 	// AGENTDECK_INSTANCE_ID is set as an inline env var so hook subprocesses
@@ -5595,6 +5781,47 @@ func sessionConversationByteSize(inst *Instance, sessionID string) int64 {
 		}
 	}
 	return 0
+}
+
+// sessionConversationMtime returns the modification time of the Claude
+// session's jsonl file (or the zero time if it cannot be located). Issue
+// #856: when both current and candidate jsonls have data, mtime gap is the
+// discriminator between a stale flap (rich session still being actively
+// written, candidate is a momentary blip) and a user-initiated new session
+// like /clear (rich session is dormant, candidate is the new active jsonl).
+// Path resolution mirrors sessionConversationByteSize.
+func sessionConversationMtime(inst *Instance, sessionID string) time.Time {
+	var configDir string
+	if inst != nil {
+		configDir = GetClaudeConfigDirForInstance(inst)
+	} else {
+		configDir = GetClaudeConfigDir()
+	}
+	if configDir == "" {
+		configDir = filepath.Join(os.Getenv("HOME"), ".claude")
+	}
+	projectPath := ""
+	if inst != nil {
+		projectPath = inst.EffectiveWorkingDir()
+	}
+	resolvedPath := projectPath
+	if resolved, err := filepath.EvalSymlinks(projectPath); err == nil {
+		resolvedPath = resolved
+	}
+	encodedPath := ConvertToClaudeDirName(resolvedPath)
+	if encodedPath == "" {
+		encodedPath = "-"
+	}
+	sessionFile := filepath.Join(configDir, "projects", encodedPath, sessionID+".jsonl")
+	if info, err := os.Stat(sessionFile); err == nil {
+		return info.ModTime()
+	}
+	if fallback := findSessionFileInAllProjects(inst, sessionID); fallback != "" {
+		if info, err := os.Stat(fallback); err == nil {
+			return info.ModTime()
+		}
+	}
+	return time.Time{}
 }
 
 // bindClaudeSessionFromHook performs the common bookkeeping when

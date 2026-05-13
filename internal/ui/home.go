@@ -20,11 +20,11 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/BurntSushi/toml"
 	"github.com/charmbracelet/bubbles/textarea"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
-	"github.com/mattn/go-runewidth"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/asheshgoplani/agent-deck/internal/clipboard"
@@ -32,6 +32,7 @@ import (
 	"github.com/asheshgoplani/agent-deck/internal/feedback"
 	"github.com/asheshgoplani/agent-deck/internal/git"
 	"github.com/asheshgoplani/agent-deck/internal/logging"
+	"github.com/asheshgoplani/agent-deck/internal/safego"
 	"github.com/asheshgoplani/agent-deck/internal/session"
 	"github.com/asheshgoplani/agent-deck/internal/statedb"
 	"github.com/asheshgoplani/agent-deck/internal/sysinfo"
@@ -130,8 +131,10 @@ const (
 // (shows all sessions except error/stopped). Change this constant to rebind.
 const FilterKeyActive = "%"
 
-// FilterModeActive is the filter value for "open" sessions: excludes error/stopped.
-// This is NOT a session status (never assigned to a session), just a filter mode.
+// FilterModeActive is the filter value for "open" sessions: excludes the
+// configured set of statuses (see DisplaySettings.ActiveFilterExcludes; default
+// {error}). This is NOT a session status (never assigned to a session), just a
+// filter mode.
 const FilterModeActive session.Status = "active"
 
 // Mouse interaction thresholds
@@ -201,6 +204,7 @@ type Home struct {
 	confirmDialog        *ConfirmDialog        // For confirming destructive actions
 	helpOverlay          *HelpOverlay          // For showing keyboard shortcuts
 	mcpDialog            *MCPDialog            // For managing MCPs
+	pluginDialog         *PluginDialog         // For managing per-session Claude Code plugins (RFC PLUGIN_ATTACH.md)
 	editPathsDialog      *EditPathsDialog      // For editing multi-repo paths
 	editSessionDialog    *EditSessionDialog    // For editing session settings (title/color/notes/command/...)
 	skillDialog          *SkillDialog          // For managing project skills
@@ -382,11 +386,18 @@ type Home struct {
 		timestamp                       time.Time   // For time-based expiration
 	}
 
+	// Status-transition tracker: emits enriched status_changed INFO,
+	// flicker_detected WARN, and session_status_cascade INFO.
+	// Lazy-initialized via getTransitionTracker().
+	transitionTrackerOnce sync.Once
+	transitionTracker     *transitionTracker
+
 	// Full repaint mode: issue tea.ClearScreen every tick to avoid
 	// incremental redraw drift in terminals with unicode grapheme widths
-	fullRepaint       bool
-	defaultFilter     string // from config.toml [display] default_filter
-	activeFilterLabel string // from config.toml [display] active_filter_label
+	fullRepaint          bool
+	defaultFilter        string                  // from config.toml [display] default_filter
+	activeFilterLabel    string                  // from config.toml [display] active_filter_label
+	activeFilterExcludes map[session.Status]bool // from config.toml [display] active_filter_excludes; default {error}
 
 	// Performance observability (debug mode only, zero cost when off)
 	debugMode          bool         // true when AGENTDECK_DEBUG=1, enables perf overlay
@@ -736,6 +747,7 @@ func NewHomeWithProfileAndMode(profile string) *Home {
 		confirmDialog:        NewConfirmDialog(),
 		helpOverlay:          NewHelpOverlay(),
 		mcpDialog:            NewMCPDialog(),
+		pluginDialog:         NewPluginDialog(),
 		editPathsDialog:      NewEditPathsDialog(),
 		editSessionDialog:    NewEditSessionDialog(),
 		skillDialog:          NewSkillDialog(),
@@ -797,10 +809,12 @@ func NewHomeWithProfileAndMode(profile string) *Home {
 		h.fullRepaint = cfg.Display.GetFullRepaint()
 		h.defaultFilter = cfg.Display.GetDefaultFilter()
 		h.activeFilterLabel = cfg.Display.ActiveFilterLabel
+		h.activeFilterExcludes = cfg.Display.GetActiveFilterExcludes()
 		h.sysStatsConfig = cfg.SystemStats
 		h.costLineTemplate, h.costLineHideWhenZero = session.ResolveCostLineTemplate(cfg, actualProfile)
 	} else {
 		h.fullRepaint = (session.DisplaySettings{}).GetFullRepaint()
+		h.activeFilterExcludes = (session.DisplaySettings{}).GetActiveFilterExcludes()
 		h.costLineTemplate, h.costLineHideWhenZero = session.ResolveCostLineTemplate(nil, actualProfile)
 	}
 
@@ -878,7 +892,7 @@ func NewHomeWithProfileAndMode(profile string) *Home {
 	tmux.SetPipeManager(pm)
 
 	// Connect pipes for all existing running sessions in background
-	go func() {
+	safego.Go(pipeUILog, "startup_pipe_connect", func() {
 		time.Sleep(500 * time.Millisecond) // Let TUI render first
 		h.instancesMu.RLock()
 		instances := make([]*session.Instance, len(h.instances))
@@ -895,7 +909,7 @@ func NewHomeWithProfileAndMode(profile string) *Home {
 			}
 		}
 		pipeUILog.Debug("startup_pipes_connected", slog.Int("count", pm.ConnectedCount()))
-	}()
+	})
 
 	// Start background status worker (Priority 1C)
 	go h.statusWorker()
@@ -993,10 +1007,10 @@ func NewHomeWithProfileAndMode(profile string) *Home {
 	// Also initializes lastLogMaintenance and lastLogCheck so periodic checks start from now
 	h.lastLogMaintenance = time.Now()
 	h.lastLogCheck = time.Now()
-	go func() {
+	safego.Go(uiLog, "startup_log_maintenance", func() {
 		logSettings := session.GetLogSettings()
 		tmux.RunLogMaintenance(logSettings.MaxSizeMB, logSettings.MaxLines, logSettings.RemoveOrphans)
-	}()
+	})
 
 	// v1.7.60: one-shot nav-discoverability hint. Reuses the maintenance-banner
 	// slot so no extra layout math is needed. Dismisses via the existing ESC
@@ -1391,7 +1405,7 @@ func (h *Home) rebuildFlatItems() {
 		groupsWithMatches := make(map[string]bool)
 		for _, item := range allItems {
 			if item.Type == session.ItemTypeSession && item.Session != nil {
-				if matchesStatusFilter(h.statusFilter, item.Session.Status) {
+				if h.matchesStatusFilter(h.statusFilter, item.Session.Status) {
 					// Mark this session's group and all parent groups as having matches
 					groupsWithMatches[item.Path] = true
 					// Also mark parent paths
@@ -1414,7 +1428,7 @@ func (h *Home) rebuildFlatItems() {
 				}
 			} else if item.Type == session.ItemTypeSession && item.Session != nil {
 				// Keep session if it matches the filter
-				if matchesStatusFilter(h.statusFilter, item.Session.Status) {
+				if h.matchesStatusFilter(h.statusFilter, item.Session.Status) {
 					filtered = append(filtered, item)
 				}
 			}
@@ -1966,7 +1980,7 @@ func (h *Home) startWatcherEngine() tea.Cmd {
 		adapterCfg := watcher.AdapterConfig{
 			Type:     row.Type,
 			Name:     row.Name,
-			Settings: map[string]string{},
+			Settings: loadWatcherSourceSettings(row.Name),
 		}
 		eng.RegisterAdapter(row.ID, adapter, adapterCfg, maxSilenceMinutes)
 	}
@@ -1984,6 +1998,29 @@ func (h *Home) startWatcherEngine() tea.Cmd {
 	)
 }
 
+// loadWatcherSourceSettings reads the [source] table from
+// ~/.agent-deck/watcher/<name>/watcher.toml into a map[string]string suitable for
+// AdapterConfig.Settings. Returns an empty (non-nil) map on any error so the engine
+// falls back to per-adapter defaults instead of failing to register.
+func loadWatcherSourceSettings(name string) map[string]string {
+	out := map[string]string{}
+	dir, err := session.WatcherNameDir(name)
+	if err != nil {
+		return out
+	}
+	path := filepath.Join(dir, "watcher.toml")
+	var cfg struct {
+		Source map[string]string `toml:"source"`
+	}
+	if _, err := toml.DecodeFile(path, &cfg); err != nil {
+		return out
+	}
+	for k, v := range cfg.Source {
+		out[k] = v
+	}
+	return out
+}
+
 // propagateThemeToSessions updates COLORFGBG in all running tmux sessions
 // so that terminal-aware tools pick up the new light/dark setting.
 func (h *Home) propagateThemeToSessions() {
@@ -1996,14 +2033,14 @@ func (h *Home) propagateThemeToSessions() {
 	copy(instances, h.instances)
 	h.instancesMu.RUnlock()
 
-	go func() {
+	safego.Go(uiLog, "apply_theme_to_sessions", func() {
 		for _, inst := range instances {
 			if tmuxSess := inst.GetTmuxSession(); tmuxSess != nil && tmuxSess.Exists() {
 				_ = tmuxSess.SetEnvironment("COLORFGBG", colorfgbg)
 				_ = tmuxSess.ApplyThemeOptions()
 			}
 		}
-	}()
+	})
 }
 
 // fetchRemoteSessions fetches sessions from all configured remotes.
@@ -2609,9 +2646,25 @@ func (h *Home) refreshSessionRenderSnapshot(instances []*session.Instance) {
 			tool:   inst.GetToolThreadSafe(),
 		}
 		// Look up pane title from the already-refreshed tmux cache.
+		// Only RefreshPaneInfoCache (called from backgroundStatusUpdate) keeps
+		// the cache fresh; processStatusUpdate and other rebuild paths run on
+		// their own cadence. When that cache crosses the 4-second freshness
+		// threshold (GetCachedPaneInfo returns ok=false), keep the previous
+		// snapshot's paneTitle so the inline suffix in renderSessionItem does
+		// not blink to empty between successful refreshes — the user would
+		// otherwise read the disappearance as "title only updated once."
+		// Reading the latest snapshot inside the per-instance branch (rather
+		// than once before the loop) narrows the read-store race window: if a
+		// concurrent rebuild lands a fresher value while we're walking the
+		// instances slice, the fallback uses that value instead of stamping
+		// an even-older one back into the snapshot.
 		if tmuxSess := inst.GetTmuxSession(); tmuxSess != nil {
 			if paneInfo, ok := tmux.GetCachedPaneInfo(tmuxSess.Name); ok {
 				state.paneTitle = cleanPaneTitle(paneInfo.Title)
+			} else if prev := h.getSessionRenderSnapshot(); prev != nil {
+				if prevState, hadPrev := prev[inst.ID]; hadPrev {
+					state.paneTitle = prevState.paneTitle
+				}
 			}
 		}
 		snap[inst.ID] = state
@@ -2859,7 +2912,7 @@ func (h *Home) backgroundStatusUpdate() {
 			if tmuxSess := inst.GetTmuxSession(); tmuxSess != nil {
 				h.clearOnCompactSent[inst.ID] = time.Now()
 				conductorName := strings.TrimPrefix(inst.Title, "conductor-")
-				go func() {
+				safego.Go(uiLog, "conductor_clear_and_heartbeat", func() {
 					time.Sleep(500 * time.Millisecond)
 					_ = tmuxSess.SendKeysAndEnter("/clear")
 					// After /clear wipes context, immediately send heartbeat to restore orientation
@@ -2870,7 +2923,7 @@ func (h *Home) backgroundStatusUpdate() {
 					}
 					msg := fmt.Sprintf("Heartbeat: Check sessions in your group (%s). List any that are waiting, auto-respond where safe, and report what needs my attention.", conductorName)
 					_ = tmuxSess.SendKeysAndEnter(msg)
-				}()
+				})
 			}
 		}
 	}
@@ -2883,6 +2936,8 @@ func (h *Home) backgroundStatusUpdate() {
 	var slowSessions []string
 	pm := tmux.GetPipeManager()
 	var skipped int
+
+	tracker := h.getTransitionTracker()
 
 	g := new(errgroup.Group)
 	g.SetLimit(10) // Pool of 10 workers (tmux server serializes, more doesn't help)
@@ -2922,6 +2977,10 @@ func (h *Home) backgroundStatusUpdate() {
 					slog.String("old", string(oldStatus)),
 					slog.String("new", string(newStatus)),
 				)
+				// T1+T3: synthesize a flicker_detected WARN if this session
+				// has oscillated >3 times within 60s. One alert per burst.
+				session.GlobalFlickerDetector().Observe(inst.ID, string(newStatus))
+				tracker.record(inst.ID, inst.Title, inst.Tool, string(oldStatus), string(newStatus))
 			}
 			return nil
 		})
@@ -2929,6 +2988,7 @@ func (h *Home) backgroundStatusUpdate() {
 	_ = g.Wait() // Errors are logged within each goroutine
 
 	statusDur := time.Since(statusStart)
+	tracker.tickEnd(statusStart, time.Now())
 	if skipped > 0 {
 		perfLog.Debug(
 			"idle_sessions_skipped",
@@ -3204,6 +3264,54 @@ func (h *Home) triggerStatusUpdate() {
 	default:
 		// Worker busy, will retry next tick
 	}
+}
+
+func (h *Home) refreshAttachedSessionStatus(sessionID string) {
+	if strings.TrimSpace(sessionID) == "" {
+		return
+	}
+
+	h.instancesMu.RLock()
+	inst := h.instanceByID[sessionID]
+	h.instancesMu.RUnlock()
+	if inst == nil {
+		return
+	}
+
+	// Attach return is the one moment where stale hook files are most visible:
+	// Claude/Codex may have exited via /q without writing a fresh "dead" hook.
+	// Force the attached session through the live tmux path before the list is
+	// redrawn so the status icon reflects a dead pane immediately.
+	inst.ClearHookStatus()
+	if h.hookWatcher != nil {
+		h.hookWatcher.ClearHookStatus(inst.ID)
+	}
+	inst.ForceNextStatusCheck()
+
+	if inst.GetTmuxSession() != nil {
+		tmux.RefreshSessionCache()
+		tmux.RefreshPaneInfoCache()
+	}
+
+	oldStatus := inst.GetStatusThreadSafe()
+	_ = inst.UpdateStatus()
+	newStatus := inst.GetStatusThreadSafe()
+	if newStatus != oldStatus {
+		h.cachedStatusCounts.valid.Store(false)
+		h.publishCurrentSessionStates()
+		if db := statedb.GetGlobal(); db != nil {
+			_ = db.WriteStatus(inst.ID, string(newStatus), inst.GetToolThreadSafe())
+		}
+	}
+	h.refreshSessionRenderSnapshot(nil)
+}
+
+func (h *Home) publishCurrentSessionStates() {
+	h.instancesMu.RLock()
+	instances := make([]*session.Instance, len(h.instances))
+	copy(instances, h.instances)
+	h.instancesMu.RUnlock()
+	h.publishWebSessionStates(instances)
 }
 
 // processStatusUpdate implements round-robin status updates (Priority 1A + 1B)
@@ -4192,6 +4300,9 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		h.isAttaching.Store(false) // Atomic store for thread safety
 		now := time.Now()
 		h.beginAttachReturnGrace(now)
+		// Reconcile the attached session synchronously before the normal delayed
+		// refresh so an exited pane does not render as still running for a tick.
+		h.refreshAttachedSessionStatus(msg.attachedSessionID)
 
 		selectedBefore := h.captureSelectedItemIdentity()
 		h.rebuildFlatItemsPreservingSelection(selectedBefore)
@@ -4250,18 +4361,26 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Re-enable mouse mode after returning from tea.Exec (tmux detach-client
 		// resets mouse reporting), restore legacy keyboard reporting (tmux's
 		// extended-keys setting leaves Kitty/modifyOtherKeys on the outer terminal;
-		// see RestoreLegacyKeyboardCmd for the full rationale), and schedule a
-		// delayed refresh so the main menu reflects attach-return state changes.
+		// see RestoreLegacyKeyboardCmd for the full rationale), force-poll
+		// terminal dimensions (#936: SIGWINCH propagation through nested SSH is
+		// late or lost — a host-terminal Cmd++ zoom during attach would otherwise
+		// land us back in the menu with stale pre-zoom column counts, making the
+		// input line render above the real viewport bottom and run off the
+		// right edge), and schedule a delayed repaint for any pane-title/content
+		// cache changes that settle just after tmux restores the outer client.
 		return h, tea.Batch(
 			tea.EnableMouseCellMotion,
 			RestoreLegacyKeyboardCmd(os.Stdout),
+			tea.WindowSize(),
 			tea.Tick(attachReturnRefreshDelay, func(time.Time) tea.Msg { return attachReturnRefreshMsg{} }),
 		)
 
 	case attachReturnRefreshMsg:
 		selectedBefore := h.captureSelectedItemIdentity()
 		tmux.RefreshSessionCache()
+		tmux.RefreshPaneInfoCache()
 		h.rebuildFlatItemsPreservingSelection(selectedBefore)
+		h.refreshSessionRenderSnapshot(nil)
 		return h, nil
 
 	case previewDebounceMsg:
@@ -4839,6 +4958,9 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if h.mcpDialog.IsVisible() {
 			return h.handleMCPDialogKey(msg)
+		}
+		if h.pluginDialog.IsVisible() {
+			return h.handlePluginDialogKey(msg)
 		}
 		if h.editPathsDialog.IsVisible() {
 			return h.handleEditPathsDialogKey(msg)
@@ -5446,7 +5568,7 @@ func (h *Home) hasModalVisible() bool {
 		h.watcherPanel.IsVisible() || // hotkeyWatcherPanel overlay
 		h.helpOverlay.IsVisible() || h.search.IsVisible() || h.globalSearch.IsVisible() ||
 		h.newDialog.IsVisible() || h.groupDialog.IsVisible() || h.forkDialog.IsVisible() ||
-		h.confirmDialog.IsVisible() || h.mcpDialog.IsVisible() || h.skillDialog.IsVisible() ||
+		h.confirmDialog.IsVisible() || h.mcpDialog.IsVisible() || h.pluginDialog.IsVisible() || h.skillDialog.IsVisible() ||
 		h.geminiModelDialog.IsVisible() || h.sessionPickerDialog.IsVisible() ||
 		h.worktreeFinishDialog.IsVisible() || h.editPathsDialog.IsVisible() ||
 		h.editSessionDialog.IsVisible() ||
@@ -6002,6 +6124,45 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return h, nil
 
+	case "shift+left":
+		// Promote: outdent a sub-session to top-level peer in the same group.
+		// Top-level sessions and groups are unaffected. Cross-group moves
+		// stay on M.
+		if h.cursor < len(h.flatItems) {
+			item := h.flatItems[h.cursor]
+			if item.Type == session.ItemTypeSession && item.Session != nil {
+				sessionID := item.Session.ID
+				h.groupTree.PromoteSession(item.Session)
+				h.rebuildFlatItems()
+				h.moveCursorToSession(sessionID)
+				if h.cursor >= len(h.flatItems) {
+					h.cursor = max(0, len(h.flatItems)-1)
+				}
+				h.saveInstances()
+			}
+		}
+		return h, nil
+
+	case "shift+right":
+		// Demote: nest the cursor's top-level session under the previous
+		// top-level peer as that peer's last child. No-op when already a
+		// sub-session, when the session has its own children (single-level
+		// nesting only), or when there is no previous peer in the group.
+		if h.cursor < len(h.flatItems) {
+			item := h.flatItems[h.cursor]
+			if item.Type == session.ItemTypeSession && item.Session != nil {
+				sessionID := item.Session.ID
+				h.groupTree.DemoteSession(item.Session)
+				h.rebuildFlatItems()
+				h.moveCursorToSession(sessionID)
+				if h.cursor >= len(h.flatItems) {
+					h.cursor = max(0, len(h.flatItems)-1)
+				}
+				h.saveInstances()
+			}
+		}
+		return h, nil
+
 	case "p":
 		// Edit multi-repo paths
 		if h.cursor < len(h.flatItems) {
@@ -6033,6 +6194,23 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				(session.IsClaudeCompatible(item.Session.Tool) || item.Session.Tool == "gemini") {
 				h.mcpDialog.SetSize(h.width, h.height)
 				if err := h.mcpDialog.Show(item.Session.ProjectPath, item.Session.ID, item.Session.Tool); err != nil {
+					h.setError(err)
+				}
+			}
+		}
+		return h, nil
+
+	case "L":
+		// Plugin Manager — claude-only (RFC docs/rfc/PLUGIN_ATTACH.md).
+		// Mirrors the MCP-manager UX (`m`): toggleable list of catalog
+		// plugins from ~/.agent-deck/config.toml. Apply persists via
+		// session.SetField(FieldPlugins,...) and triggers restart.
+		if h.cursor < len(h.flatItems) {
+			item := h.flatItems[h.cursor]
+			if item.Type == session.ItemTypeSession && item.Session != nil &&
+				session.IsClaudeCompatible(item.Session.Tool) {
+				h.pluginDialog.SetSize(h.width, h.height)
+				if err := h.pluginDialog.Show(item.Session); err != nil {
 					h.setError(err)
 				}
 			}
@@ -7232,6 +7410,59 @@ func (h *Home) handleMCPDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	default:
 		h.mcpDialog.Update(msg)
+		return h, nil
+	}
+}
+
+// handlePluginDialogKey routes key events to the plugin manager dialog.
+// Apply path: persist via session.SetField(FieldPlugins,...) and restart
+// the session to reload claude's enabledPlugins from the per-session
+// scratch settings.json. RFC: docs/rfc/PLUGIN_ATTACH.md.
+func (h *Home) handlePluginDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "enter":
+		// Persist if anything changed; otherwise just close.
+		if !h.pluginDialog.HasChanged() {
+			h.pluginDialog.Hide()
+			return h, nil
+		}
+		sessionID := h.pluginDialog.GetSessionID()
+		newNames := h.pluginDialog.SelectedPluginNames()
+
+		var targetInst *session.Instance
+		h.instancesMu.RLock()
+		for _, inst := range h.instances {
+			if inst.ID == sessionID {
+				targetInst = inst
+				break
+			}
+		}
+		h.instancesMu.RUnlock()
+		if targetInst == nil {
+			h.pluginDialog.Hide()
+			return h, nil
+		}
+
+		oldValue, _, mutErr := session.SetField(targetInst, session.FieldPlugins, strings.Join(newNames, ","), nil)
+		if mutErr != nil {
+			h.setError(mutErr)
+			return h, nil
+		}
+		_ = oldValue
+		h.forceSaveInstances()
+		h.pluginDialog.Hide()
+
+		if targetInst.CanRestart() && !h.hasActiveAnimation(targetInst.ID) {
+			return h, h.restartSession(targetInst)
+		}
+		return h, nil
+
+	case "esc":
+		h.pluginDialog.Hide()
+		return h, nil
+
+	default:
+		h.pluginDialog.Update(msg)
 		return h, nil
 	}
 }
@@ -9174,7 +9405,6 @@ func (h *Home) renderFilterBar() string {
 		pills = append(pills, inactivePillStyle.Render("All")+allPad)
 	}
 
-	// Running pill (green when active, dim if 0)
 	runningLabel := fmt.Sprintf("● %d", running)
 	if h.statusFilter == session.StatusRunning {
 		pills = append(pills, lipgloss.NewStyle().
@@ -9182,6 +9412,8 @@ func (h *Home) renderFilterBar() string {
 			Background(ColorGreen).
 			Bold(true).
 			Padding(0, 1).Render(runningLabel))
+	} else if isActive && h.activeFilterExcludes[session.StatusRunning] {
+		pills = append(pills, dimPillStyle.Render(runningLabel))
 	} else if running > 0 {
 		pills = append(pills, lipgloss.NewStyle().
 			Foreground(ColorGreen).
@@ -9191,7 +9423,6 @@ func (h *Home) renderFilterBar() string {
 		pills = append(pills, dimPillStyle.Render(runningLabel))
 	}
 
-	// Waiting pill (yellow when active)
 	waitingLabel := fmt.Sprintf("◐ %d", waiting)
 	if h.statusFilter == session.StatusWaiting {
 		pills = append(pills, lipgloss.NewStyle().
@@ -9199,6 +9430,8 @@ func (h *Home) renderFilterBar() string {
 			Background(ColorYellow).
 			Bold(true).
 			Padding(0, 1).Render(waitingLabel))
+	} else if isActive && h.activeFilterExcludes[session.StatusWaiting] {
+		pills = append(pills, dimPillStyle.Render(waitingLabel))
 	} else if waiting > 0 {
 		pills = append(pills, lipgloss.NewStyle().
 			Foreground(ColorYellow).
@@ -9208,7 +9441,6 @@ func (h *Home) renderFilterBar() string {
 		pills = append(pills, dimPillStyle.Render(waitingLabel))
 	}
 
-	// Idle pill (gray when selected, dimmed when active filter hides it)
 	idleLabel := fmt.Sprintf("○ %d", idle)
 	if h.statusFilter == session.StatusIdle {
 		pills = append(pills, lipgloss.NewStyle().
@@ -9216,6 +9448,8 @@ func (h *Home) renderFilterBar() string {
 			Background(ColorTextDim).
 			Bold(true).
 			Padding(0, 1).Render(idleLabel))
+	} else if isActive && h.activeFilterExcludes[session.StatusIdle] {
+		pills = append(pills, dimPillStyle.Render(idleLabel))
 	} else if idle == 0 {
 		pills = append(pills, dimPillStyle.Render(idleLabel))
 	} else {
@@ -9225,7 +9459,6 @@ func (h *Home) renderFilterBar() string {
 			Padding(0, 1).Render(idleLabel))
 	}
 
-	// Error pill (red when selected, dimmed when active filter hides it)
 	if errored > 0 || h.statusFilter == session.StatusError {
 		errorLabel := fmt.Sprintf("✕ %d", errored)
 		if h.statusFilter == session.StatusError {
@@ -9234,7 +9467,7 @@ func (h *Home) renderFilterBar() string {
 				Background(ColorRed).
 				Bold(true).
 				Padding(0, 1).Render(errorLabel))
-		} else if isActive {
+		} else if isActive && h.activeFilterExcludes[session.StatusError] {
 			pills = append(pills, dimPillStyle.Render(errorLabel))
 		} else if errored > 0 {
 			pills = append(pills, lipgloss.NewStyle().
@@ -9244,8 +9477,7 @@ func (h *Home) renderFilterBar() string {
 		}
 	}
 
-	// Hint for keyboard shortcuts (cached — content is static)
-	hint := cachedFilterBarHint()
+	hint := h.renderFilterBarHint()
 
 	// Join pills with spaces (leading space replaces Padding)
 	filterRow := " " + strings.Join(pills, " ") + hint
@@ -9349,6 +9581,9 @@ func (h *Home) View() string {
 	}
 	if h.mcpDialog.IsVisible() {
 		return h.mcpDialog.View()
+	}
+	if h.pluginDialog.IsVisible() {
+		return h.pluginDialog.View()
 	}
 	if h.editSessionDialog.IsVisible() {
 		return h.editSessionDialog.View()
@@ -10281,7 +10516,10 @@ func renderSimpleMCPLine(b *strings.Builder, mcpInfo *session.MCPInfo, width int
 
 	for i, part := range mcpParts {
 		plainPart := tmux.StripANSI(part)
-		partWidth := runewidth.StringWidth(plainPart)
+		// #937: ansi.StringWidth (uniseg grapheme-cluster aware) instead of
+		// runewidth.StringWidth, which under-counts <codepoint>+VS16 emoji
+		// sequences and produced row-offset drift on titles like "🏷️ ...".
+		partWidth := ansi.StringWidth(plainPart)
 
 		addedWidth := partWidth
 		if mcpCount > 0 {
@@ -10296,7 +10534,7 @@ func renderSimpleMCPLine(b *strings.Builder, mcpInfo *session.MCPInfo, width int
 			wouldExceed = currentWidth+addedWidth > mcpMaxWidth
 		} else {
 			moreIndicator := fmt.Sprintf(" (+%d more)", remaining)
-			moreWidth := runewidth.StringWidth(moreIndicator)
+			moreWidth := ansi.StringWidth(moreIndicator)
 			wouldExceed = currentWidth+addedWidth+moreWidth > mcpMaxWidth
 		}
 
@@ -12398,7 +12636,10 @@ func (h *Home) renderPreviewPane(width, height int) string {
 			for i, part := range mcpParts {
 				// Strip ANSI codes to measure actual display width
 				plainPart := tmux.StripANSI(part)
-				partWidth := runewidth.StringWidth(plainPart)
+				// #937: ansi.StringWidth (uniseg grapheme-cluster aware)
+				// instead of runewidth.StringWidth — see comment at the other
+				// MCP-row sizing loop for full rationale.
+				partWidth := ansi.StringWidth(plainPart)
 
 				// Calculate width including separator if not first
 				addedWidth := partWidth
@@ -12418,7 +12659,7 @@ func (h *Home) renderPreviewPane(width, height int) string {
 				} else {
 					// Not last - check with indicator space reserved
 					moreIndicator := fmt.Sprintf(" (+%d more)", remaining)
-					moreWidth := runewidth.StringWidth(moreIndicator)
+					moreWidth := ansi.StringWidth(moreIndicator)
 					wouldExceed = currentWidth+addedWidth+moreWidth > mcpMaxWidth
 				}
 
@@ -13256,7 +13497,13 @@ func (h *Home) renderNotesSection(inst *session.Instance, width, maxLines int) s
 			}
 			for _, line := range displayLines {
 				safe := stripControlCharsPreserveANSI(line)
-				safe = runewidth.Truncate(safe, contentWidth, "...")
+				// #937: ansi.Truncate is uniseg grapheme-cluster aware so
+				// pane content (notes lines) containing emoji+VS16 stays
+				// inside the panel width budget — runewidth.Truncate
+				// under-counted by 1 cell per VS16 sequence and let the
+				// overflow scroll the layout. Reported by @jennings as
+				// the pane-content half of #937.
+				safe = ansi.Truncate(safe, contentWidth, "...")
 				lines = append(lines, notesStyle.Render(safe))
 			}
 			if overflow && len(lines) > 0 {
@@ -13353,9 +13600,14 @@ func remapANSIBackground(s, replacement string) string {
 	return ansiBackgroundRE.ReplaceAllString(s, replacement)
 }
 
-// truncatePath shortens a path to fit within maxLen display width
+// truncatePath shortens a path to fit within maxLen display width.
+//
+// #937: width and truncate route through ansi.* (uniseg grapheme-cluster
+// aware) instead of runewidth.*, which under-counts <codepoint>+VS16 emoji
+// sequences and let oversized titles past the truncation gate, producing
+// row-offset drift on titles like "🏷️ /Users/foo/project".
 func truncatePath(path string, maxLen int) string {
-	pathWidth := runewidth.StringWidth(path)
+	pathWidth := ansi.StringWidth(path)
 	if pathWidth <= maxLen {
 		return path
 	}
@@ -13368,8 +13620,8 @@ func truncatePath(path string, maxLen int) string {
 	startLen := maxLen / 3
 	endLen := maxLen*2/3 - 3
 	if startLen+endLen+3 > len(runes) {
-		// Path is short in runes but wide in display - use simple truncation
-		return runewidth.Truncate(path, maxLen-3, "...")
+		// Path is short in runes but wide in display - use width-aware truncation
+		return ansi.Truncate(path, maxLen-3, "...")
 	}
 	return string(runes[:startLen]) + "..." + string(runes[len(runes)-endLen:])
 }
@@ -13565,9 +13817,13 @@ func (h *Home) renderGroupPreview(group *session.Group, width, height int) strin
 	var truncatedLines []string
 	for _, line := range lines {
 		cleanLine := tmux.StripANSI(line)
-		displayWidth := runewidth.StringWidth(cleanLine)
+		// #937: ansi.StringWidth + ansi.Truncate are uniseg-aware and
+		// count <codepoint>+VS16 emoji sequences as 2 cells (matching
+		// terminal rendering); runewidth.* counts them as 1 and let
+		// oversized lines overflow into the next row.
+		displayWidth := ansi.StringWidth(cleanLine)
 		if displayWidth > maxWidth {
-			truncated := runewidth.Truncate(cleanLine, maxWidth-3, "...")
+			truncated := ansi.Truncate(cleanLine, maxWidth-3, "...")
 			truncatedLines = append(truncatedLines, truncated)
 		} else {
 			truncatedLines = append(truncatedLines, line)
@@ -13974,26 +14230,38 @@ func renderBar(percent float64, width int) string {
 	return filledStyle.Render(strings.Repeat("█", filled)) + emptyStyle.Render(strings.Repeat("░", empty))
 }
 
-// matchesStatusFilter returns true if the given session status matches the
-// current filter. For FilterModeActive, everything except error/stopped matches
-// (including StatusStarting — sessions being launched count as active).
-func matchesStatusFilter(filter, status session.Status) bool {
+// matchesStatusFilter reports whether status passes the current filter.
+// FilterModeActive consults [display].active_filter_excludes; concrete
+// filters require exact match.
+func (h *Home) matchesStatusFilter(filter, status session.Status) bool {
 	if filter == FilterModeActive {
-		return status != session.StatusError && status != session.StatusStopped
+		return !h.activeFilterExcludes[status]
 	}
 	return status == filter
 }
 
-// cachedFilterBarHint returns the static filter bar hint string.
-// Cached after first call since the content never changes after theme init.
-var _cachedFilterBarHint string
+// renderFilterBarHint renders the filter-bar keyboard-shortcut hint with the
+// shortcut character of the currently-engaged filter highlighted (subtle shade
+// brighter than the surrounding faint hint text).
+func (h *Home) renderFilterBarHint() string {
+	dim := lipgloss.NewStyle().Foreground(ColorComment).Faint(true)
+	hi := lipgloss.NewStyle().Foreground(ColorTextDim) // same hue, no Faint
 
-func cachedFilterBarHint() string {
-	if _cachedFilterBarHint == "" {
-		_cachedFilterBarHint = lipgloss.NewStyle().
-			Foreground(ColorComment).
-			Faint(true).
-			Render("  !@#$ filter • 0 all • " + FilterKeyActive + " open")
+	mark := func(c string, on bool) string {
+		if on {
+			return hi.Render(c)
+		}
+		return dim.Render(c)
 	}
-	return _cachedFilterBarHint
+
+	return dim.Render("  ") +
+		mark("!", h.statusFilter == session.StatusRunning) +
+		mark("@", h.statusFilter == session.StatusWaiting) +
+		mark("#", h.statusFilter == session.StatusIdle) +
+		mark("$", h.statusFilter == session.StatusError) +
+		dim.Render(" filter • ") +
+		mark("0", h.statusFilter == "") +
+		dim.Render(" all • ") +
+		mark(FilterKeyActive, h.statusFilter == FilterModeActive) +
+		dim.Render(" open")
 }

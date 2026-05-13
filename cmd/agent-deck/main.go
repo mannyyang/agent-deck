@@ -36,7 +36,7 @@ import (
 	"github.com/asheshgoplani/agent-deck/internal/web"
 )
 
-var Version = "1.7.81" // overridden at build time via -ldflags "-X main.Version=..."
+var Version = "1.8.3" // overridden at build time via -ldflags "-X main.Version=..."
 
 // Table column widths for list command output
 const (
@@ -260,6 +260,9 @@ func main() {
 			return
 		case "mcp":
 			handleMCP(profile, args[1:])
+			return
+		case "plugin":
+			handlePlugin(profile, args[1:])
 			return
 		case "skill":
 			handleSkill(profile, args[1:])
@@ -867,6 +870,7 @@ func reorderArgsForFlagParsing(args []string) []string {
 		"-p": true, "--parent": true,
 		"--mcp":       true,
 		"--channel":   true,
+		"--plugin":    true,
 		"--extra-arg": true,
 		"--wrapper":   true,
 		"-w":          true, "--worktree": true,
@@ -1065,6 +1069,17 @@ func handleAdd(profile string, args []string) {
 		channelFlags = append(channelFlags, s)
 		return nil
 	})
+
+	// Plugin enablement flag — repeatable, catalog-only, claude-only.
+	// Persisted on Instance.Plugins; resolved at spawn through
+	// [plugins.<name>] in ~/.agent-deck/config.toml and applied via the
+	// per-session scratch settings.json (RFC docs/rfc/PLUGIN_ATTACH.md).
+	var pluginFlags []string
+	fs.Func("plugin", "Catalog plugin to enable for this session (can specify multiple times); requires -c claude; configure in [plugins.<name>] in ~/.agent-deck/config.toml", func(s string) error {
+		pluginFlags = append(pluginFlags, s)
+		return nil
+	})
+	noChannelLink := fs.Bool("no-channel-link", false, "Disable auto-link between --plugin entries with emits_channel=true and --channel (RFC §4.7)")
 
 	// Extra claude CLI tokens - repeatable; each invocation is one already-
 	// tokenised arg (e.g. --extra-arg --agent --extra-arg reviewer).
@@ -1420,6 +1435,25 @@ func handleAdd(profile string, args []string) {
 			os.Exit(1)
 		}
 		newInstance.Channels = channelFlags
+	}
+
+	// Apply --plugin flags (catalog-only, claude-only, RFC docs/rfc/PLUGIN_ATTACH.md).
+	if len(pluginFlags) > 0 {
+		if newInstance.Tool != "claude" {
+			fmt.Println("Error: --plugin only supported for claude sessions (use -c claude); plugins enable Claude Code plugin features per-session via enabledPlugins")
+			os.Exit(1)
+		}
+		if err := validatePluginFlags(pluginFlags); err != nil {
+			fmt.Println("Error:", err)
+			os.Exit(1)
+		}
+		newInstance.Plugins = pluginFlags
+		newInstance.PluginChannelLinkDisabled = *noChannelLink
+		applyPluginChannelAutolink(newInstance)
+	} else if *noChannelLink {
+		// No-op flag without --plugin — quietly persist the preference
+		// for future session set / dialog edits.
+		newInstance.PluginChannelLinkDisabled = true
 	}
 
 	// Apply --extra-arg flags (claude only for now — these are passed to the
@@ -1922,16 +1956,16 @@ func handleRemove(profile string, args []string) {
 		_ = git.PruneWorktrees(inst.WorktreeRepoRoot)
 	}
 
-	// Direct SQL DELETE first to prevent resurrection by concurrent TUI force saves.
-	// The TUI's forceSaveInstances() can race with CLI deletion and re-insert the session.
-	// By deleting the row directly, we ensure it's gone even if SaveWithGroups races.
-	if err := storage.DeleteInstance(removedID); err != nil {
-		if !*jsonOutput {
-			fmt.Printf("Warning: direct delete failed: %v\n", err)
-		}
-	}
-
-	// Rebuild instance list without the deleted session and save with groups
+	// Rebuild instance list without the deleted session and persist groups.
+	// v1.9.1 (#909): the rm path now uses RemoveSessionAndVerify which
+	//   1. issues a targeted DELETE (busy-retried in statedb),
+	//   2. saves groups WITHOUT rewriting the instances table (SaveGroupsOnly,
+	//      not SaveWithGroups — the latter's load-modify-write INSERT OR
+	//      REPLACE was the structural source of the silent-loss race), and
+	//   3. verifies the row is actually gone, retrying the DELETE on
+	//      resurrection by a concurrent SaveInstances rewrite.
+	// On persistent failure the CLI exits 1 instead of falsely printing
+	// "✓ Removed".
 	newInstances := make([]*session.Instance, 0, len(instances)-1)
 	for _, s := range instances {
 		if s.ID != removedID {
@@ -1940,9 +1974,21 @@ func handleRemove(profile string, args []string) {
 	}
 	groupTree := session.NewGroupTreeWithGroups(newInstances, groups)
 
-	if err := storage.SaveWithGroups(newInstances, groupTree); err != nil {
-		out.Error(fmt.Sprintf("failed to save: %v", err), ErrCodeInvalidOperation)
+	if err := storage.RemoveSessionAndVerify(removedID, newInstances, groupTree); err != nil {
+		out.Error(fmt.Sprintf("failed to remove session: %v", err), ErrCodeInvalidOperation)
 		os.Exit(1)
+	}
+
+	// Best-effort post-removal cleanup for transition-notifier state
+	// (issue #910). Failures are warned but do not block the rm — the
+	// SQLite removal is the user-visible contract.
+	if swept, err := session.SweepInboxesForChildSession(removedID); err != nil && !*jsonOutput {
+		fmt.Fprintf(os.Stderr, "warn: inbox sweep for %s failed: %v\n", removedID, err)
+	} else if swept > 0 && !*jsonOutput {
+		fmt.Fprintf(os.Stderr, "swept %d stale inbox event(s) for removed session\n", swept)
+	}
+	if _, err := session.RemoveNotifyStateRecord(removedID); err != nil && !*jsonOutput {
+		fmt.Fprintf(os.Stderr, "warn: notify-state sweep for %s failed: %v\n", removedID, err)
 	}
 
 	out.Success(

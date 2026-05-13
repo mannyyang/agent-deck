@@ -203,6 +203,32 @@ func handleSessionStart(profile string, args []string) {
 		os.Exit(1)
 	}
 
+	// v1.9.1 group concurrency cap: if the target group is at its
+	// max_concurrent cap, mark this session queued instead of starting.
+	// The queue drains in handleSessionStop. Groups with max_concurrent<=0
+	// (legacy default) skip this check entirely.
+	tree := session.NewGroupTreeWithGroups(instances, groups)
+	max := session.GroupMaxConcurrent(tree, inst.GroupPath)
+	if session.ShouldQueue(instances, inst.GroupPath, max) {
+		inst.Status = session.StatusQueued
+		if err := saveSessionData(storage, instances, groups); err != nil {
+			out.Error(fmt.Sprintf("failed to save queued state: %v", err), ErrCodeInvalidOperation)
+			os.Exit(1)
+		}
+		out.Success(
+			fmt.Sprintf("Queued session: %s (group at cap %d)", inst.Title, max),
+			map[string]interface{}{
+				"success":        true,
+				"id":             inst.ID,
+				"title":          inst.Title,
+				"status":         "queued",
+				"group":          inst.GroupPath,
+				"max_concurrent": max,
+			},
+		)
+		return
+	}
+
 	// Start the session (with or without initial message)
 	if initialMessage != "" {
 		if err := inst.StartWithMessage(initialMessage); err != nil {
@@ -307,6 +333,12 @@ func handleSessionStop(profile string, args []string) {
 		os.Exit(1)
 	}
 
+	// v1.9.1 queue drain: a slot freed up. If the group has a cap and a
+	// queued sibling is waiting, start the oldest one. Only one drain per
+	// stop: if max_concurrent>=2 and multiple slots are now free, the next
+	// stop drains the next entry.
+	drained := drainGroupQueue(inst.GroupPath, instances, groups)
+
 	// Save updated state
 	if err := saveSessionData(storage, instances, groups); err != nil {
 		out.Error(fmt.Sprintf("failed to save session state: %v", err), ErrCodeInvalidOperation)
@@ -314,11 +346,38 @@ func handleSessionStop(profile string, args []string) {
 	}
 
 	// Output success
-	out.Success(fmt.Sprintf("Stopped session: %s", inst.Title), map[string]interface{}{
+	result := map[string]interface{}{
 		"success": true,
 		"id":      inst.ID,
 		"title":   inst.Title,
-	})
+	}
+	if drained != nil {
+		result["drained"] = drained.ID
+		result["drained_title"] = drained.Title
+	}
+	out.Success(fmt.Sprintf("Stopped session: %s", inst.Title), result)
+}
+
+// drainGroupQueue starts the oldest queued instance in groupPath when a slot
+// is available. Returns the drained instance (or nil if nothing to drain).
+// The caller is responsible for persisting state afterward.
+func drainGroupQueue(groupPath string, instances []*session.Instance, groups []*session.GroupData) *session.Instance {
+	tree := session.NewGroupTreeWithGroups(instances, groups)
+	max := session.GroupMaxConcurrent(tree, groupPath)
+	if session.IsAtCap(session.CountRunningInGroup(instances, groupPath), max) {
+		return nil
+	}
+	next := session.FindNextQueued(instances, groupPath)
+	if next == nil {
+		return nil
+	}
+	if err := next.Start(); err != nil {
+		// Drain is best-effort. Surface as queued + log; don't fail the stop.
+		next.Status = session.StatusError
+		fmt.Fprintf(os.Stderr, "queue drain failed to start %s: %v\n", next.Title, err)
+		return nil
+	}
+	return next
 }
 
 // handleSessionRestart restarts a session (or all active sessions with --all)
@@ -908,6 +967,24 @@ func handleSessionShow(profile string, args []string) {
 		if len(inst.Channels) > 0 {
 			jsonData["channels"] = inst.Channels
 		}
+
+		// Plugins (RFC docs/rfc/PLUGIN_ATTACH.md §10.5) — surface when
+		// non-empty so downstream tooling can introspect per-session
+		// enabledPlugins state without parsing the scratch settings.json.
+		if len(inst.Plugins) > 0 {
+			jsonData["plugins"] = inst.Plugins
+		}
+		// Surface the auto-link opt-out (RFC §4.7) when set, so tooling
+		// can distinguish "user disabled auto-link" from "no plugins".
+		if inst.PluginChannelLinkDisabled {
+			jsonData["plugin_channel_link_disabled"] = true
+		}
+		// AutoLinkedChannels (RFC §4.7, G4/C2 fix) — internal-ish state
+		// for ownership tracking, but exposing in JSON helps downstream
+		// tooling distinguish auto-linked vs user-managed channels.
+		if len(inst.AutoLinkedChannels) > 0 {
+			jsonData["auto_linked_channels"] = inst.AutoLinkedChannels
+		}
 	}
 
 	if tmuxSession := inst.GetTmuxSession(); tmuxSession != nil {
@@ -961,6 +1038,19 @@ func handleSessionShow(profile string, args []string) {
 			}
 			sb.WriteString(fmt.Sprintf("MCPs:    %s\n", strings.Join(mcpParts, ", ")))
 		}
+
+		// Channels and Plugins (RFC docs/rfc/PLUGIN_ATTACH.md). Surfaced
+		// for claude sessions so users can verify per-session topology
+		// without parsing state.db or the scratch settings.json.
+		if len(inst.Channels) > 0 {
+			sb.WriteString(fmt.Sprintf("Channels:%s\n", " "+strings.Join(inst.Channels, ", ")))
+		}
+		if len(inst.Plugins) > 0 {
+			sb.WriteString(fmt.Sprintf("Plugins: %s\n", strings.Join(inst.Plugins, ", ")))
+			if inst.PluginChannelLinkDisabled {
+				sb.WriteString("         (auto-channel-link disabled — RFC §4.7)\n")
+			}
+		}
 	}
 
 	if inst.NoTransitionNotify {
@@ -1012,6 +1102,7 @@ func handleSessionSet(profile string, args []string) {
 		fmt.Println("  tool               Tool type (claude, gemini, shell, etc.)")
 		fmt.Println("  wrapper            Wrapper command (use {command} to include tool command)")
 		fmt.Println("  channels           Comma-separated plugin channel ids (claude only)")
+		fmt.Println("  plugins            Comma-separated plugin catalog names (claude only) — see [plugins.<name>] in ~/.agent-deck/config.toml")
 		fmt.Println("  extra-args         Extra claude CLI tokens (claude only; use `-- --flag value` for tokens starting with -; persisted plaintext — no secrets)")
 		fmt.Println("  color              Optional TUI row tint: '#RRGGBB' or ANSI '0'..'255' or '' (issue #391)")
 		fmt.Println("  claude-session-id  Claude conversation ID")
@@ -1649,6 +1740,7 @@ func handleSessionSend(profile string, args []string) {
 	noWait := fs.Bool("no-wait", false, "Don't wait for agent to be ready (send immediately)")
 	wait := fs.Bool("wait", false, "Block until agent finishes processing, then print output")
 	stream := fs.Bool("stream", false, "Stream JSONL events (Claude only) to stdout instead of returning a snapshot")
+	draft := fs.Bool("draft", false, "Pre-fill the prompt without submitting (incompatible with --wait/--stream/--no-wait)")
 	timeout := fs.Duration("timeout", 10*time.Minute, "Max time to wait for completion (used with --wait)")
 	streamIdle := fs.Duration("stream-idle", 10*time.Second, "Max idle time before --stream aborts with error")
 	streamCharBudget := fs.Int("stream-char-budget", 4000, "Char budget for text flush in --stream mode")
@@ -1667,6 +1759,7 @@ func handleSessionSend(profile string, args []string) {
 		fmt.Println("  agent-deck session send my-project \"run tests\" --wait")
 		fmt.Println("  agent-deck session send my-project \"quick ping\" --no-wait")
 		fmt.Println("  agent-deck session send my-project \"trace progress\" --stream")
+		fmt.Println("  agent-deck session send my-project \"cwd: /path/to/dir\" --draft")
 	}
 
 	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
@@ -1684,6 +1777,11 @@ func handleSessionSend(profile string, args []string) {
 
 	if *stream && *wait {
 		out.Error("--stream and --wait are mutually exclusive", ErrCodeInvalidOperation)
+		os.Exit(1)
+	}
+
+	if *draft && (*wait || *stream || *noWait) {
+		out.Error("--draft is incompatible with --wait, --stream, and --no-wait", ErrCodeInvalidOperation)
 		os.Exit(1)
 	}
 
@@ -1741,6 +1839,22 @@ func handleSessionSend(profile string, args []string) {
 	// Record send time before the actual send so we can verify output freshness.
 	// Captured early to avoid false negatives from clock skew.
 	sentAt := time.Now()
+
+	// --draft: type text into the prompt without pressing Enter, letting the
+	// user review and submit manually.
+	if *draft {
+		if err := executeDraft(tmuxSess, message); err != nil {
+			out.Error(fmt.Sprintf("failed to pre-fill prompt: %v", err), ErrCodeInvalidOperation)
+			os.Exit(1)
+		}
+		out.Success(fmt.Sprintf("Pre-filled prompt in '%s'", inst.Title), map[string]interface{}{
+			"success":       true,
+			"session_id":    inst.ID,
+			"session_title": inst.Title,
+			"message":       message,
+		})
+		return
+	}
 
 	// Send message atomically (text + Enter in single tmux invocation).
 	// --no-wait: skip full readiness waiting, but run a capped preflight
@@ -1829,13 +1943,32 @@ func handleSessionSend(profile string, args []string) {
 	}
 }
 
+// defaultSendOptions returns the verification-loop options used by the default
+// (non-`--no-wait`) CLI send path. verifyDelivery is enabled so the CLI
+// surfaces silent drops as errors rather than returning false success — see
+// issue #876.
+func defaultSendOptions() sendRetryOptions {
+	return sendRetryOptions{
+		maxRetries:     50,
+		checkDelay:     300 * time.Millisecond,
+		verifyDelivery: true,
+	}
+}
+
 // sendWithRetry sends a message atomically and retries Enter if the agent
 // doesn't start processing within a reasonable time.
 func sendWithRetry(tmuxSess *tmux.Session, message string, skipVerify bool) error {
-	return sendWithRetryTarget(tmuxSess, message, skipVerify, sendRetryOptions{
-		maxRetries: 50,
-		checkDelay: 300 * time.Millisecond,
-	})
+	return sendWithRetryTarget(tmuxSess, message, skipVerify, defaultSendOptions())
+}
+
+// draftSender is implemented by *tmux.Session for the --draft path.
+type draftSender interface {
+	SendKeysChunked(string) error
+}
+
+// executeDraft pre-fills the prompt without pressing Enter.
+func executeDraft(target draftSender, message string) error {
+	return target.SendKeysChunked(message)
 }
 
 // noWaitSendOptions returns the verification-loop options used by the
@@ -1855,6 +1988,11 @@ func noWaitSendOptions() sendRetryOptions {
 		maxRetries:     30,
 		checkDelay:     200 * time.Millisecond,
 		maxFullResends: -1,
+		// Issue #876: even on the --no-wait path, callers expect that a
+		// `Sent` exit means the message reached the agent. Without this,
+		// the verification loop would still fall through to nil on a
+		// silent drop.
+		verifyDelivery: true,
 	}
 }
 
@@ -1935,6 +2073,15 @@ type sendRetryOptions struct {
 	maxRetries     int
 	checkDelay     time.Duration
 	maxFullResends int // >0 overrides default (3); <0 disables Ctrl+C-then-resend; 0 uses default
+
+	// verifyDelivery, when true, requires the verification loop to observe at
+	// least one positive signal that the message reached the inner agent (an
+	// "active" status transition, an unsent-prompt composer marker, a full
+	// resend, or the message body appearing in the captured pane). If the
+	// budget is exhausted without any such signal, the function returns an
+	// error instead of the prior best-effort `nil`. Closes the silent-drop
+	// path reported in issue #876.
+	verifyDelivery bool
 }
 
 func sendWithRetryTarget(target sendRetryTarget, message string, skipVerify bool, opts sendRetryOptions) error {
@@ -1981,6 +2128,19 @@ func sendWithRetryTarget(target sendRetryTarget, message string, skipVerify bool
 	activeChecks := 0
 	sawActiveAfterSend := false
 	fullResendCount := 0
+	// sawDeliveryEvidence flips true on any positive signal that the message
+	// reached the agent: an "active" status transition, an unsent-prompt
+	// composer marker, the message body appearing verbatim in the pane, or a
+	// successful full resend. When opts.verifyDelivery is set and this stays
+	// false for the entire budget, the function returns an error instead of
+	// silently succeeding (issue #876).
+	sawDeliveryEvidence := false
+	// Snippet of the message body to look for in captured pane content. Some
+	// TUI frameworks (and non-Claude tools) won't render a "[Pasted text …]"
+	// or "❯ <msg>" marker, so direct verbatim content is the only signal.
+	// Take the first run of non-whitespace content, capped, to avoid false
+	// positives from matching common short strings.
+	deliveryToken := messageDeliveryToken(message)
 	for retry := 0; retry < opts.maxRetries; retry++ {
 		time.Sleep(opts.checkDelay)
 
@@ -1988,10 +2148,14 @@ func sendWithRetryTarget(target sendRetryTarget, message string, skipVerify bool
 		if rawContent, captureErr := target.CapturePaneFresh(); captureErr == nil {
 			content := tmux.StripANSI(rawContent)
 			unsentPromptDetected = send.HasUnsentPastedPrompt(content) || send.HasUnsentComposerPrompt(content, message)
+			if !sawDeliveryEvidence && deliveryToken != "" && strings.Contains(content, deliveryToken) {
+				sawDeliveryEvidence = true
+			}
 		}
 		status, err := target.GetStatus()
 
 		if unsentPromptDetected {
+			sawDeliveryEvidence = true
 			waitingNoMarkerChecks = 0
 			waitingNoActivityChecks = 0
 			activeChecks = 0
@@ -2001,6 +2165,7 @@ func sendWithRetryTarget(target sendRetryTarget, message string, skipVerify bool
 
 		if err == nil && status == "active" {
 			sawActiveAfterSend = true
+			sawDeliveryEvidence = true
 			waitingNoMarkerChecks = 0
 			waitingNoActivityChecks = 0
 			activeChecks++
@@ -2030,7 +2195,14 @@ func sendWithRetryTarget(target sendRetryTarget, message string, skipVerify bool
 					waitingNoActivityChecks = 0
 					_ = target.SendCtrlC()
 					time.Sleep(200 * time.Millisecond)
-					_ = target.SendKeysAndEnter(message)
+					if resendErr := target.SendKeysAndEnter(message); resendErr == nil {
+						// A successful resend is not yet evidence of receipt
+						// — the next iteration must still observe a positive
+						// signal — but we record the attempt so verifyDelivery
+						// can distinguish "send pipe ever fired" from "never
+						// even acked". Intentionally NOT setting
+						// sawDeliveryEvidence here.
+					}
 					continue
 				}
 
@@ -2055,8 +2227,34 @@ func sendWithRetryTarget(target sendRetryTarget, message string, skipVerify bool
 		}
 	}
 
-	// Best effort: don't fail even if verification is inconclusive.
+	// Issue #876: with verifyDelivery, refuse to claim success when no
+	// positive signal was ever observed — the message was very likely
+	// dropped silently. Without it, preserve the legacy best-effort
+	// contract used by paths that gate verification elsewhere.
+	if opts.verifyDelivery && !sawDeliveryEvidence {
+		return fmt.Errorf("send dropped silently: no evidence of delivery after %d checks (issue #876). "+
+			"The agent never transitioned to 'active', no composer/unsent-paste marker appeared, "+
+			"and the message body was not visible in the pane. Verify the inner agent is reading from "+
+			"its TTY before retrying", opts.maxRetries)
+	}
 	return nil
+}
+
+// messageDeliveryToken returns a short, content-bearing slice of the message
+// suitable for "did this body appear in the pane?" verification. Returns "" if
+// the message contains no usefully-distinctive token (e.g. all whitespace, or
+// only short common words).
+func messageDeliveryToken(message string) string {
+	const minTokenLen = 12
+	const maxTokenLen = 64
+	trimmed := strings.TrimSpace(message)
+	if len(trimmed) < minTokenLen {
+		return ""
+	}
+	if len(trimmed) > maxTokenLen {
+		trimmed = trimmed[:maxTokenLen]
+	}
+	return trimmed
 }
 
 // waitForAgentReady waits for Claude/Gemini/other agents to be ready for input

@@ -621,6 +621,28 @@ func TestConductorHeartbeatScript_StatusParsingHandlesWhitespace(t *testing.T) {
 	}
 }
 
+// TestConductorHeartbeatScript_InjectsHeartbeatRules verifies parity with
+// conductor/bridge.py (PR #218): the OS heartbeat must also resolve and inline
+// HEARTBEAT_RULES.md so rules survive context compaction regardless of which
+// heartbeat mechanism is active.
+func TestConductorHeartbeatScript_InjectsHeartbeatRules(t *testing.T) {
+	if !strings.Contains(conductorHeartbeatScript, "HEARTBEAT_RULES.md") {
+		t.Fatal("heartbeat script should reference HEARTBEAT_RULES.md")
+	}
+	if !strings.Contains(conductorHeartbeatScript, "{NAME}/HEARTBEAT_RULES.md") {
+		t.Fatal("heartbeat script should look up per-conductor HEARTBEAT_RULES.md first")
+	}
+	if !strings.Contains(conductorHeartbeatScript, "{PROFILE}/HEARTBEAT_RULES.md") {
+		t.Fatal("heartbeat script should look up per-profile HEARTBEAT_RULES.md")
+	}
+	if !strings.Contains(conductorHeartbeatScript, "/.agent-deck/conductor/HEARTBEAT_RULES.md") {
+		t.Fatal("heartbeat script should fall back to the global HEARTBEAT_RULES.md")
+	}
+	if !strings.Contains(conductorHeartbeatScript, "[HEARTBEAT]") {
+		t.Fatal("heartbeat script should send messages prefixed with [HEARTBEAT] (matches bridge.py)")
+	}
+}
+
 // --- Symlink-based CLAUDE.md tests ---
 
 func TestInstallSharedClaudeMD_Default(t *testing.T) {
@@ -807,7 +829,7 @@ func TestSetupConductor_DefaultTemplate(t *testing.T) {
 	defer os.RemoveAll(filepath.Join(homeDir, ".agent-deck", "conductor", name))
 
 	// Setup without custom path (uses default template)
-	err := SetupConductor(name, profile, true, true, "test description", "", "", nil, "")
+	err := SetupConductor(name, profile, true, true, "test description", "", "", "", nil, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -854,7 +876,7 @@ func TestSetupConductorWithAgent_Codex(t *testing.T) {
 	t.Setenv("HOME", tmpHome)
 
 	name := "test-codex"
-	if err := SetupConductorWithAgent(name, "default", ConductorAgentCodex, true, true, "codex conductor", "", "", nil, ""); err != nil {
+	if err := SetupConductorWithAgent(name, "default", ConductorAgentCodex, true, true, "codex conductor", "", "", "", nil, ""); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
@@ -888,10 +910,10 @@ func TestSetupConductorWithAgent_RemovesStaleInstructionsFile(t *testing.T) {
 	t.Setenv("HOME", tmpHome)
 
 	name := "switch-agent"
-	if err := SetupConductor(name, "default", true, true, "", "", "", nil, ""); err != nil {
+	if err := SetupConductor(name, "default", true, true, "", "", "", "", nil, ""); err != nil {
 		t.Fatalf("failed to create initial Claude conductor: %v", err)
 	}
-	if err := SetupConductorWithAgent(name, "default", ConductorAgentCodex, true, true, "", "", "", nil, ""); err != nil {
+	if err := SetupConductorWithAgent(name, "default", ConductorAgentCodex, true, true, "", "", "", "", nil, ""); err != nil {
 		t.Fatalf("failed to switch conductor to Codex: %v", err)
 	}
 
@@ -921,7 +943,7 @@ func TestSetupConductor_CustomSymlink(t *testing.T) {
 	defer os.RemoveAll(filepath.Join(homeDir, ".agent-deck", "conductor", name))
 
 	// Setup with custom path (creates symlink)
-	err := SetupConductor(name, profile, true, true, "test description", customPath, "", nil, "")
+	err := SetupConductor(name, profile, true, true, "test description", customPath, "", "", nil, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -951,7 +973,7 @@ func TestSetupConductor_EmptyProfileNormalizesToDefault(t *testing.T) {
 	t.Setenv("HOME", tmpHome)
 
 	name := "default-profile-conductor"
-	if err := SetupConductor(name, "", true, true, "", "", "", nil, ""); err != nil {
+	if err := SetupConductor(name, "", true, true, "", "", "", "", nil, ""); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
@@ -978,11 +1000,11 @@ func TestSetupConductor_ProfileConflict(t *testing.T) {
 	t.Setenv("HOME", tmpHome)
 
 	name := "profile-conflict"
-	if err := SetupConductor(name, "work", true, true, "", "", "", nil, ""); err != nil {
+	if err := SetupConductor(name, "work", true, true, "", "", "", "", nil, ""); err != nil {
 		t.Fatalf("first setup failed: %v", err)
 	}
 
-	err := SetupConductor(name, "personal", true, true, "", "", "", nil, "")
+	err := SetupConductor(name, "personal", true, true, "", "", "", "", nil, "")
 	if err == nil {
 		t.Fatal("expected conflict error when reusing conductor name across profiles")
 	}
@@ -1377,7 +1399,7 @@ func TestSetupConductor_PolicyOverride(t *testing.T) {
 	defer os.RemoveAll(filepath.Join(homeDir, ".agent-deck", "conductor", name))
 
 	// Setup with custom policy path (creates per-conductor symlink)
-	err := SetupConductor(name, profile, true, true, "test description", "", customPolicyPath, nil, "")
+	err := SetupConductor(name, profile, true, true, "test description", "", customPolicyPath, "", nil, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1398,6 +1420,48 @@ func TestSetupConductor_PolicyOverride(t *testing.T) {
 	// Verify reading through symlink works
 	content, _ := os.ReadFile(policyPath)
 	if !strings.Contains(string(content), "My Conductor Policy") {
+		t.Error("reading through symlink should return custom content")
+	}
+}
+
+func TestSetupConductor_HeartbeatRulesOverride(t *testing.T) {
+	tmpDir := t.TempDir()
+	customRulesPath := filepath.Join(tmpDir, "my-conductor-HEARTBEAT_RULES.md")
+
+	// Create custom file first
+	if err := os.WriteFile(customRulesPath, []byte("# My Conductor Heartbeat Rules\n"), 0o644); err != nil {
+		t.Fatalf("failed to create custom file: %v", err)
+	}
+
+	name := "test-heartbeat-rules-override"
+	profile := "default"
+
+	// Clean up after test
+	homeDir, _ := os.UserHomeDir()
+	defer os.RemoveAll(filepath.Join(homeDir, ".agent-deck", "conductor", name))
+
+	// Setup with custom heartbeat rules path (creates per-conductor symlink)
+	err := SetupConductor(name, profile, true, true, "test description", "", "", customRulesPath, nil, "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Verify per-conductor HEARTBEAT_RULES.md symlink exists
+	dir, _ := ConductorNameDir(name)
+	rulesPath := filepath.Join(dir, "HEARTBEAT_RULES.md")
+	linkDest, err := os.Readlink(rulesPath)
+	if err != nil {
+		t.Fatalf("HEARTBEAT_RULES.md should be a symlink: %v", err)
+	}
+
+	// Verify symlink points to custom file
+	if linkDest != customRulesPath {
+		t.Errorf("symlink should point to %q, got %q", customRulesPath, linkDest)
+	}
+
+	// Verify reading through symlink works
+	content, _ := os.ReadFile(rulesPath)
+	if !strings.Contains(string(content), "My Conductor Heartbeat Rules") {
 		t.Error("reading through symlink should return custom content")
 	}
 }
@@ -1556,7 +1620,7 @@ func TestSetupConductorCreatesLearnings(t *testing.T) {
 	t.Setenv("HOME", tmpHome)
 
 	name := "learnings-test"
-	if err := SetupConductor(name, "default", true, true, "", "", "", nil, ""); err != nil {
+	if err := SetupConductor(name, "default", true, true, "", "", "", "", nil, ""); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
@@ -1581,7 +1645,7 @@ func TestSetupConductorPreservesExistingLearnings(t *testing.T) {
 
 	name := "learnings-preserve"
 	// First setup creates the file
-	if err := SetupConductor(name, "default", true, true, "", "", "", nil, ""); err != nil {
+	if err := SetupConductor(name, "default", true, true, "", "", "", "", nil, ""); err != nil {
 		t.Fatalf("first setup failed: %v", err)
 	}
 
@@ -1594,7 +1658,7 @@ func TestSetupConductorPreservesExistingLearnings(t *testing.T) {
 	}
 
 	// Re-running setup should NOT overwrite
-	if err := SetupConductor(name, "default", true, true, "", "", "", nil, ""); err != nil {
+	if err := SetupConductor(name, "default", true, true, "", "", "", "", nil, ""); err != nil {
 		t.Fatalf("second setup failed: %v", err)
 	}
 
@@ -2246,7 +2310,7 @@ func TestSetupConductor_WithEnvVars(t *testing.T) {
 		"ANTHROPIC_BASE_URL":   "https://api.z.ai/api/anthropic",
 		"ANTHROPIC_AUTH_TOKEN": "test-token",
 	}
-	err := SetupConductor(name, "default", true, true, "env test", "", "", env, "~/.conductor.env")
+	err := SetupConductor(name, "default", true, true, "env test", "", "", "", env, "~/.conductor.env")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -2282,7 +2346,7 @@ func TestSetupConductor_WithoutEnvVars(t *testing.T) {
 	t.Setenv("HOME", tmpHome)
 
 	name := "test-no-env-conductor"
-	err := SetupConductor(name, "default", true, true, "", "", "", nil, "")
+	err := SetupConductor(name, "default", true, true, "", "", "", "", nil, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
