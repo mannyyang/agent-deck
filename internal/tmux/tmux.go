@@ -537,7 +537,7 @@ func SupportsHyperlinks() bool {
 }
 
 // Tool detection patterns (used by DetectTool for initial tool identification)
-var toolDetectionOrder = []string{"claude", "gemini", "opencode", "codex", "copilot", "pi"}
+var toolDetectionOrder = []string{"claude", "gemini", "opencode", "codex", "copilot", "crush", "cursor", "hermes", "pi"}
 
 var toolDetectionPatterns = map[string][]*regexp.Regexp{
 	"claude": {
@@ -565,10 +565,26 @@ var toolDetectionPatterns = map[string][]*regexp.Regexp{
 		regexp.MustCompile(`(?i)\bcopilot\s+cli\b`),
 		regexp.MustCompile(`(?i)^copilot>\s*`),
 	},
+	"crush": {
+		// charmbracelet/crush — Charm's terminal-first AI assistant. Issue #940.
+		// Distinct phrases to avoid colliding with the English word "crush".
+		regexp.MustCompile(`(?i)\bcharm\s+crush\b`),
+		regexp.MustCompile(`(?i)\bcrush>\s*`),
+	},
+	"hermes": {
+		// Hermes Agent CLI (github.com/NousResearch/hermes-agent).
+		regexp.MustCompile(`(?i)\bhermes\s+agent\b`),
+		regexp.MustCompile(`(?i)\bnous\s*research\b`),
+	},
 	"pi": {
 		regexp.MustCompile(`(?mi)^\s*pi>\s*`),
 		regexp.MustCompile(`(?i)\bpi\s+cli\b`),
 		regexp.MustCompile(`(?i)\bpi\s+code\b`),
+	},
+	"cursor": {
+		// Cursor CLI agent TUI
+		regexp.MustCompile(`(?i)\bcursor\s+agent\b`),
+		regexp.MustCompile(`(?i)cursor\s+cli\b`),
 	},
 }
 
@@ -592,6 +608,12 @@ func detectToolFromCommand(command string) string {
 			return "codex"
 		case "copilot":
 			return "copilot"
+		case "crush":
+			return "crush"
+		case "cursor":
+			return "cursor"
+		case "hermes":
+			return "hermes"
 		case "pi":
 			return "pi"
 		}
@@ -608,6 +630,12 @@ func detectToolFromCommand(command string) string {
 		return "codex"
 	case strings.Contains(cmdLower, "copilot") || strings.Contains(cmdLower, "@github/copilot"):
 		return "copilot"
+	case strings.Contains(cmdLower, "crush"):
+		return "crush"
+	case strings.Contains(cmdLower, "cursor"):
+		return "cursor"
+	case strings.Contains(cmdLower, "hermes"):
+		return "hermes"
 	case strings.Contains(cmdLower, " pi ") || strings.HasPrefix(cmdLower, "pi "):
 		return "pi"
 	default:
@@ -1464,6 +1492,42 @@ func (s *Session) IsConfigured() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.configured
+}
+
+// AnyAgentDeckSessionWithEnvValue reports whether any agentdeck-prefixed
+// tmux session carries envKey=envValue. Returns the matching session name
+// (or "") and a bool. Issue #1040: the spawn-guard's in-lock "already
+// alive" gate uses this to detect that a sibling Restart has already
+// produced a live session before this caller does so again. The probe is
+// read-only — no kill. envValue == "" short-circuits to false because
+// matching every session with an unset variable is never the intent.
+func AnyAgentDeckSessionWithEnvValue(envKey, envValue string) (string, bool) {
+	if envValue == "" {
+		return "", false
+	}
+
+	socket := DefaultSocketName()
+	out, err := tmuxExec(socket, "list-sessions", "-F", "#{session_name}").Output()
+	if err != nil {
+		return "", false
+	}
+
+	for _, name := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if name == "" || !strings.HasPrefix(name, SessionPrefix) {
+			continue
+		}
+		val, err := tmuxExec(socket, "show-environment", "-t", name, envKey).Output()
+		if err != nil {
+			continue
+		}
+		line := strings.TrimSpace(string(val))
+		if idx := strings.IndexByte(line, '='); idx >= 0 {
+			if line[idx+1:] == envValue {
+				return name, true
+			}
+		}
+	}
+	return "", false
 }
 
 // KillSessionsWithEnvValue kills agentdeck tmux sessions that have the given
@@ -3903,6 +3967,26 @@ func (s *Session) SendKeys(keys string) error {
 func (s *Session) SendEnter() error {
 	s.invalidateCache()
 	cmd := s.tmuxCmd("send-keys", "-t", s.Name, "Enter")
+	return cmd.Run()
+}
+
+// OpenKeySender opens a persistent tmux control-mode client bound to this
+// session's pane. Used by TUI insert mode (#1102) to amortize the fork+exec
+// cost of `tmux send-keys` across a typing burst. Returns nil and an error
+// when the user's tmux can't be reached or the session no longer exists;
+// callers should fall back to per-call SendKeys / SendEnter / SendNamedKey.
+func (s *Session) OpenKeySender() (KeySender, error) {
+	return OpenKeySender(s.SocketName, s.Name)
+}
+
+// SendNamedKey sends a single tmux named key (e.g. "BSpace", "Up", "Down",
+// "Left", "Right", "Tab", "BTab", "C-c", "C-d") to the session. Unlike
+// SendKeys it does NOT use the -l flag, so tmux interprets the argument as a
+// key name rather than literal text. Used by insert mode (#1094) to forward
+// Backspace, arrow keys, Tab, and Ctrl-{C,D} from the TUI to the focused pane.
+func (s *Session) SendNamedKey(key string) error {
+	s.invalidateCache()
+	cmd := s.tmuxCmd("send-keys", "-t", s.Name, key)
 	return cmd.Run()
 }
 

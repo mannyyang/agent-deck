@@ -24,25 +24,26 @@ Every keyboard action in the TUI that mutates state or navigates must have a web
 | Restart session | `internal/ui/home.go:6473` (`R` key) | POST `/api/sessions/{id}/restart` | `RestartSession` | `handlers_sessions_test.go` | Recreate tmux with resume |
 | Restart fresh | `internal/ui/home.go:6494` (`T` key) | MISSING | `RestartSessionFresh` | N/A | Discards tool binding, no web equivalent |
 | Delete session | `internal/ui/home.go:6302` (`d` key) | DELETE `/api/sessions/{id}` | `DeleteSession` | `handlers_sessions_test.go` | Kills + removes from storage |
-| Close session | `internal/ui/home.go:6318` (`D` key) | MISSING | N/A | N/A | Non-destructive close (stops process, keeps metadata) |
+| Close session | `internal/ui/home.go:6318` (`D` key) | POST `/api/sessions/{id}/close` | `CloseSession` | `handlers_sessions_test.go`, `tests/web/e2e/close-undo.spec.js` | Non-destructive close (stops process, keeps metadata); Shift+D in web UI |
 | Fork session | `internal/ui/home.go:5979` (`f` key, quick) | POST `/api/sessions/{id}/fork` | `ForkSession` | `handlers_sessions_test.go` | Creates fork with resume command |
 | Fork with dialog | `internal/ui/home.go:5997` (`F`/`shift+f`) | POST `/api/sessions/{id}/fork` | `ForkSession` | `handlers_sessions_test.go` | Dialog allows custom title + group |
 | Rename session | `internal/ui/home.go:6119` (`r` key) | MISSING | N/A | N/A | Title edit via GroupDialog |
-| Undo delete | `internal/ui/home.go:6572` (`ctrl+z`) | MISSING | N/A | N/A | Chrome-style undo, TUI-only |
+| Undo delete | `internal/ui/home.go:6572` (`ctrl+z`) | POST `/api/sessions/undelete` | `UndoDelete` | `handlers_sessions_test.go`, `tests/web/e2e/close-undo.spec.js` | Chrome-style undo within 30s window (web.DefaultUndoWindow); Ctrl+Z in web UI |
 | **GROUP OPERATIONS** |
 | Create group | `internal/ui/home.go:6094` (`g` key) | POST `/api/groups` | `CreateGroup` | `handlers_groups_test.go` | Root or as subgroup |
 | Rename group | `internal/ui/home.go:6119` (`r` key, group) | PATCH `/api/groups/{path}` | `RenameGroup` | `handlers_groups_test.go` | Via GroupDialog |
 | Delete group | `internal/ui/home.go:6302` (`d` key, group) | DELETE `/api/groups/{path}` | `DeleteGroup` | `handlers_groups_test.go` | Moves children to default group |
 | Move session to group | `internal/ui/home.go:6028` (`M`/`shift+m`) | MISSING | N/A | N/A | TUI-only via GroupDialog move mode |
 | **MCP MANAGEMENT** |
-| Attach MCP | `internal/ui/home.go:5965` (`m` key → MCPDialog) | MISSING | N/A | N/A | TUI dialog only; writes `.mcp.json` |
-| Detach MCP | `internal/ui/home.go:5965` (`m` key → MCPDialog) | MISSING | N/A | N/A | TUI dialog only; edits `.mcp.json` |
-| List MCPs | `internal/ui/home.go:5965` (`m` key → MCPDialog) | MISSING | N/A | N/A | TUI displays from catalog |
-| Toggle pooled ↔ local | `internal/ui/home.go:5965` (`m` key → MCPDialog) | MISSING | N/A | N/A | TUI dialog only |
+| Attach MCP | `internal/ui/home.go:5965` (`m` key → MCPDialog) | POST `/api/sessions/{id}/mcps/{name}` | `MCPManager.Attach` | `handlers_mcps_test.go` | Body `{scope?}`; default scope=local; writes `.mcp.json` via session helpers |
+| Detach MCP | `internal/ui/home.go:5965` (`m` key → MCPDialog) | DELETE `/api/sessions/{id}/mcps/{name}` | `MCPManager.Detach` | `handlers_mcps_test.go` | Body `{scope?}`; scope auto-detected if omitted |
+| List MCPs | `internal/ui/home.go:5965` (`m` key → MCPDialog) | GET `/api/sessions/{id}/mcps` | `MCPManager.ListAttached` | `handlers_mcps_test.go` | Returns `{local,global,user}`; catalog at GET `/api/mcps` |
+| Toggle pooled ↔ local | `internal/ui/home.go:5965` (`m` key → MCPDialog) | PATCH `/api/sessions/{id}/mcps/{name}` | `MCPManager.Move` | `handlers_mcps_test.go` | Body `{scope}` or `{pooled:bool}`; pooled=true→global, pooled=false→local |
 | **SKILLS MANAGEMENT** |
-| Attach skill | `internal/ui/home.go:6015` (`s` key → SkillDialog) | MISSING | N/A | N/A | TUI dialog only; writes project config |
-| Detach skill | `internal/ui/home.go:6015` (`s` key → SkillDialog) | MISSING | N/A | N/A | TUI dialog only |
-| List skills | `internal/ui/home.go:6015` (`s` key → SkillDialog) | MISSING | N/A | N/A | TUI displays from catalog |
+| Attach skill | `internal/ui/home.go:6015` (`s` key → SkillDialog) | POST `/api/sessions/{id}/skills/{name}` | `apiFetch('POST', …)` from `SkillsPane.js` | `tests/web/e2e/skills.spec.js` | Wired via `web.SkillsService`; writes project config |
+| Detach skill | `internal/ui/home.go:6015` (`s` key → SkillDialog) | DELETE `/api/sessions/{id}/skills/{name}` | `apiFetch('DELETE', …)` from `SkillsPane.js` | `tests/web/e2e/skills.spec.js` | Wired via `web.SkillsService` |
+| List skills (catalog) | `internal/ui/home.go:6015` (`s` key → SkillDialog) | GET `/api/skills` | `SkillsPane.js` catalog column | `tests/web/e2e/skills.spec.js` | Mirrors `session.ListAvailableSkills` |
+| List skills (attached) | `internal/ui/home.go:6015` (`s` key → SkillDialog) | GET `/api/sessions/{id}/skills` | `SkillsPane.js` attached column | `tests/web/e2e/skills.spec.js` | Mirrors `session.GetAttachedProjectSkills(projectPath)` |
 | **SETTINGS & DISPLAY** |
 | Edit session settings | `internal/ui/home.go:5953` (`P`/`shift+p` → EditSessionDialog) | MISSING | `SetField` (indirect) | N/A | Title, color, notes, tool options, channels |
 | Edit multi-repo paths | `internal/ui/home.go:5942` (`p` → EditPathsDialog) | MISSING | N/A | N/A | Multi-repo session paths |
@@ -64,7 +65,7 @@ Every keyboard action in the TUI that mutates state or navigates must have a web
 | Jump mode | `internal/ui/home.go:6406` (`space` key) | MISSING | N/A | N/A | Vimium-style hint navigation |
 | Attach session | `internal/ui/home.go:5744` (`enter` key) | MISSING | N/A | N/A | PTY attach via tmux; web uses WS for streaming |
 | **WORKTREE OPERATIONS** |
-| Finish worktree | `internal/ui/home.go:6038` (`W`/`shift+w`) | MISSING | N/A | N/A | Merge + cleanup; TUI dialog only |
+| Finish worktree | `internal/ui/home.go:6038` (`W`/`shift+w`) | POST `/api/sessions/{id}/worktree/finish` | `FinishWorktree` | `issue1126_worktree_finish_test.go`, `tests/web/e2e/worktree-finish.spec.js` | Merge + cleanup; body accepts `into`, `noMerge`, `keepBranch`, `force` (mirrors CLI flags). Issue #1126. |
 | **COST TRACKING** |
 | View costs dashboard | `internal/ui/home.go` (TUI only) | GET `/api/costs/summary` | N/A | `handlers_costs_test.go` | Sessions cost aggregation. **e2e parity: degraded-only** — fixture omits the SQLite cost store, so the e2e probe asserts the documented 503 `UNAVAILABLE` response. Happy-path (200 + payload) coverage is `parity-test-deferred` to PR-B fixture wiring. |
 | Cost export | N/A | GET `/api/costs/export` | N/A | `handlers_costs_test.go` | Web-only; CSV/JSON export. **e2e parity: degraded-only** (503 without cost store). Happy-path `parity-test-deferred` to PR-B. |
@@ -92,54 +93,54 @@ Every observable session field shown in the TUI must appear in the web API JSON 
 | `created_at` | Info section | `MenuSession.createdAt` | ✅ Present |
 | `last_accessed_at` | Info section | `MenuSession.lastAccessedAt` | ✅ Present |
 | **RELATIONSHIPS** |
-| `parent_session_id` | Sub-session indicator | `MenuSession.parentSessionId` | ✅ Present |
-| `is_conductor` | (Not shown in TUI) | MISSING | Conductor metadata |
+| `parent_session_id` | Sub-session indicator | `MenuSession.parentSessionId` + `GET /api/sessions/{id}/children` | ✅ Present; tree endpoint surfaces full conductor child topology in the right-rail Children card (`internal/web/handlers_children.go`, `tests/web/e2e/children-panel.spec.js`) |
+| `is_conductor` | (Not shown in TUI) | `MenuSession.isConductor` | ✅ Present; conductor metadata. Tree topology also surfaced at `GET /api/sessions/{id}/children` (kind derived UI-side from title/groupPath in `dataModel.js`) |
 | **PROCESS STATE** |
 | `tmux_session` | Internal reference | `MenuSession.tmuxSession` | ✅ Present (tmux session name) |
 | `tmux_socket_name` | (Internal) | `MenuSession.tmuxSocketName` | ✅ Present; issue #687 |
 | **TOOL-SPECIFIC** |
-| `claude_session_id` | (Tooltip, not prominent) | MISSING | Shown in TUI debug; not in web |
-| `gemini_session_id` | (Tooltip, not prominent) | MISSING | Shown in TUI debug; not in web |
-| `gemini_model` | (Not shown) | MISSING | Active Gemini model selection |
-| `gemini_yolo_mode` | (Toggle via `y` key) | MISSING | Per-session Gemini YOLO toggle |
-| `codex_session_id` | (Not shown) | MISSING | Codex integration state |
-| `opencode_session_id` | (Not shown) | MISSING | OpenCode integration state |
+| `claude_session_id` | (Tooltip, not prominent) | `MenuSession.claudeSessionId` | ✅ Present |
+| `gemini_session_id` | (Tooltip, not prominent) | `MenuSession.geminiSessionId` | ✅ Present |
+| `gemini_model` | (Not shown) | `MenuSession.geminiModel` | ✅ Present; active Gemini model |
+| `gemini_yolo_mode` | (Toggle via `y` key) | `MenuSession.geminiYoloMode` | ✅ Present; *bool, `&false` marshals as `false` |
+| `codex_session_id` | (Not shown) | `MenuSession.codexSessionId` | ✅ Present |
+| `opencode_session_id` | (Not shown) | `MenuSession.opencodeSessionId` | ✅ Present |
 | **CONTENT** |
-| `latest_prompt` | (Not shown in TUI) | MISSING | Last user input for context |
-| `notes` | Preview pane (if enabled) | MISSING | User notes field |
+| `latest_prompt` | (Not shown in TUI) | `MenuSession.latestPrompt` | ✅ Present; last user input |
+| `notes` | Preview pane (if enabled) | `MenuSession.notes` | ✅ Present |
 | **APPEARANCE** |
-| `color` | Row background tint | MISSING | User-chosen session color tint |
+| `color` | Row background tint | `MenuSession.color` | ✅ Present; lipgloss color spec |
 | **CONFIGURATION** |
-| `command` | (Edit dialog) | MISSING | Session command to launch |
-| `wrapper` | (Edit dialog) | MISSING | Optional wrapper command |
-| `channels` | (Edit dialog) | MISSING | Claude plugin channels list |
-| `extra_args` | (Edit dialog) | MISSING | Claude CLI extra arguments |
-| `tool_options_json` | (Edit dialog) | MISSING | Tool-specific options (Claude, Codex, Gemini) |
+| `command` | (Edit dialog) | `MenuSession.command` | ✅ Present |
+| `wrapper` | (Edit dialog) | `MenuSession.wrapper` | ✅ Present |
+| `channels` | (Edit dialog) | `MenuSession.channels` | ✅ Present; Claude plugin channel ids |
+| `extra_args` | (Edit dialog) | `MenuSession.extraArgs` | ✅ Present |
+| `tool_options_json` | (Edit dialog) | `MenuSession.toolOptions` | ✅ Present; raw JSON tool-specific options |
 | **SANDBOX & REMOTE** |
-| `sandbox` | (Edit dialog) | MISSING | Docker sandbox config |
-| `sandbox_container` | (Not shown) | MISSING | Running container name |
-| `ssh_host` | (Not shown) | MISSING | SSH remote hostname |
-| `ssh_remote_path` | (Not shown) | MISSING | SSH remote working directory |
+| `sandbox` | (Edit dialog) | `MenuSession.sandbox` | ✅ Present; Docker sandbox config |
+| `sandbox_container` | (Not shown) | `MenuSession.sandboxContainer` | ✅ Present |
+| `ssh_host` | (Not shown) | `MenuSession.sshHost` | ✅ Present |
+| `ssh_remote_path` | (Not shown) | `MenuSession.sshRemotePath` | ✅ Present |
 | **MULTIREPO** |
-| `multi_repo_enabled` | (Not shown) | MISSING | Multi-repo mode flag |
-| `additional_paths` | (Edit dialog) | MISSING | List of additional project paths |
-| `multi_repo_temp_dir` | (Not shown) | MISSING | Temp working directory for multi-repo |
-| `multi_repo_worktrees` | (Not shown) | MISSING | Worktree metadata for each repo |
+| `multi_repo_enabled` | (Not shown) | `MenuSession.multiRepoEnabled` | ✅ Present |
+| `additional_paths` | (Edit dialog) | `MenuSession.additionalPaths` | ✅ Present |
+| `multi_repo_temp_dir` | (Not shown) | `MenuSession.multiRepoTempDir` | ✅ Present |
+| `multi_repo_worktrees` | (Not shown) | `MenuSession.multiRepoWorktrees` | ✅ Present |
 | **WORKTREE** |
-| `worktree_path` | (Edit dialog) | MISSING | Path to worktree directory |
-| `worktree_repo_root` | (Edit dialog) | MISSING | Original repo root |
-| `worktree_branch` | (Edit dialog) | MISSING | Branch name in worktree |
+| `worktree_path` | (Edit dialog) | `MenuSession.worktreePath` | ✅ Present |
+| `worktree_repo_root` | (Edit dialog) | `MenuSession.worktreeRepoRoot` | ✅ Present |
+| `worktree_branch` | (Edit dialog) | `MenuSession.worktreeBranch` | ✅ Present |
 | **PERSISTENCE & FLAGS** |
 | `order` | Row position in group | `MenuSession.order` | ✅ Present |
-| `title_locked` | (Not shown) | MISSING | Prevents Claude title auto-sync |
-| `no_transition_notify` | (Not shown) | MISSING | Suppress transition event dispatch |
+| `title_locked` | (Not shown) | `MenuSession.titleLocked` | ✅ Present |
+| `no_transition_notify` | (Not shown) | `MenuSession.noTransitionNotify` | ✅ Present |
 | **MCP & LIFECYCLE** |
-| `loaded_mcp_names` | (MCP dialog) | MISSING | MCPs loaded at last start |
-| `is_fork_awaiting_start` | (Internal) | MISSING | Pre-built fork command pending |
-| `skip_mcp_regenerate` | (Internal) | MISSING | Transient flag for MCP dialog |
+| `loaded_mcp_names` | (MCP dialog) | `MenuSession.loadedMcpNames` | ✅ Present |
+| `is_fork_awaiting_start` | (Internal) | MISSING | Transient `json:"-"` field on Instance, not persisted |
+| `skip_mcp_regenerate` | (Internal) | MISSING | Transient `json:"-"` field on Instance, not persisted |
 | **ANALYTICS (Conditional)** |
-| `claude_analytics` | Cost/token panel | MISSING | Per-session token/cost metrics |
-| `gemini_analytics` | Cost/token panel | MISSING | Per-session Gemini metrics |
+| `claude_analytics` | Cost/token panel | MISSING | No `ClaudeAnalytics` struct on `*session.Instance` today |
+| `gemini_analytics` | Cost/token panel | `MenuSession.geminiAnalytics` | ✅ Present |
 
 ---
 
@@ -182,15 +183,11 @@ tiers:
 
 ### State Field Parity
 - **Total TUI-visible fields:** ~50
-- **Web JSON fields:** 12
-- **MISSING web fields:** ~38 (~76% gap)
-- **Critical gaps:**
-  - Tool-specific state (claude/gemini/codex session IDs, models, options)
-  - User content (notes, latest_prompt)
-  - Configuration (command, wrapper, channels, extra_args, tool_options)
-  - Sandbox/SSH/multirepo metadata
-  - Worktree metadata
-  - Appearance (color)
+- **Web JSON fields:** 42
+- **MISSING web fields:** 3 (~7% gap) — two transients (`is_fork_awaiting_start`, `skip_mcp_regenerate`) and one not-yet-modeled (`claude_analytics`)
+- **Remaining gaps:**
+  - `is_fork_awaiting_start`, `skip_mcp_regenerate`: `json:"-"` on `*session.Instance`; nothing to surface
+  - `claude_analytics`: no `ClaudeAnalytics` struct on the Instance yet (gemini-only today)
 
 ---
 

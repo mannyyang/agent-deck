@@ -166,8 +166,8 @@ func (h *HelpOverlay) View() string {
 	// Define help sections
 	newKeys := h.keyPair(hotkeyNewSession, hotkeyQuickCreate, "n/N")
 	forkKeys := h.keyPair(hotkeyQuickFork, hotkeyForkWithOptions, "f/F")
-	reorderUpKeys := "K / Shift+↑"
-	reorderDownKeys := "J / Shift+↓"
+	reorderUpKeys := "+ / K / Shift+↑"
+	reorderDownKeys := "- / J / Shift+↓"
 	indentKeys := "Shift+→/←"
 	searchKey := h.key(hotkeySearch, "/")
 	settingsKey := h.key(hotkeySettings, "S")
@@ -220,6 +220,7 @@ func (h *HelpOverlay) View() string {
 				{"1-9", "Jump to root group"},
 				{"Space", "Jump mode"},
 				{"Enter", "Attach / toggle"},
+				{"Shift+Enter", "Open session in new iTerm window (macOS)"},
 			},
 		},
 		{
@@ -247,6 +248,7 @@ func (h *HelpOverlay) View() string {
 				{skillsKey, "Skills Manager"},
 				{"$", "Cost Dashboard"},
 				{previewKey, "Toggle preview mode (output/stats/both)"},
+				{"< / >", "Shrink / grow preview pane by 5% (issue #1092)"},
 				{unreadKey, "Mark unread"},
 				{quickApproveKey, "Quick approve (send '1' to Claude)"},
 				{reorderUpKeys, "Reorder up (auto-promote at edge)"},

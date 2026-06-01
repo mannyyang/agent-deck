@@ -19,6 +19,75 @@ var claudeDirNameRegex = regexp.MustCompile(`[^a-zA-Z0-9-]`)
 // uuidSessionFileRegex matches UUID-format JSONL session filenames.
 var uuidSessionFileRegex = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.jsonl$`)
 
+// uuidBareRegex matches a bare UUID (no .jsonl suffix). Used to validate
+// candidates extracted from `claude --session-id <token>` in a wrapper
+// command string before we trust them as the explicit session id.
+var uuidBareRegex = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+
+// extractExplicitClaudeSessionID parses the user-supplied wrapper command
+// string and returns the literal UUID argument of `--session-id <uuid>`
+// (or `--session-id=<uuid>`) if exactly one is present and well-formed.
+//
+// Issue #1147: in multi-session-per-cwd setups the user explicitly bakes
+// a distinct `--session-id <uuid>` into each session's launch command so
+// each tenant owns its own Claude conversation. The disk-discovery
+// preludes at instance.go:2576 / :2613 (`ensureClaudeSessionIDFromDisk`
+// and its restart variant) walk the shared cwd and pick the newest JSONL
+// by mtime, which silently hijacks every sibling's id onto whichever
+// transcript was written last. The explicit-flag extraction below makes
+// the launch command authoritative so disk discovery never gets a chance
+// to override an explicit user choice.
+//
+// Returns ("", false) when:
+//   - command is empty
+//   - command contains no `--session-id` token
+//   - the token is not followed by a well-formed UUID
+//   - the command contains shell metacharacters in the UUID argument
+//     (e.g. `--session-id "$VAR"`) — the user is doing dynamic id
+//     resolution; we cannot safely declare the id without expansion.
+func extractExplicitClaudeSessionID(command string) (string, bool) {
+	if command == "" {
+		return "", false
+	}
+	// Tokenize by whitespace and `=`. We do NOT attempt full shell parsing —
+	// the launch surface is a string like
+	//   `env FOO=bar claude --session-id <uuid> --resume <other>`
+	// and the contract is: if the literal token `--session-id <uuid>` (or
+	// `--session-id=<uuid>`) appears anywhere, trust it. Quoting, command
+	// substitution, and variable expansion are not supported because we
+	// cannot evaluate them without spawning a shell.
+	fields := strings.Fields(command)
+	for idx, f := range fields {
+		var candidate string
+		switch {
+		case f == "--session-id":
+			if idx+1 >= len(fields) {
+				return "", false
+			}
+			candidate = fields[idx+1]
+		case strings.HasPrefix(f, "--session-id="):
+			candidate = strings.TrimPrefix(f, "--session-id=")
+		default:
+			continue
+		}
+		// Strip a single layer of matched surrounding quotes so
+		// `--session-id "abc...def"` still parses. Anything that survives
+		// must be a bare UUID — no $VAR, no $(), no backticks.
+		candidate = strings.TrimSpace(candidate)
+		if len(candidate) >= 2 {
+			if (candidate[0] == '"' && candidate[len(candidate)-1] == '"') ||
+				(candidate[0] == '\'' && candidate[len(candidate)-1] == '\'') {
+				candidate = candidate[1 : len(candidate)-1]
+			}
+		}
+		if !uuidBareRegex.MatchString(candidate) {
+			return "", false
+		}
+		return candidate, true
+	}
+	return "", false
+}
+
 // ConvertToClaudeDirName converts a filesystem path to Claude's directory naming format.
 // Claude Code replaces all non-alphanumeric characters (except hyphens) with hyphens.
 // Example: /Users/master/Code cloud/!Project → -Users-master-Code-cloud--Project
@@ -241,6 +310,7 @@ type resolveOpts struct {
 //
 // Returns (path, source) where source is one of:
 //
+//	"account"   — Instance.Account (issue #924) resolved via [profiles.<account>.claude].config_dir
 //	"env"       — CLAUDE_CONFIG_DIR env var
 //	"conductor" — [conductors.<name>.claude].config_dir
 //	"group"     — [groups."<groupPath>".claude].config_dir
@@ -248,7 +318,8 @@ type resolveOpts struct {
 //	"global"    — top-level [claude].config_dir
 //	"default"   — ~/.claude
 //
-// On the instance chain conductor and group beat env (the #881 fix); see
+// On the instance chain Account is the most-specific level (beats
+// conductor/group/env). Conductor and group beat env (the #881 fix); see
 // GetClaudeConfigDirForInstance doc for the rationale.
 func resolveClaudeConfigDir(opts resolveOpts) (path, source string) {
 	userConfig, _ := LoadUserConfig()
@@ -259,6 +330,16 @@ func resolveClaudeConfigDir(opts resolveOpts) (path, source string) {
 	}
 
 	if opts.inst != nil {
+		// Instance chain: account is the most-specific override (#924).
+		// Falls through to conductor/group/env when the account name has
+		// no matching [profiles.<account>.claude].config_dir block — so an
+		// unconfigured account name is a silent no-op, matching the
+		// permissive style of the other levels.
+		if userConfig != nil && opts.inst.Account != "" {
+			if accountDir := userConfig.GetProfileClaudeConfigDir(opts.inst.Account); accountDir != "" {
+				return accountDir, "account"
+			}
+		}
 		// Instance chain: conductor / group beat env.
 		if userConfig != nil {
 			if name := conductorNameFromInstance(opts.inst); name != "" {
@@ -353,13 +434,14 @@ func conductorNameFromInstance(inst *Instance) string {
 //
 // Priority (most-specific → least-specific):
 //
-//  1. [conductors.<name>.claude].config_dir — consulted only when
+//  1. Instance.Account (#924) → [profiles.<account>.claude].config_dir
+//  2. [conductors.<name>.claude].config_dir — consulted only when
 //     Instance.Title starts with "conductor-"
-//  2. [groups."<group>".claude].config_dir
-//  3. CLAUDE_CONFIG_DIR env var
-//  4. [profiles.<profile>.claude].config_dir
-//  5. [claude].config_dir
-//  6. ~/.claude
+//  3. [groups."<group>".claude].config_dir
+//  4. CLAUDE_CONFIG_DIR env var
+//  5. [profiles.<profile>.claude].config_dir
+//  6. [claude].config_dir
+//  7. ~/.claude
 //
 // Why conductor/group beat env (fix-config-dir-priority, 2026-04-17):
 // developer shells commonly export CLAUDE_CONFIG_DIR via aliases (cdp,
@@ -376,8 +458,8 @@ func GetClaudeConfigDirForInstance(inst *Instance) string {
 }
 
 // GetClaudeConfigDirSourceForInstance returns (path, source) for the
-// instance chain. Source labels: "conductor", "group", "env", "profile",
-// "global", "default".
+// instance chain. Source labels: "account" (issue #924), "conductor",
+// "group", "env", "profile", "global", "default".
 func GetClaudeConfigDirSourceForInstance(inst *Instance) (path, source string) {
 	return resolveClaudeConfigDir(resolveOpts{inst: inst})
 }
@@ -394,11 +476,7 @@ func IsClaudeConfigDirExplicitForInstance(inst *Instance) bool {
 // This allows users to configure an alias like "cdw" or "cdp" that sets
 // CLAUDE_CONFIG_DIR automatically, avoiding the need for config_dir setting
 func GetClaudeCommand() string {
-	userConfig, _ := LoadUserConfig()
-	if userConfig != nil && userConfig.Claude.Command != "" {
-		return userConfig.Claude.Command
-	}
-	return "claude"
+	return GetToolCommand("claude")
 }
 
 // GetClaudeSessionID returns the ACTIVE session ID for a project path
@@ -559,6 +637,8 @@ func discoverLatestClaudeJSONL(projectPath string) (string, bool) {
 	}
 
 	projectDir := filepath.Join(configDir, "projects", encoded)
+	// #nosec G703 -- projectDir is derived from configDir (CLAUDE_CONFIG_DIR)
+	// joined with an encoded session ID; not from untrusted input.
 	if _, err := os.Stat(projectDir); os.IsNotExist(err) {
 		return "", false
 	}

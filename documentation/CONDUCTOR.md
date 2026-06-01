@@ -163,7 +163,22 @@ If you enabled heartbeat at setup (it is enabled by default), agent-deck install
 [HEARTBEAT]
 ```
 
-The conductor is instructed to respond with either:
+The first action on every heartbeat is to drain its inbox:
+
+```bash
+agent-deck inbox drain self
+```
+
+This pulls any child completions that landed in the conductor's durable outbox
+(`~/.agent-deck/inboxes/<id>.jsonl`) while it was busy. Delivery is pull, not push
+(issue [#1225](https://github.com/asheshgoplani/agent-deck/issues/1225) /
+[#1226](https://github.com/asheshgoplani/agent-deck/issues/1226)): a child that
+finishes mid-turn commits its completion to disk rather than typing into the
+conductor's pane. The conductor's synchronous Stop hook drains the same queue at
+each turn boundary (the busy-conductor path); this heartbeat drain is the
+idle-conductor fallback. Together they guarantee no completion is missed.
+
+The conductor then responds with either:
 
 ```
 [STATUS] {one-line summary of current state}
@@ -217,7 +232,7 @@ Practical upshot: you can let your conductor spawn children liberally; the polle
 
 **Children land in the wrong group.** When a conductor launches a child, the child inherits the conductor's group at creation time — for a conductor in the `conductor` group, that means children pile into the conductor row in the TUI tree. The `conductor` group is reserved for the conductor sessions themselves; children belong in a project group named after the conductor (e.g. an `ops` conductor's children go in the `ops` group, an `infra` conductor's children in `infra`). Either pass `-g <my-project-group>` on the launch command, or run `agent-deck group move <child> <my-project-group>` immediately after creation.
 
-**Resume-from-summary picker stalls long-running conductors.** Once a conductor's claude session crosses ~250k tokens, `claude --resume` shows an interactive picker ("Resume from summary / Resume full / Don't ask again"). The conductor has no human at the terminal to answer, so it sits on the picker indefinitely and looks stuck on `waiting`. Workaround: `agent-deck session send <conductor> ""` to inject Enter and accept the default (Resume from summary). A structural fix is on the agent-deck roadmap.
+**Resume-from-summary picker stalls long-running conductors.** Once a conductor's claude session crosses ~250k tokens, `claude --resume` shows an interactive picker ("Resume from summary / Resume full / Don't ask again"). The conductor has no human at the terminal to answer, so it would sit on the picker indefinitely and look stuck on `waiting`. **Auto-handled as of v1.7.73 (#67):** agent-deck samples the pane after restart and auto-confirms the default option (Resume from summary) within a few seconds. To opt out, set `[claude].auto_resume_summary = false` in `~/.agent-deck/config.toml` and fall back to the manual workaround: `agent-deck session send <conductor> ""` to inject Enter.
 
 ## Lifecycle commands
 

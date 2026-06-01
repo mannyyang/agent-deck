@@ -8,7 +8,6 @@ import (
 	"io"
 	"log/slog"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -36,8 +35,11 @@ import (
 	"github.com/asheshgoplani/agent-deck/internal/session"
 	"github.com/asheshgoplani/agent-deck/internal/statedb"
 	"github.com/asheshgoplani/agent-deck/internal/sysinfo"
+	"github.com/asheshgoplani/agent-deck/internal/terminal"
 	"github.com/asheshgoplani/agent-deck/internal/tmux"
 	"github.com/asheshgoplani/agent-deck/internal/update"
+	"github.com/asheshgoplani/agent-deck/internal/vcs"
+	"github.com/asheshgoplani/agent-deck/internal/vcsbackend"
 	"github.com/asheshgoplani/agent-deck/internal/watcher"
 	"github.com/asheshgoplani/agent-deck/internal/web"
 )
@@ -283,6 +285,13 @@ type Home struct {
 	lastFullStatusSweep atomic.Int64             // UnixNano timestamp of last full background status sweep
 	lastPersistedStatus map[string]string        // instanceID -> last status written to SQLite
 
+	// Issue #1143: auto-stop dormant child sessions via central poll.
+	// Coalesced into the existing 2-second statusWorker tick by way of
+	// idleTimeoutLastTick, so we don't burn extra goroutines and the watcher
+	// only runs every ~60s.
+	idleTimeoutWatcher  *session.IdleTimeoutWatcher
+	idleTimeoutLastTick atomic.Int64 // UnixNano
+
 	// PERFORMANCE: Worker pool for output-driven status updates (Priority 2)
 	// Caps the number of goroutines spawned for %output events from control pipes
 	logUpdateChan chan *session.Instance // Buffers status update requests from PipeManager
@@ -381,9 +390,9 @@ type Home struct {
 
 	// Cached status counts (invalidated on instance changes)
 	cachedStatusCounts struct {
-		running, waiting, idle, errored int
-		valid                           atomic.Bool // THREAD-SAFE: accessed from main and worker goroutines
-		timestamp                       time.Time   // For time-based expiration
+		running, waiting, idle, stopped, errored int
+		valid                                    atomic.Bool // THREAD-SAFE: accessed from main and worker goroutines
+		timestamp                                time.Time   // For time-based expiration
 	}
 
 	// Status-transition tracker: emits enriched status_changed INFO,
@@ -392,12 +401,23 @@ type Home struct {
 	transitionTrackerOnce sync.Once
 	transitionTracker     *transitionTracker
 
+	// Logs once per engine instance when the first watcher event is consumed
+	// from the engine's EventCh. Helps diagnose listener-not-firing issues
+	// without needing to instrument every event.
+	firstWatcherEventOnce sync.Once
+
 	// Full repaint mode: issue tea.ClearScreen every tick to avoid
 	// incremental redraw drift in terminals with unicode grapheme widths
 	fullRepaint          bool
 	defaultFilter        string                  // from config.toml [display] default_filter
 	activeFilterLabel    string                  // from config.toml [display] active_filter_label
 	activeFilterExcludes map[session.Status]bool // from config.toml [display] active_filter_excludes; default {error}
+
+	// Sessions/Preview split (issue #1092): percentage of width allocated to
+	// preview pane. Loaded from config.toml [ui] preview_pct, adjustable
+	// live via < and > keybindings, persisted back to config on adjustment.
+	previewPct          int       // 10-90, default 65
+	previewPctOverlayAt time.Time // when to hide the split overlay (zero = hidden)
 
 	// Performance observability (debug mode only, zero cost when off)
 	debugMode          bool         // true when AGENTDECK_DEBUG=1, enables perf overlay
@@ -447,7 +467,23 @@ type Home struct {
 	remoteSessionsMu   sync.RWMutex
 	lastRemoteFetch    time.Time // When remote sessions were last fetched
 	remotesFetchActive bool      // Prevents overlapping fetches
+	// remoteSessionRefreshSec is the poll cadence (seconds) for re-fetching
+	// the remote session list, resolved once at construction from
+	// [ui] remote_session_refresh_secs. Issue #1170.
+	remoteSessionRefreshSec int
 
+	// Remote latency (issue #1103) — measured per remote host on the same
+	// cadence as CPU/RAM (see UISettings.GetRemoteLatencyRefreshSecs).
+	remoteLatency           map[string]session.RemoteLatency
+	remoteLatencyMu         sync.RWMutex
+	lastRemoteLatencyFetch  time.Time
+	remoteLatencyFetchBusy  bool
+	remoteLatencyRefreshSec int // resolved once at construction
+	// #1101: remote cost summaries fetched alongside session listings so the
+	// status-line cost segment reflects spend on every configured remote, not
+	// just events written to the local cost_events table.
+	remoteCosts   map[string]*costs.RemoteCostSummary // remoteName -> summary
+	remoteCostsMu sync.RWMutex
 	// Cost tracking
 	costStore            *costs.Store
 	costPricer           *costs.Pricer
@@ -468,6 +504,59 @@ type Home struct {
 	// System stats collector (CPU, RAM, disk, etc.)
 	sysStatsCollector *sysinfo.Collector
 	sysStatsConfig    session.SystemStatsSettings
+
+	// Insert mode (#1069, feature 1): vim-style modal type-through. When
+	// active, printable runes, Space, and Enter are routed directly to the
+	// focused session's tmux pane instead of being interpreted as TUI
+	// commands. Toggled with `I` (enter) and `Esc` (exit).
+	insertMode          bool
+	insertModeSessionID string
+	// insertKeySink is an optional override used by tests to capture keys
+	// without running real tmux. When nil, keys are sent via the session's
+	// tmux pane (SendKeys / SendEnter).
+	insertKeySink func(inst *session.Instance, text string, sendEnter bool) error
+	// insertNamedKeySink is the test override for forwarded named keys
+	// (Backspace, arrows, Tab, Ctrl-C, Ctrl-D — #1094). When nil, named keys
+	// are sent via the session's tmux pane (SendNamedKey).
+	insertNamedKeySink func(inst *session.Instance, key string) error
+	// insertKeySender is the persistent dispatch path opened on
+	// enterInsertMode and closed on exitInsertMode (#1102 perf fix +
+	// remote support). Local sessions get a tmux.KeySender (control-mode
+	// client, no per-keystroke fork+exec); remote sessions get a
+	// session.RemoteKeySender (SSH RPC to the remote agent-deck). When
+	// insertKeySink/insertNamedKeySink are set (test mode) they win;
+	// when neither is set, dispatch falls back to per-call SendKeys
+	// (the legacy path, ~50× slower but unconditional).
+	insertKeySender insertKeySender
+	// insertOpenKeySender creates a persistent KeySender for the given
+	// insert target. Defaulted to the production opener at construction
+	// time; tests override to inject a mock without real tmux/SSH.
+	insertOpenKeySender func(target insertTargetRef) (insertKeySender, error)
+	// insertModeRemoteName / insertModeRemoteID identify the remote
+	// agent-deck and session ID when insert mode targets a remote session
+	// (ItemTypeRemoteSession). Empty for local sessions, which use
+	// insertModeSessionID instead.
+	insertModeRemoteName string
+	insertModeRemoteID   string
+
+	// Insert-mode keystroke batching (#1094). Per-keystroke tmux send-keys
+	// invocations are too slow when typing fast. Runes are accumulated in
+	// insertBuf and flushed together after insertBatchDuration, or
+	// immediately on Enter / Esc / a named key. insertBatchDuration <= 0
+	// disables batching (each rune flushes synchronously) and is used by
+	// tests that want to assert call counts deterministically.
+	insertBuf           strings.Builder
+	insertFlushPending  bool
+	insertBatchDuration time.Duration
+	// insertPreviewRefreshPending guards the fast preview-refresh tick armed
+	// after an insert keystroke (#1131). Only one tick is in flight at a time;
+	// see scheduleInsertPreviewRefresh.
+	insertPreviewRefreshPending bool
+	// openInNewWindowSink is an optional override used by tests to capture
+	// Shift+Enter dispatches without spawning a real iTerm2 window. When
+	// nil, the dispatch calls terminal.OpenSessionInNewWindow directly.
+	// See issue #1093.
+	openInNewWindowSink func(req terminal.AttachRequest) error
 }
 
 // reloadState preserves UI state during storage reload
@@ -512,7 +601,71 @@ func (h *Home) setHotkeys(bindings map[string]string) {
 	}
 }
 
+// openInNewWindow dispatches the Shift+Enter new-window launch through an
+// optional test sink, or falls back to the real terminal launcher.
+//
+// The sessionExists flag short-circuits the real launcher for dead sessions
+// — opening a fresh iTerm2 window only to land on a "tmux: no such session"
+// error is worse UX than a silent no-op. The sink path skips this guard so
+// tests can pin the dispatch without faking tmux state. Issue #1093.
+func (h *Home) openInNewWindow(req terminal.AttachRequest, sessionExists bool) error {
+	if h.openInNewWindowSink != nil {
+		return h.openInNewWindowSink(req)
+	}
+	if !sessionExists {
+		return nil
+	}
+	return terminal.OpenSessionInNewWindow(req)
+}
+
+// resolveITermOpenAs reads the [ui] iterm_open_as setting from the user
+// config, returning "tab" by default if the config can't be loaded or
+// the value is unset/unknown. Issue #1100.
+func resolveITermOpenAs() string {
+	cfg, err := session.LoadUserConfig()
+	if err != nil || cfg == nil {
+		return session.DefaultITermOpenAs
+	}
+	return cfg.UI.GetITermOpenAs()
+}
+
+// buildRemoteAttachRequest constructs a terminal.AttachRequest that
+// runs `agent-deck session attach <id>` over SSH on the named remote.
+// Returns ok=false when the remote can't be resolved from user config or
+// is missing a host. Issue #1100.
+func buildRemoteAttachRequest(remoteName, sessionID, openAs string) (terminal.AttachRequest, bool) {
+	if remoteName == "" || sessionID == "" {
+		return terminal.AttachRequest{}, false
+	}
+	cfg, err := session.LoadUserConfig()
+	if err != nil || cfg == nil || cfg.Remotes == nil {
+		return terminal.AttachRequest{}, false
+	}
+	rc, ok := cfg.Remotes[remoteName]
+	if !ok || rc.Host == "" {
+		return terminal.AttachRequest{}, false
+	}
+	return terminal.AttachRequest{
+		Name:   sessionID,
+		OpenAs: openAs,
+		Remote: &terminal.RemoteAttach{
+			Host:          rc.Host,
+			AgentDeckPath: rc.GetAgentDeckPath(),
+			Profile:       rc.GetProfile(),
+		},
+	}, true
+}
+
 func (h *Home) normalizeMainKey(pressed string) string {
+	// Shift+Enter relay: csiuReader emits the Private-Use rune
+	// shiftEnterMarker (U+E5E5) when it sees a Shift+Enter CSI u or
+	// modifyOtherKeys sequence (issue #1093). Bubble Tea v1.3.10 has no
+	// native shift+enter string, so we rewrite the rune to the canonical
+	// label here, before any hotkey lookup, so the dispatch arm at
+	// `case "shift+enter":` is reachable.
+	if pressed == string(shiftEnterMarker) {
+		pressed = "shift+enter"
+	}
 	if canonical, ok := h.hotkeyLookup[pressed]; ok {
 		return canonical
 	}
@@ -651,6 +804,18 @@ type sendOutputResultMsg struct {
 // remoteSessionsFetchedMsg is sent when async remote sessions fetch completes.
 type remoteSessionsFetchedMsg struct {
 	sessions map[string][]session.RemoteSessionInfo
+	// #1101: per-remote cost summary collected on the same SSH fanout.
+	costs map[string]*costs.RemoteCostSummary
+	// failed marks remotes whose fetch errored this round (issue #1170).
+	// The handler keeps their last-good sessions instead of wiping them,
+	// so one slow/offline remote can't flicker the whole list.
+	failed map[string]bool
+}
+
+// remoteLatenciesFetchedMsg is sent when an async batch of latency
+// measurements completes. Keyed by remote name. See issue #1103.
+type remoteLatenciesFetchedMsg struct {
+	latencies map[string]session.RemoteLatency
 }
 
 // systemThemeMsg is sent when the OS dark mode setting changes.
@@ -761,6 +926,8 @@ func NewHomeWithProfileAndMode(profile string) *Home {
 		zoxidePicker:         NewZoxidePicker(),
 		feedbackSender:       feedback.NewSender(),
 		watcherPanel:         NewWatcherPanel(),
+		insertBatchDuration:  defaultInsertBatchDuration,
+		insertOpenKeySender:  defaultInsertOpenKeySender,
 		cursor:               0,
 		initialLoading:       true, // Show splash until sessions load
 		ctx:                  ctx,
@@ -786,6 +953,7 @@ func NewHomeWithProfileAndMode(profile string) *Home {
 		worktreeDirtyCacheTs: make(map[string]time.Time),
 		statusTrigger:        make(chan statusUpdateRequest, 1), // Buffered to avoid blocking
 		statusWorkerDone:     make(chan struct{}),
+		idleTimeoutWatcher:   session.NewIdleTimeoutWatcher(session.IdleTimeoutWatcherConfig{}),
 		lastPersistedStatus:  make(map[string]string),
 		logUpdateChan:        make(chan *session.Instance, 100), // Buffered to absorb bursts
 		hotkeys:              make(map[string]string),
@@ -812,11 +980,18 @@ func NewHomeWithProfileAndMode(profile string) *Home {
 		h.activeFilterExcludes = cfg.Display.GetActiveFilterExcludes()
 		h.sysStatsConfig = cfg.SystemStats
 		h.costLineTemplate, h.costLineHideWhenZero = session.ResolveCostLineTemplate(cfg, actualProfile)
+		h.previewPct = cfg.UI.GetPreviewPct()
+		h.remoteLatencyRefreshSec = cfg.UI.GetRemoteLatencyRefreshSecs(cfg.SystemStats.GetRefreshSeconds())
+		h.remoteSessionRefreshSec = cfg.UI.GetRemoteSessionRefreshSecs()
 	} else {
 		h.fullRepaint = (session.DisplaySettings{}).GetFullRepaint()
 		h.activeFilterExcludes = (session.DisplaySettings{}).GetActiveFilterExcludes()
 		h.costLineTemplate, h.costLineHideWhenZero = session.ResolveCostLineTemplate(nil, actualProfile)
+		h.previewPct = session.DefaultPreviewPct
+		h.remoteLatencyRefreshSec = (session.UISettings{}).GetRemoteLatencyRefreshSecs(0)
+		h.remoteSessionRefreshSec = (session.UISettings{}).GetRemoteSessionRefreshSecs()
 	}
+	h.remoteLatency = make(map[string]session.RemoteLatency)
 
 	// Initialize system stats collector if enabled
 	if h.sysStatsConfig.GetEnabled() {
@@ -1991,11 +2166,27 @@ func (h *Home) startWatcherEngine() tea.Cmd {
 	}
 
 	h.watcherEngine = eng
+	h.firstWatcherEventOnce = sync.Once{}
+
+	uiLog.Info("watcher_engine_started",
+		slog.Int("watcher_count", len(rows)),
+		slog.Int("running_count", runningCount(rows)))
 
 	return tea.Batch(
 		listenForWatcherEvent(eng.EventCh()),
 		listenForWatcherHealth(eng.HealthCh()),
 	)
+}
+
+// runningCount returns how many watcher rows are in the "running" state.
+func runningCount(rows []*statedb.WatcherRow) int {
+	n := 0
+	for _, r := range rows {
+		if r != nil && r.Status == "running" {
+			n++
+		}
+	}
+	return n
 }
 
 // loadWatcherSourceSettings reads the [source] table from
@@ -2050,23 +2241,143 @@ func (h *Home) fetchRemoteSessions() tea.Msg {
 		return remoteSessionsFetchedMsg{sessions: nil}
 	}
 
-	results := make(map[string][]session.RemoteSessionInfo)
-	ctx, cancel := context.WithTimeout(h.ctx, 15*time.Second)
+	results := make(map[string][]session.RemoteSessionInfo, len(config.Remotes))
+	// #1101: remote cost summaries piggy-back on the existing remote-fetch
+	// channel so the status-line cost segment doesn't lag behind the session
+	// list. nil-valued entries indicate fetch failures (e.g., older remote
+	// agent-deck without `costs summary --json`); the renderer treats those
+	// as "remote contributes zero" so a single broken remote can't poison
+	// the displayed total.
+	costResults := make(map[string]*costs.RemoteCostSummary, len(config.Remotes))
+	// #1170: track remotes that errored so the handler keeps their last-good
+	// sessions instead of dropping them.
+	failed := make(map[string]bool, len(config.Remotes))
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+
+	// #1170: fetch every remote in parallel, each with its OWN timeout, so a
+	// single slow/offline remote can't starve the others. The previous code
+	// shared one 15s budget across all remotes fetched sequentially, which
+	// made healthy remotes drop out of the result map (and flicker in the
+	// TUI) whenever an earlier remote was slow.
+	for name, rc := range config.Remotes {
+		wg.Add(1)
+		go func(name string, rc session.RemoteConfig) {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(h.ctx, 15*time.Second)
+			defer cancel()
+
+			runner := session.NewSSHRunner(name, rc)
+			sessions, err := runner.FetchSessions(ctx)
+			if err != nil {
+				mu.Lock()
+				failed[name] = true
+				mu.Unlock()
+				return
+			}
+			for i := range sessions {
+				sessions[i].RemoteName = name
+			}
+			summary, costErr := runner.FetchCostSummary(ctx)
+
+			mu.Lock()
+			results[name] = sessions
+			if costErr == nil && summary != nil {
+				costResults[name] = summary
+			}
+			mu.Unlock()
+		}(name, rc)
+	}
+	wg.Wait()
+
+	return remoteSessionsFetchedMsg{sessions: results, costs: costResults, failed: failed}
+}
+
+// mergeRemoteSessions reconciles a freshly fetched remote-session map against
+// the previously displayed one (issue #1170). The contract:
+//
+//   - remotes present in fetched → replaced wholesale (new sessions appear,
+//     removed sessions drop);
+//   - remotes in failed (errored this round) → keep their last-good sessions
+//     from prev, so a transient SSH hiccup never wipes a remote;
+//   - remotes absent from both fetched and failed → dropped (deconfigured).
+//
+// It is a pure function so the reconciliation logic is unit-testable without
+// SSH or the Bubble Tea event loop.
+func mergeRemoteSessions(prev, fetched map[string][]session.RemoteSessionInfo, failed map[string]bool) map[string][]session.RemoteSessionInfo {
+	merged := make(map[string][]session.RemoteSessionInfo, len(fetched)+len(failed))
+	for name, sess := range fetched {
+		merged[name] = sess
+	}
+	for name := range failed {
+		if _, ok := merged[name]; ok {
+			// A successful result for this remote (if any) always wins.
+			continue
+		}
+		if prevSess, ok := prev[name]; ok && len(prevSess) > 0 {
+			merged[name] = prevSess
+		}
+	}
+	return merged
+}
+
+// shouldFetchRemoteSessions reports whether the periodic tick should kick off
+// a remote-session re-fetch: the configured interval has elapsed since the
+// last fetch and no fetch is currently in flight. Issue #1170.
+func (h *Home) shouldFetchRemoteSessions(now time.Time) bool {
+	interval := h.remoteSessionRefreshSec
+	if interval <= 0 {
+		interval = session.DefaultRemoteSessionRefreshSecs
+	}
+	h.remoteSessionsMu.RLock()
+	defer h.remoteSessionsMu.RUnlock()
+	return !h.remotesFetchActive && now.Sub(h.lastRemoteFetch) >= time.Duration(interval)*time.Second
+}
+
+// measureRemoteLatencies measures round-trip latency to every configured
+// remote in parallel, returning a map keyed by remote name. Failed
+// measurements are recorded as Offline=true so the header can show
+// `— offline` instead of a misleading stale ms value. Issue #1103.
+func (h *Home) measureRemoteLatencies() tea.Msg {
+	config, err := session.LoadUserConfig()
+	if err != nil || config == nil || len(config.Remotes) == 0 {
+		return remoteLatenciesFetchedMsg{latencies: nil}
+	}
+
+	results := make(map[string]session.RemoteLatency, len(config.Remotes))
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+
+	// Bound total budget: each individual MeasureLatency has its own 5s
+	// timeout, but we also cap the outer batch so we never starve the
+	// tick that triggered us.
+	ctx, cancel := context.WithTimeout(h.ctx, 8*time.Second)
 	defer cancel()
 
 	for name, rc := range config.Remotes {
-		runner := session.NewSSHRunner(name, rc)
-		sessions, err := runner.FetchSessions(ctx)
-		if err != nil {
-			continue
-		}
-		for i := range sessions {
-			sessions[i].RemoteName = name
-		}
-		results[name] = sessions
+		wg.Add(1)
+		go func(name string, rc session.RemoteConfig) {
+			defer wg.Done()
+			runner := session.NewSSHRunner(name, rc)
+			d, err := runner.MeasureLatency(ctx)
+			lat := session.RemoteLatency{MeasuredAt: time.Now()}
+			if err != nil {
+				lat.Offline = true
+			} else {
+				ms := int(d.Milliseconds())
+				if ms < 0 {
+					ms = 0
+				}
+				lat.MS = ms
+			}
+			mu.Lock()
+			results[name] = lat
+			mu.Unlock()
+		}(name, rc)
 	}
+	wg.Wait()
 
-	return remoteSessionsFetchedMsg{sessions: results}
+	return remoteLatenciesFetchedMsg{latencies: results}
 }
 
 // loadSessions loads sessions from storage and initializes the pool
@@ -2417,7 +2728,18 @@ func (h *Home) fetchRemotePreview(remoteName, sessionID, key string) tea.Cmd {
 		ctx, cancel := context.WithTimeout(h.ctx, 15*time.Second)
 		defer cancel()
 
-		content, fetchErr := runner.FetchSessionOutput(ctx, sessionID)
+		// #1101: use FetchSessionPane (raw capture-pane content with ANSI +
+		// tool UI chrome) instead of FetchSessionOutput (parsed transcript
+		// text) so claude-formatted previews render the same way local
+		// sessions do. If the remote agent-deck predates --pane, fall back
+		// to the transcript path so the preview is at least non-empty.
+		content, fetchErr := runner.FetchSessionPane(ctx, sessionID)
+		if fetchErr != nil || strings.TrimSpace(content) == "" {
+			if fallback, fbErr := runner.FetchSessionOutput(ctx, sessionID); fbErr == nil && strings.TrimSpace(fallback) != "" {
+				content = fallback
+				fetchErr = nil
+			}
+		}
 		content = truncateRemotePreviewContent(content)
 		return previewFetchedMsg{previewKey: key, content: content, err: fetchErr}
 	}
@@ -2863,6 +3185,21 @@ func (h *Home) backgroundStatusUpdate() {
 	instances := make([]*session.Instance, len(h.instances))
 	copy(instances, h.instances)
 	h.instancesMu.RUnlock()
+
+	// Issue #1143: rate-limit the idle-timeout watcher to one tick per minute.
+	// The background sweep runs every 2s; capture-pane on every session every
+	// 2s would add unnecessary tmux load. 60s is the same cadence the spec
+	// suggests and matches how the lifecycle log surfaces dormant workers.
+	if h.idleTimeoutWatcher != nil {
+		const idleTickEvery = 60 * time.Second
+		nowNano := time.Now().UnixNano()
+		lastNano := h.idleTimeoutLastTick.Load()
+		if lastNano == 0 || time.Duration(nowNano-lastNano) >= idleTickEvery {
+			if h.idleTimeoutLastTick.CompareAndSwap(lastNano, nowNano) {
+				h.idleTimeoutWatcher.Tick(instances)
+			}
+		}
+	}
 
 	// PERFORMANCE: Gradually configure unconfigured sessions in background
 	// Configure one session per tick to avoid blocking the status update
@@ -3403,7 +3740,7 @@ func (h *Home) processStatusUpdate(req statusUpdateRequest) {
 			statusChanged = true
 		}
 		remaining--
-		h.statusUpdateIndex.Store(int32((idx + 1) % instanceCount))
+		h.statusUpdateIndex.Store(int32((idx + 1) % instanceCount)) // #nosec G115 -- idx is bounded by instanceCount (slice length), fits in int32
 	}
 
 	// Only invalidate status counts cache if status actually changed
@@ -3508,7 +3845,7 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// width column where Y-based routing is ambiguous enough to
 			// leave as list-scroll).
 			if h.getLayoutMode() == LayoutModeDual {
-				leftWidth := int(float64(h.width) * 0.35)
+				leftWidth := h.sessionsPaneWidth()
 				if msg.X >= leftWidth {
 					if msg.Button == tea.MouseButtonWheelUp {
 						h.previewScrollOffset++
@@ -3541,6 +3878,44 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		default:
 			return h.handleMouse(msg)
 		}
+
+	case insertFlushMsg:
+		// Drain any buffered runes from the insert-mode batch (#1094). The
+		// flag is cleared inside flushInsertBuf so a new batch can be
+		// scheduled. If the user already left insert mode we silently drop.
+		if h.insertMode {
+			h.flushInsertBuf()
+		} else {
+			h.insertFlushPending = false
+			h.insertBuf.Reset()
+		}
+		return h, nil
+
+	case insertPreviewRefreshMsg:
+		// #1131: fast echo path. After an insert keystroke this fires ~60ms
+		// later and re-fetches the focused session's preview, BYPASSING the
+		// 2s previewCacheTTL gate in the tickMsg handler — that gate was why a
+		// typed character could take up to ~2s to appear. Local sessions only;
+		// remote previews stay on their SSH-throttled cadence to avoid
+		// hammering the link per keystroke.
+		h.insertPreviewRefreshPending = false
+		if !h.insertMode {
+			return h, nil
+		}
+		inst, key, winIdx := h.selectedPreviewTarget()
+		if inst == nil || key == "" {
+			return h, nil
+		}
+		h.previewCacheMu.Lock()
+		alreadyFetching := h.previewFetchingID == key
+		if !alreadyFetching {
+			h.previewFetchingID = key
+		}
+		h.previewCacheMu.Unlock()
+		if alreadyFetching {
+			return h, nil
+		}
+		return h, h.fetchPreview(inst, key, winIdx)
 
 	case loadSessionsMsg:
 		// Clear loading indicators and store file mtime for external change detection
@@ -4129,11 +4504,37 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case remoteSessionsFetchedMsg:
 		h.remoteSessionsMu.Lock()
-		h.remoteSessions = msg.sessions
+		// #1170: merge rather than wholesale-replace so a remote that errored
+		// this round keeps its last-good sessions instead of flickering out.
+		h.remoteSessions = mergeRemoteSessions(h.remoteSessions, msg.sessions, msg.failed)
 		h.lastRemoteFetch = time.Now()
 		h.remotesFetchActive = false
 		h.remoteSessionsMu.Unlock()
+		// #1101: store remote cost summaries so renderCostLine can fold them
+		// into the displayed totals on the next paint.
+		h.remoteCostsMu.Lock()
+		h.remoteCosts = msg.costs
+		h.remoteCostsMu.Unlock()
+		// #1112 bug 1: a remote running→waiting transition wouldn't update
+		// the header pill ("[◐ Waiting N]") because countSessionStatuses
+		// caches for 500ms. The row icon updated (read from the map
+		// directly), but the pill froze on the previous fetch's totals.
+		// Invalidate so the next View() recomputes.
+		h.cachedStatusCounts.valid.Store(false)
 		h.rebuildFlatItems()
+		return h, nil
+
+	case remoteLatenciesFetchedMsg:
+		h.remoteLatencyMu.Lock()
+		if h.remoteLatency == nil {
+			h.remoteLatency = make(map[string]session.RemoteLatency)
+		}
+		for name, lat := range msg.latencies {
+			h.remoteLatency[name] = lat
+		}
+		h.lastRemoteLatencyFetch = time.Now()
+		h.remoteLatencyFetchBusy = false
+		h.remoteLatencyMu.Unlock()
 		return h, nil
 
 	case remoteSessionDeletedMsg:
@@ -4658,8 +5059,17 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return h, nil
 
 	case watcherEventMsg:
+		// One-shot log per engine instance to confirm the listener path is alive.
+		h.firstWatcherEventOnce.Do(func() {
+			uiLog.Info("watcher_event_first_received",
+				slog.String("sender", msg.event.Sender),
+				slog.String("routed_to", msg.event.RoutedTo))
+		})
 		// Refresh watcher panel data on new events and re-register listener.
 		h.refreshWatcherPanel()
+		// Deliver event to the routed conductor's tmux pane (parity with
+		// dispatchHealthAlert). Skipped for triage and unrouted events.
+		h.dispatchWatcherEvent(msg.event)
 		if h.watcherEngine != nil {
 			return h, listenForWatcherEvent(h.watcherEngine.EventCh())
 		}
@@ -4692,6 +5102,7 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tickMsg:
 		var remoteFetchCmd tea.Cmd
+		var remoteLatencyCmd tea.Cmd
 
 		// Auto-dismiss errors after 5 seconds
 		if h.err != nil && !h.errTime.IsZero() && time.Since(h.errTime) > 5*time.Second {
@@ -4734,15 +5145,34 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 			h.saveUIState()
 		}
 
-		// Periodic remote session fetch (every 30 seconds)
-		h.remoteSessionsMu.RLock()
-		shouldFetch := !h.remotesFetchActive && time.Since(h.lastRemoteFetch) >= 30*time.Second
-		h.remoteSessionsMu.RUnlock()
-		if shouldFetch {
+		// Periodic remote session fetch (issue #1170). Cadence is configurable
+		// via [ui] remote_session_refresh_secs (default 15s); see
+		// shouldFetchRemoteSessions for the stale/in-flight gating.
+		if h.shouldFetchRemoteSessions(time.Now()) {
 			h.remoteSessionsMu.Lock()
 			h.remotesFetchActive = true
 			h.remoteSessionsMu.Unlock()
 			remoteFetchCmd = h.fetchRemoteSessions
+		}
+
+		// Periodic remote latency measurement (issue #1103). Cadence is
+		// configurable via [ui] remote_latency_refresh_secs, defaulting
+		// to system_stats.refresh_seconds so the marker ticks alongside
+		// CPU/RAM. Fast/non-blocking — each remote runs in its own
+		// goroutine inside the Cmd.
+		refresh := h.remoteLatencyRefreshSec
+		if refresh < 2 {
+			refresh = 5
+		}
+		h.remoteLatencyMu.RLock()
+		shouldLatency := !h.remoteLatencyFetchBusy &&
+			time.Since(h.lastRemoteLatencyFetch) >= time.Duration(refresh)*time.Second
+		h.remoteLatencyMu.RUnlock()
+		if shouldLatency {
+			h.remoteLatencyMu.Lock()
+			h.remoteLatencyFetchBusy = true
+			h.remoteLatencyMu.Unlock()
+			remoteLatencyCmd = h.measureRemoteLatencies
 		}
 
 		// Fast log size check every 10 seconds (catches runaway logs before they cause issues)
@@ -4840,7 +5270,7 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 				h.previewCacheMu.Unlock()
 			}
 		}
-		cmds := []tea.Cmd{h.tick(), previewCmd, remoteFetchCmd}
+		cmds := []tea.Cmd{h.tick(), previewCmd, remoteFetchCmd, remoteLatencyCmd}
 		if h.fullRepaint {
 			cmds = append(cmds, tea.ClearScreen)
 		}
@@ -4870,8 +5300,14 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 			h.setupWizard, cmd = h.setupWizard.Update(msg)
 			// Check if wizard completed (Enter on final step, or Esc on welcome to use defaults)
 			if h.setupWizard.IsComplete() {
-				// Save config and close wizard
+				// Save config and close wizard. Merge onto disk first so
+				// fields the wizard doesn't manage (Remotes, Hotkeys,
+				// Plugins, etc.) survive — issue #1067.
 				config := h.setupWizard.GetConfig()
+				merged, mergeErr := session.MergePanelConfigOntoDisk(config)
+				if mergeErr == nil && merged != nil {
+					config = merged
+				}
 				if err := session.SaveUserConfig(config); err != nil {
 					h.err = err
 					h.errTime = time.Now()
@@ -4901,7 +5337,14 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 			var shouldSave bool
 			h.settingsPanel, cmd, shouldSave = h.settingsPanel.Update(msg)
 			if shouldSave {
+				// Merge panel output onto the on-disk config so top-level
+				// fields the panel does not manage (Remotes, Hotkeys,
+				// Plugins, Conductors, Groups, etc.) survive — issue #1067.
 				config := h.settingsPanel.GetConfig()
+				merged, mergeErr := session.MergePanelConfigOntoDisk(config)
+				if mergeErr == nil && merged != nil {
+					config = merged
+				}
 				if err := session.SaveUserConfig(config); err != nil {
 					h.err = err
 					h.errTime = time.Now()
@@ -5232,32 +5675,21 @@ func (h *Home) handleNewDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return h, cmd
 	}
 
-	// When the path suggestions dropdown is in active arrow-key mode, the
-	// dialog must consume navigation keys before the outer handlers run.
-	// Enter is special: apply the highlighted entry, dismiss the dropdown,
-	// then fall through to the form-submit handler below — unless "Type
-	// custom" is highlighted, in which case we just close the dropdown
-	// (the user wants to type a path, not submit).
 	if h.newDialog.IsSuggestionsActive() {
-		if msg.String() == "enter" {
-			if h.newDialog.IsTypeCustomHighlighted() {
-				h.newDialog.ApplyHighlightedSuggestion()
-				return h, nil
-			}
-			h.newDialog.ApplyHighlightedSuggestion()
-			h.newDialog.DismissSuggestions() // hide dropdown until user types
-			// fall through to the "enter" case below to validate + create.
-		} else {
-			var cmd tea.Cmd
-			h.newDialog, cmd = h.newDialog.Update(msg)
-			return h, cmd
-		}
+		var cmd tea.Cmd
+		h.newDialog, cmd = h.newDialog.Update(msg)
+		return h, cmd
+	}
+
+	if h.newDialog.IsModelSuggestionsActive() {
+		var cmd tea.Cmd
+		h.newDialog, cmd = h.newDialog.Update(msg)
+		return h, cmd
 	}
 
 	switch msg.String() {
 	case "enter":
-		// When multi-repo path list is focused, let the dialog handle enter (edit/save path).
-		if h.newDialog.IsMultiRepoEditing() {
+		if h.newDialog.shouldHandleEnterLocally() {
 			var cmd tea.Cmd
 			h.newDialog, cmd = h.newDialog.Update(msg)
 			return h, cmd
@@ -5273,38 +5705,29 @@ func (h *Home) handleNewDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		name, path, command, branchName, worktreeEnabled := h.newDialog.GetValuesWithWorktree()
 		groupPath := h.newDialog.GetSelectedGroup()
 		claudeOpts := h.newDialog.GetClaudeOptions() // Get Claude options if applicable.
+		launchModelID := h.newDialog.GetLaunchModelID()
 
 		// Resolve worktree target if enabled; actual worktree creation runs in async command.
 		var worktreePath, worktreeRepoRoot string
 		if worktreeEnabled && branchName != "" {
-			// Validate path is a git repo OR a bare-repo project root (#742 /
-			// #715): IsGitRepoOrBareProjectRoot accepts a directory that
-			// contains a nested .bare/ even though the directory itself has
-			// no .git. Downstream GetWorktreeBaseRoot + CreateWorktreeWithSetup
-			// handle both layouts transparently.
-			if !git.IsGitRepoOrBareProjectRoot(path) {
-				h.newDialog.SetError("Path is not a git repository")
+			// resolveWorktreeTarget validates the path is a git repo OR a
+			// bare-repo project root (#742 / #715) and implements the #1185
+			// fallback: a worktree enabled by config default (not an explicit
+			// user toggle) on a non-repo dir falls back to a normal session
+			// instead of erroring, while an explicit worktree still fails loud.
+			wtPath, repoRoot, fallback, errMsg := resolveWorktreeTarget(path, branchName, h.newDialog.IsWorktreeExplicit())
+			if errMsg != "" {
+				h.newDialog.SetError(errMsg)
 				return h, nil
 			}
-
-			repoRoot, err := git.GetWorktreeBaseRoot(path)
-			if err != nil {
-				h.newDialog.SetError(fmt.Sprintf("Failed to get repo root: %v", err))
-				return h, nil
+			if fallback {
+				// #1185: create a normal session on this non-repo dir.
+				worktreeEnabled = false
+				branchName = ""
+			} else {
+				worktreePath = wtPath
+				worktreeRepoRoot = repoRoot
 			}
-
-			// Generate worktree path using configured location/template
-			wtSettings := session.GetWorktreeSettings()
-			worktreePath = git.WorktreePath(git.WorktreePathOptions{
-				Branch:    branchName,
-				Location:  wtSettings.DefaultLocation,
-				RepoDir:   repoRoot,
-				SessionID: git.GeneratePathID(),
-				Template:  wtSettings.Template(),
-			})
-
-			// Store repo root for later use
-			worktreeRepoRoot = repoRoot
 		}
 
 		// Build generic toolOptionsJSON from tool-specific options
@@ -5329,7 +5752,7 @@ func (h *Home) handleNewDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if !worktreeEnabled {
 			if _, err := os.Stat(path); os.IsNotExist(err) {
 				h.newDialog.Hide()
-				h.confirmDialog.ShowCreateDirectory(path, name, command, groupPath, toolOptionsJSON, claudeExtraArgs, claudeStartQuery, parentSessionID, parentProjectPath)
+				h.confirmDialog.ShowCreateDirectory(path, name, command, groupPath, toolOptionsJSON, claudeExtraArgs, claudeStartQuery, launchModelID, parentSessionID, parentProjectPath)
 				return h, nil
 			}
 		}
@@ -5382,6 +5805,7 @@ func (h *Home) handleNewDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			toolOptionsJSON,
 			claudeExtraArgs,
 			claudeStartQuery,
+			launchModelID,
 			multiRepoEnabled,
 			additionalPaths,
 			parentSessionID,
@@ -5390,6 +5814,15 @@ func (h *Home) handleNewDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		)
 
 	case "esc":
+		// #1162: when the model picker dropdown is open, Esc dismisses only the
+		// picker and keeps the new-session form alive (focus stays on the model
+		// field) rather than cancelling the whole flow. Forward to the dialog so
+		// its picker-level Esc handler runs.
+		if h.newDialog.IsModelPickerOpen() {
+			var cmd tea.Cmd
+			h.newDialog, cmd = h.newDialog.Update(msg)
+			return h, cmd
+		}
 		h.newDialog.Hide()
 		h.clearError() // Clear any validation error
 		return h, nil
@@ -5611,7 +6044,7 @@ func (h *Home) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 
 		// Check if click is in the session list panel
 		if h.getLayoutMode() == LayoutModeDual {
-			leftWidth := int(float64(h.width) * 0.35)
+			leftWidth := h.sessionsPaneWidth()
 			if msg.X >= leftWidth {
 				return h, nil
 			}
@@ -5724,6 +6157,21 @@ func (h *Home) mouseYToItemIndex(y int) int {
 
 // handleMainKey handles keys in main view
 func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// Insert mode (#1069): short-circuit before any normal-mode handling.
+	// Keystrokes are sent to the focused session's tmux pane; Esc exits.
+	if h.insertMode {
+		model, cmd := h.handleInsertModeKey(msg)
+		// #1131: after any insert keystroke, arm a fast preview refresh so the
+		// user's echo appears in ~60ms instead of waiting up to the 2s
+		// background tick. Skip once the keystroke exited insert mode (Esc) —
+		// the normal tick cadence resumes there. scheduleInsertPreviewRefresh
+		// self-guards against stacking ticks during a typing burst.
+		if h2, ok := model.(*Home); ok && h2.insertMode {
+			return h2, tea.Batch(cmd, h2.scheduleInsertPreviewRefresh())
+		}
+		return model, cmd
+	}
+
 	raw := msg.String()
 	key := h.normalizeMainKey(raw)
 	uiLog.Info("keypress", "raw", raw, "normalized", key, "type", msg.Type, "runes", string(msg.Runes))
@@ -5769,10 +6217,10 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		h.lastEscTime = time.Now()
 		return h, nil
 
-	case "up", "k":
+	case "up", "k", "ctrl+p":
+		h.previewScrollOffset = 0
 		if h.cursor > 0 {
 			h.cursor--
-			h.previewScrollOffset = 0
 			h.syncViewport()
 			h.markNavigationActivity()
 			// PERFORMANCE: Debounced preview fetch - waits 150ms for navigation to settle
@@ -5781,10 +6229,10 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return h, nil
 
-	case "down", "j":
+	case "down", "j", "ctrl+n":
+		h.previewScrollOffset = 0
 		if h.cursor < len(h.flatItems)-1 {
 			h.cursor++
-			h.previewScrollOffset = 0
 			h.syncViewport()
 			h.markNavigationActivity()
 			// PERFORMANCE: Debounced preview fetch - waits 150ms for navigation to settle
@@ -5924,6 +6372,42 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "alt+/": // In-group filter search
 		h.search.SetSize(h.width, h.height)
 		h.openInGroupSearch()
+		return h, nil
+
+	case "shift+enter":
+		// Open the focused session in a new native terminal tab (or
+		// window, per [ui] iterm_open_as), leaving agent-deck running
+		// here. Issue #1069 feature 2 + #1100 remote-session support,
+		// credit @ddorman-dn.
+		//
+		// Reaching this arm at all required the #1093 fix to keyboard_compat.go
+		// + normalizeMainKey: Bubble Tea v1.3.10 has no shift+enter string,
+		// so we relay Shift+Enter via a Private-Use rune through the input
+		// reader and rewrite it to "shift+enter" before this switch sees it.
+		if h.cursor < len(h.flatItems) {
+			item := h.flatItems[h.cursor]
+			openAs := resolveITermOpenAs()
+			switch {
+			case item.Type == session.ItemTypeSession && item.Session != nil:
+				tmuxSess := item.Session.GetTmuxSession()
+				if tmuxSess != nil {
+					req := terminal.AttachRequest{
+						Name:       tmuxSess.Name,
+						SocketName: tmuxSess.SocketName,
+						OpenAs:     openAs,
+					}
+					if err := h.openInNewWindow(req, item.Session.Exists()); err != nil {
+						h.setError(fmt.Errorf("open in new window: %w", err))
+					}
+				}
+			case item.Type == session.ItemTypeRemoteSession && item.RemoteSession != nil:
+				if req, ok := buildRemoteAttachRequest(item.RemoteName, item.RemoteSession.ID, openAs); ok {
+					if err := h.openInNewWindow(req, true); err != nil {
+						h.setError(fmt.Errorf("open remote in new window: %w", err))
+					}
+				}
+			}
+		}
 		return h, nil
 
 	case "enter":
@@ -6070,7 +6554,7 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return h, nil
 
-	case "shift+up", "K":
+	case "shift+up", "ctrl+up", "+", "K":
 		// Move item up
 		if h.cursor < len(h.flatItems) {
 			item := h.flatItems[h.cursor]
@@ -6097,7 +6581,7 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return h, nil
 
-	case "shift+down", "J":
+	case "shift+down", "ctrl+down", "-", "J":
 		// Move item down
 		if h.cursor < len(h.flatItems) {
 			item := h.flatItems[h.cursor]
@@ -6386,6 +6870,22 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		h.helpOverlay.Show()
 		return h, nil
 
+	case "<":
+		// Sessions/Preview split: shrink preview by previewPctStep (#1092).
+		// Bound to dual layout — single/stacked layouts have no horizontal
+		// split to adjust.
+		if h.getLayoutMode() == LayoutModeDual {
+			h.adjustPreviewPct(-previewPctStep)
+		}
+		return h, nil
+
+	case ">":
+		// Sessions/Preview split: grow preview by previewPctStep (#1092).
+		if h.getLayoutMode() == LayoutModeDual {
+			h.adjustPreviewPct(previewPctStep)
+		}
+		return h, nil
+
 	case "S":
 		// Open settings panel
 		h.settingsPanel.Show()
@@ -6603,6 +7103,15 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "i":
 		return h, h.importSessions
+
+	case "I":
+		// Enter insert mode (#1069 feature 1): subsequent keystrokes are
+		// routed to the currently-selected session's tmux pane. Esc exits.
+		// `i` is taken by import; `I` follows the vim convention (Insert).
+		if h.enterInsertMode() {
+			return h, nil
+		}
+		return h, nil
 
 	case "u":
 		// Mark session as unread (idle → waiting)
@@ -7080,7 +7589,7 @@ func (h *Home) confirmAction() tea.Cmd {
 
 // confirmCreateDirectory handles the "yes" action for ConfirmCreateDirectory.
 func (h *Home) confirmCreateDirectory() tea.Cmd {
-	name, path, command, groupPath, pendingToolOpts, pendingExtraArgs, pendingStartQuery, parentSessionID, parentProjectPath := h.confirmDialog.GetPendingSession()
+	name, path, command, groupPath, pendingToolOpts, pendingExtraArgs, pendingStartQuery, pendingLaunchModelID, parentSessionID, parentProjectPath := h.confirmDialog.GetPendingSession()
 	h.confirmDialog.Hide()
 	if err := os.MkdirAll(path, 0o755); err != nil {
 		h.setError(fmt.Errorf("failed to create directory: %w", err))
@@ -7099,6 +7608,7 @@ func (h *Home) confirmCreateDirectory() tea.Cmd {
 		pendingToolOpts,
 		pendingExtraArgs,
 		pendingStartQuery,
+		pendingLaunchModelID,
 		false,
 		nil,
 		parentSessionID,
@@ -7301,6 +7811,40 @@ func (h *Home) refreshWatcherPanel() {
 			}
 			h.watcherPanel.SetEvents(displayEvents)
 		}
+	}
+}
+
+// dispatchWatcherEvent sends a routed watcher event into the conductor's tmux pane.
+// Skipped for triage and unrouted events (RoutedTo empty or "triage") since those have no
+// concrete delivery target yet. Mirrors dispatchHealthAlert: looks up the conductor session
+// by title and uses tmux send-keys (T-16-08) to deliver the formatted line.
+func (h *Home) dispatchWatcherEvent(evt watcher.Event) {
+	if evt.RoutedTo == "" || evt.RoutedTo == "triage" || strings.HasPrefix(evt.RoutedTo, "triage-") {
+		return
+	}
+	msg := fmt.Sprintf("[%s] %s: %s", evt.Source, evt.Sender, evt.Subject)
+	sessionTitle := session.ConductorSessionTitle(evt.RoutedTo)
+	h.instancesMu.RLock()
+	instances := h.instances
+	h.instancesMu.RUnlock()
+	for _, inst := range instances {
+		if inst.Title != sessionTitle {
+			continue
+		}
+		ts := inst.GetTmuxSession()
+		if ts == nil || ts.Name == "" {
+			return
+		}
+		tmuxName := ts.Name
+		socket := inst.TmuxSocketName
+		go func() {
+			if err := tmux.Exec(socket, "send-keys", "-t", tmuxName, msg, "Enter").Run(); err != nil {
+				uiLog.Warn("dispatch_watcher_event_send_failed",
+					slog.String("tmux_session", tmuxName),
+					slog.String("error", err.Error()))
+			}
+		}()
+		return
 	}
 }
 
@@ -7721,13 +8265,20 @@ func (h *Home) handleGroupDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case GroupDialogCreate:
 			name := h.groupDialog.GetValue()
 			if name != "" {
+				var created *session.Group
 				if h.groupDialog.HasParent() {
 					// Create subgroup under parent
 					parentPath := h.groupDialog.GetParentPath()
-					h.groupTree.CreateSubgroup(parentPath, name)
+					created = h.groupTree.CreateSubgroup(parentPath, name)
 				} else {
 					// Create root-level group
-					h.groupTree.CreateGroup(name)
+					created = h.groupTree.CreateGroup(name)
+				}
+				// Issue #918: persist the optional default path captured in the dialog.
+				if created != nil {
+					if defaultPath := h.groupDialog.GetDefaultPath(); defaultPath != "" {
+						h.groupTree.SetDefaultPathForGroup(created.Path, defaultPath)
+					}
 				}
 				h.rebuildFlatItems()
 				h.saveInstances() // Persist the new group
@@ -7852,35 +8403,25 @@ func (h *Home) handleForkDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				source := item.Session
 
 				// Resolve worktree target if enabled; actual creation runs in async command.
+				// Bare-repo project roots must pass — same contract as the
+				// new-session path (#742). #1185: a worktree enabled by config
+				// default (not an explicit toggle) on a non-repo dir falls back
+				// to a normal fork instead of erroring.
 				if worktreeEnabled && branchName != "" {
-					// Bare-repo project roots must pass — same contract as
-					// the new-session path (#742).
-					if !git.IsGitRepoOrBareProjectRoot(source.ProjectPath) {
-						h.forkDialog.SetError("Path is not a git repository")
+					worktreePath, repoRoot, fallback, errMsg := resolveWorktreeTarget(source.ProjectPath, branchName, h.forkDialog.IsWorktreeExplicit())
+					if errMsg != "" {
+						h.forkDialog.SetError(errMsg)
 						return h, nil
 					}
-					repoRoot, err := git.GetWorktreeBaseRoot(source.ProjectPath)
-					if err != nil {
-						h.forkDialog.SetError(fmt.Sprintf("Failed to get repo root: %v", err))
-						return h, nil
+					if !fallback {
+						if opts == nil {
+							opts = &session.ClaudeOptions{}
+						}
+						opts.WorkDir = worktreePath
+						opts.WorktreePath = worktreePath
+						opts.WorktreeRepoRoot = repoRoot
+						opts.WorktreeBranch = branchName
 					}
-
-					wtSettings := session.GetWorktreeSettings()
-					worktreePath := git.WorktreePath(git.WorktreePathOptions{
-						Branch:    branchName,
-						Location:  wtSettings.DefaultLocation,
-						RepoDir:   repoRoot,
-						SessionID: git.GeneratePathID(),
-						Template:  wtSettings.Template(),
-					})
-					if opts == nil {
-						opts = &session.ClaudeOptions{}
-					}
-
-					opts.WorkDir = worktreePath
-					opts.WorktreePath = worktreePath
-					opts.WorktreeRepoRoot = repoRoot
-					opts.WorktreeBranch = branchName
 				}
 
 				parentID := h.forkDialog.GetParentSessionID()
@@ -8135,6 +8676,7 @@ func (h *Home) createSessionInGroupWithWorktreeAndOptions(
 	toolOptionsJSON json.RawMessage,
 	claudeExtraArgs []string,
 	claudeStartQuery string,
+	launchModelID string,
 	multiRepoEnabled bool,
 	additionalPaths []string,
 	parentSessionID, parentProjectPath string,
@@ -8146,24 +8688,27 @@ func (h *Home) createSessionInGroupWithWorktreeAndOptions(
 			return sessionCreatedMsg{err: fmt.Errorf("cannot create session: %w", err), tempID: tempID}
 		}
 
+		var worktreeBackend vcs.Backend
 		if worktreePath != "" && worktreeRepoRoot != "" && worktreeBranch != "" && !multiRepoEnabled {
 			// Single-repo worktree: create here. Multi-repo worktrees are handled below.
 			//
+			// Detect the VCS so jj repos get `jj workspace add` instead of `git worktree add`.
+			backend, err := vcsbackend.Detect(worktreeRepoRoot)
+			if err != nil {
+				return sessionCreatedMsg{err: fmt.Errorf("failed to detect VCS: %w", err), tempID: tempID}
+			}
+			worktreeBackend = backend
+
 			// Check for an existing worktree for this branch before creating a new one.
-			if existingPath, err := git.GetWorktreeForBranch(worktreeRepoRoot, worktreeBranch); err == nil && existingPath != "" {
+			if existingPath, err := backend.GetWorktreeForBranch(worktreeBranch); err == nil && existingPath != "" {
 				uiLog.Info("worktree_reuse", slog.String("branch", worktreeBranch), slog.String("path", existingPath))
 				worktreePath = existingPath
 			} else {
 				if err := os.MkdirAll(filepath.Dir(worktreePath), 0o755); err != nil {
 					return sessionCreatedMsg{err: fmt.Errorf("failed to create parent directory: %w", err), tempID: tempID}
 				}
-				var setupBuf bytes.Buffer
-				setupErr, err := git.CreateWorktreeWithSetup(worktreeRepoRoot, worktreePath, worktreeBranch, &setupBuf, &setupBuf, session.GetWorktreeSettings().SetupTimeout())
-				if err != nil {
+				if err := createWorktreeWithSetupAndLog(backend, worktreePath, worktreeBranch); err != nil {
 					return sessionCreatedMsg{err: fmt.Errorf("failed to create worktree: %w", err), tempID: tempID}
-				}
-				if setupErr != nil {
-					uiLog.Warn("worktree_setup_script_failed", slog.String("error", setupErr.Error()), slog.String("output", setupBuf.String()))
 				}
 			}
 			path = worktreePath
@@ -8184,6 +8729,9 @@ func (h *Home) createSessionInGroupWithWorktreeAndOptions(
 			inst.WorktreePath = worktreePath
 			inst.WorktreeRepoRoot = worktreeRepoRoot
 			inst.WorktreeBranch = worktreeBranch
+			if worktreeBackend != nil {
+				inst.WorktreeType = string(worktreeBackend.Type())
+			}
 		}
 
 		applyCreateSessionToolOverrides(inst, tool, geminiYoloMode)
@@ -8191,6 +8739,12 @@ func (h *Home) createSessionInGroupWithWorktreeAndOptions(
 		// Apply generic tool options (claude, codex, etc.)
 		if len(toolOptionsJSON) > 0 {
 			inst.ToolOptionsJSON = toolOptionsJSON
+		}
+
+		if launchModelID != "" {
+			if err := inst.ApplyLaunchModel(launchModelID); err != nil {
+				return sessionCreatedMsg{err: fmt.Errorf("failed to apply model override: %w", err), tempID: tempID}
+			}
 		}
 
 		// Apply claude extra CLI tokens (claude-only, ignored for other tools).
@@ -8232,62 +8786,13 @@ func (h *Home) createSessionInGroupWithWorktreeAndOptions(
 				}
 				inst.MultiRepoTempDir = parentDir
 
-				// Create worktrees inside parentDir, named after each repo
-				dirnames := session.DeduplicateDirnames(allPaths)
-				var newProjectPath string
-				var newAdditionalPaths []string
-				for i, p := range allPaths {
-					wtPath := filepath.Join(parentDir, dirnames[i])
-					// Accept bare-repo project roots in the multi-repo
-					// path too (#742). Without this, a .bare layout
-					// silently fell through to os.Symlink below,
-					// skipping worktree creation AND the setup hook.
-					if git.IsGitRepoOrBareProjectRoot(p) {
-						repoRoot, rootErr := git.GetWorktreeBaseRoot(p)
-						if rootErr != nil {
-							uiLog.Warn("multi_repo_worktree_skip", slog.String("path", p), slog.String("error", rootErr.Error()))
-							// Copy path as-is into the parent dir via symlink
-							_ = os.Symlink(p, wtPath)
-							if i == 0 {
-								newProjectPath = wtPath
-							} else {
-								newAdditionalPaths = append(newAdditionalPaths, wtPath)
-							}
-							continue
-						}
-						if err := git.CreateWorktree(repoRoot, wtPath, worktreeBranch); err != nil {
-							uiLog.Warn("multi_repo_worktree_create_fail", slog.String("path", p), slog.String("error", err.Error()))
-							_ = os.Symlink(p, wtPath)
-							if i == 0 {
-								newProjectPath = wtPath
-							} else {
-								newAdditionalPaths = append(newAdditionalPaths, wtPath)
-							}
-							continue
-						}
-						inst.MultiRepoWorktrees = append(inst.MultiRepoWorktrees, session.MultiRepoWorktree{
-							OriginalPath: p,
-							WorktreePath: wtPath,
-							RepoRoot:     repoRoot,
-							Branch:       worktreeBranch,
-						})
-						if i == 0 {
-							newProjectPath = wtPath
-						} else {
-							newAdditionalPaths = append(newAdditionalPaths, wtPath)
-						}
-					} else {
-						// Non-git paths: symlink into parent dir
-						_ = os.Symlink(p, wtPath)
-						if i == 0 {
-							newProjectPath = wtPath
-						} else {
-							newAdditionalPaths = append(newAdditionalPaths, wtPath)
-						}
-					}
+				wtResult := session.CreateMultiRepoWorktrees(allPaths, parentDir, worktreeBranch, session.GetWorktreeSettings().SetupTimeout())
+				for _, w := range wtResult.Warnings {
+					uiLog.Warn("multi_repo_worktree", slog.String("detail", w))
 				}
-				inst.ProjectPath = newProjectPath
-				inst.AdditionalPaths = newAdditionalPaths
+				inst.MultiRepoWorktrees = wtResult.Worktrees
+				inst.ProjectPath = wtResult.MappedPaths[0]
+				inst.AdditionalPaths = wtResult.MappedPaths[1:]
 			} else {
 				// Multi-repo without worktree: create a persistent parent dir with symlinks.
 				home, _ := os.UserHomeDir()
@@ -8321,6 +8826,22 @@ func (h *Home) createSessionInGroupWithWorktreeAndOptions(
 			if inst.GetTmuxSession() != nil {
 				inst.GetTmuxSession().WorkDir = inst.MultiRepoTempDir
 			}
+
+			// Pre-accept the Claude trust dialog and emit a parent CLAUDE.md
+			// describing the layout (#1149, credit @spawnia). Skips silently
+			// for non-claude tools or empty repo lists. Failures are logged
+			// but non-fatal — the session can still launch; user just sees
+			// the usual trust prompt.
+			repoNames := make([]string, 0, len(inst.AllProjectPaths()))
+			for _, p := range inst.AllProjectPaths() {
+				repoNames = append(repoNames, filepath.Base(p))
+			}
+			if ctxErr := session.ApplyMultiRepoClaudeContext(
+				inst.Tool, inst.MultiRepoEnabled,
+				session.GetUserMCPRootPath(), inst.MultiRepoTempDir, repoNames,
+			); ctxErr != nil {
+				uiLog.Warn("multi_repo_claude_context", slog.String("error", ctxErr.Error()))
+			}
 		}
 
 		if parentSessionID != "" {
@@ -8339,6 +8860,23 @@ func (h *Home) createSessionInGroupWithWorktreeAndOptions(
 		uiLog.Info("session_create_succeeded", slog.String("id", inst.ID))
 		return sessionCreatedMsg{instance: inst, tempID: tempID}
 	}
+}
+
+// createWorktreeWithSetupAndLog creates a worktree via the supplied backend.
+// For git backends it also runs .worktreeinclude and worktree-setup.sh; for
+// jujutsu backends only the workspace is created (setup-script behavior is
+// git-only per the vcsbackend convention). Returns only the creation error;
+// setup failures are non-fatal and logged to uiLog.
+func createWorktreeWithSetupAndLog(backend vcs.Backend, wtPath, branch string) error {
+	var buf bytes.Buffer
+	setupErr, err := vcsbackend.CreateWorktreeWithSetup(backend, wtPath, branch, &buf, &buf, session.GetWorktreeSettings().SetupTimeout())
+	if err != nil {
+		return err
+	}
+	if setupErr != nil {
+		uiLog.Warn("worktree_setup_script_failed", slog.String("error", setupErr.Error()), slog.String("output", buf.String()))
+	}
+	return nil
 }
 
 // createSessionTool maps a free-form command to (tool, command). Built-in
@@ -8363,6 +8901,13 @@ func createSessionTool(command string) (string, string) {
 		tool = "pi"
 	case "copilot":
 		tool = "copilot"
+	case "crush":
+		tool = "crush"
+	case "cursor":
+		tool = "cursor"
+		command = "cursor agent"
+	case "hermes":
+		tool = "hermes"
 	default:
 		if toolDef := session.GetToolDef(command); toolDef != nil {
 			tool = command
@@ -8482,7 +9027,11 @@ func (h *Home) quickCreateSession() tea.Cmd {
 		tool = "claude"
 	}
 	if command == "" {
-		command = tool
+		if tool == "cursor" {
+			command = "cursor agent"
+		} else {
+			command = tool
+		}
 	}
 
 	// Generate unique name
@@ -8496,6 +9045,7 @@ func (h *Home) quickCreateSession() tea.Cmd {
 		geminiYoloMode, false, toolOptionsJSON,
 		nil,        // no extra claude args (recent-session path)
 		"",         // no claude startup query (recent-session path)
+		"",         // no explicit model override
 		false, nil, // no multi-repo
 		"", "", // no parent
 		"", // no placeholder
@@ -8574,6 +9124,7 @@ func (h *Home) quickCreateSessionAt(projectPath string) tea.Cmd {
 		false, false, nil,
 		nil, // no extra claude args
 		"",  // no claude startup query
+		"",  // no explicit model override
 		false, nil,
 		"", "",
 		"",
@@ -8691,21 +9242,22 @@ func (h *Home) forkSessionCmdWithOptions(
 			// Worktree creation can be slow on large repos; keep it in async cmd path
 			// so the TUI remains responsive.
 			//
+			// Detect the VCS so jj repos get `jj workspace add` instead of `git worktree add`.
+			backend, err := vcsbackend.Detect(opts.WorktreeRepoRoot)
+			if err != nil {
+				return sessionForkedMsg{err: fmt.Errorf("failed to detect VCS: %w", err), sourceID: sourceID}
+			}
+
 			// Check for an existing worktree for this branch before creating a new one.
-			if existingPath, err := git.GetWorktreeForBranch(opts.WorktreeRepoRoot, opts.WorktreeBranch); err == nil && existingPath != "" {
+			if existingPath, err := backend.GetWorktreeForBranch(opts.WorktreeBranch); err == nil && existingPath != "" {
 				uiLog.Info("worktree_reuse", slog.String("branch", opts.WorktreeBranch), slog.String("path", existingPath))
 				opts.WorktreePath = existingPath
 			} else {
 				if err := os.MkdirAll(filepath.Dir(opts.WorktreePath), 0o755); err != nil {
 					return sessionForkedMsg{err: fmt.Errorf("failed to create directory: %w", err), sourceID: sourceID}
 				}
-				var setupBuf bytes.Buffer
-				setupErr, err := git.CreateWorktreeWithSetup(opts.WorktreeRepoRoot, opts.WorktreePath, opts.WorktreeBranch, &setupBuf, &setupBuf, session.GetWorktreeSettings().SetupTimeout())
-				if err != nil {
+				if err := createWorktreeWithSetupAndLog(backend, opts.WorktreePath, opts.WorktreeBranch); err != nil {
 					return sessionForkedMsg{err: fmt.Errorf("worktree creation failed: %w", err), sourceID: sourceID}
-				}
-				if setupErr != nil {
-					uiLog.Warn("worktree_setup_script_failed", slog.String("error", setupErr.Error()), slog.String("output", setupBuf.String()))
 				}
 			}
 		}
@@ -8815,11 +9367,17 @@ func (h *Home) deleteSession(inst *session.Instance) tea.Cmd {
 	return func() tea.Msg {
 		killErr := inst.Kill()
 		if isWorktree {
-			if err := git.RemoveWorktree(worktreeRepoRoot, worktreePath, true); err != nil {
+			// #1200: route worktree teardown through the session guard so a
+			// worktree_reuse session (WorktreePath == the user's original repo)
+			// is never os.RemoveAll'd. Only genuine agent-deck-created linked
+			// worktrees are removed; a reused repo is left intact and merely
+			// dropped from the registry.
+			snap := &session.Instance{WorktreePath: worktreePath, WorktreeRepoRoot: worktreeRepoRoot}
+			switch removed, err := session.RemoveSessionWorktree(snap); {
+			case err != nil:
 				uiLog.Warn("worktree_remove_err", slog.String("path", worktreePath), slog.String("err", err.Error()))
-			}
-			if err := git.PruneWorktrees(worktreeRepoRoot); err != nil {
-				uiLog.Warn("worktree_prune_err", slog.String("repo", worktreeRepoRoot), slog.String("err", err.Error()))
+			case !removed:
+				uiLog.Info("worktree_remove_skipped", slog.String("path", worktreePath), slog.String("repo", worktreeRepoRoot), slog.String("reason", "reused or non-linked worktree (#1200 guard)"))
 			}
 		}
 		if isMultiRepo {
@@ -9322,13 +9880,14 @@ func (h *Home) importSessions() tea.Msg {
 // Cache expires after 500ms to balance freshness with performance
 // PERFORMANCE: Increased from 100ms to 500ms - status changes are rare
 // during UI interaction, and longer cache reduces View() overhead
-func (h *Home) countSessionStatuses() (running, waiting, idle, errored int) {
+func (h *Home) countSessionStatuses() (running, waiting, idle, stopped, errored int) {
 	// Return cached values if valid and not expired
 	const cacheDuration = 500 * time.Millisecond
 	if h.cachedStatusCounts.valid.Load() &&
 		time.Since(h.cachedStatusCounts.timestamp) < cacheDuration {
 		return h.cachedStatusCounts.running, h.cachedStatusCounts.waiting,
-			h.cachedStatusCounts.idle, h.cachedStatusCounts.errored
+			h.cachedStatusCounts.idle, h.cachedStatusCounts.stopped,
+			h.cachedStatusCounts.errored
 	}
 
 	// Compute counts
@@ -9345,25 +9904,57 @@ func (h *Home) countSessionStatuses() (running, waiting, idle, errored int) {
 			waiting++
 		case session.StatusIdle:
 			idle++
-		case session.StatusError, session.StatusStopped:
+		case session.StatusStopped:
+			// Issue #953 (re-opened): manually-stopped sessions get their
+			// own bucket so the header counter does not slander them as
+			// errors. StatusStopped reaches here only via i.Kill()'s
+			// canonical contract (see internal/session/instance.go) —
+			// crashes still surface as StatusError below.
+			stopped++
+		case session.StatusError:
 			errored++
 		}
 	}
+
+	// Include remote sessions (issue #1066). Remotes carry their status as a
+	// lowercase string from the remote's `agent-deck list --json` (see
+	// internal/session/discovery.go for the canonical mapping). The counter
+	// previously only iterated the local-instance snapshot, so the header
+	// pill read 0 for users with only remote sessions.
+	h.remoteSessionsMu.RLock()
+	for _, sessions := range h.remoteSessions {
+		for _, rs := range sessions {
+			switch rs.Status {
+			case "running":
+				running++
+			case "waiting":
+				waiting++
+			case "idle":
+				idle++
+			case "stopped":
+				stopped++
+			case "error":
+				errored++
+			}
+		}
+	}
+	h.remoteSessionsMu.RUnlock()
 
 	// Cache results with timestamp
 	h.cachedStatusCounts.running = running
 	h.cachedStatusCounts.waiting = waiting
 	h.cachedStatusCounts.idle = idle
+	h.cachedStatusCounts.stopped = stopped
 	h.cachedStatusCounts.errored = errored
 	h.cachedStatusCounts.valid.Store(true)
 	h.cachedStatusCounts.timestamp = time.Now()
-	return running, waiting, idle, errored
+	return running, waiting, idle, stopped, errored
 }
 
 // renderFilterBar renders the quick filter pills
-// Format: [All] [● Running 2] [◐ Waiting 1] [○ Idle 5] [✕ Error 1]
+// Format: [All] [● Running 2] [◐ Waiting 1] [○ Idle 5] [■ Stopped 1] [✕ Error 1]
 func (h *Home) renderFilterBar() string {
-	running, waiting, idle, errored := h.countSessionStatuses()
+	running, waiting, idle, stopped, errored := h.countSessionStatuses()
 
 	// Pill styling
 	activePillStyle := lipgloss.NewStyle().
@@ -9457,6 +10048,28 @@ func (h *Home) renderFilterBar() string {
 			Foreground(ColorText).
 			Background(ColorSurface).
 			Padding(0, 1).Render(idleLabel))
+	}
+
+	// Stopped pill (issue #953): manually-stopped sessions deserve their own
+	// affordance — they're not errors, they're intentional. Render-only-if
+	// non-zero or actively filtered, mirroring the error pill's pattern, so
+	// the bar stays compact when no stopped sessions exist.
+	if stopped > 0 || h.statusFilter == session.StatusStopped {
+		stoppedLabel := fmt.Sprintf("■ %d", stopped)
+		if h.statusFilter == session.StatusStopped {
+			pills = append(pills, lipgloss.NewStyle().
+				Foreground(ColorBg).
+				Background(ColorTextDim).
+				Bold(true).
+				Padding(0, 1).Render(stoppedLabel))
+		} else if isActive && h.activeFilterExcludes[session.StatusStopped] {
+			pills = append(pills, dimPillStyle.Render(stoppedLabel))
+		} else if stopped > 0 {
+			pills = append(pills, lipgloss.NewStyle().
+				Foreground(ColorTextDim).
+				Background(ColorSurface).
+				Padding(0, 1).Render(stoppedLabel))
+		}
 	}
 
 	if errored > 0 || h.statusFilter == session.StatusError {
@@ -9622,7 +10235,7 @@ func (h *Home) View() string {
 	// HEADER BAR
 	// ═══════════════════════════════════════════════════════════════════
 	// Calculate real session status counts for logo and stats
-	running, waiting, idle, errored := h.countSessionStatuses()
+	running, waiting, idle, stopped, errored := h.countSessionStatuses()
 	logo := RenderLogoCompact(running, waiting, idle)
 
 	titleStyle := lipgloss.NewStyle().
@@ -9668,6 +10281,14 @@ func (h *Home) View() string {
 			lipgloss.NewStyle().Foreground(ColorText).Render(fmt.Sprintf("○ %d idle", idle)),
 		)
 	}
+	if stopped > 0 {
+		// Issue #953: stopped sessions get their own segment so users can see
+		// at a glance how many sessions are intentionally off vs. errored.
+		statsParts = append(
+			statsParts,
+			lipgloss.NewStyle().Foreground(ColorTextDim).Render(fmt.Sprintf("■ %d stopped", stopped)),
+		)
+	}
 	if errored > 0 {
 		statsParts = append(
 			statsParts,
@@ -9687,14 +10308,21 @@ func (h *Home) View() string {
 	// See session.ResolveCostLineTemplate for the [costs] / per-profile
 	// override chain. RenderCostLine returns "" when hide_when_zero is on
 	// and every recognized variable rendered to $0.00.
+	// #1101: aggregate remote per-host summaries on top of local totals so the
+	// status-line cost segment reflects spend across every configured host,
+	// not only events written to the local cost_events table. Remotes whose
+	// fetch failed contribute zero — the local figures still render.
+	h.remoteCostsMu.RLock()
+	remoteAgg := costs.MergeRemoteCostSummaries(h.remoteCosts)
+	h.remoteCostsMu.RUnlock()
 	costVars := map[string]int64{
-		"cost_today":      h.costToday.Load(),
-		"cost_yesterday":  h.costYesterday.Load(),
-		"cost_this_week":  h.costWeek.Load(),
-		"cost_last_week":  h.costLastWeek.Load(),
-		"cost_this_month": h.costThisMonth.Load(),
-		"cost_last_month": h.costLastMonth.Load(),
-		"cost_projected":  h.costProjected.Load(),
+		"cost_today":      h.costToday.Load() + remoteAgg.CostTodayMicrodollars,
+		"cost_yesterday":  h.costYesterday.Load() + remoteAgg.CostYesterdayMicrodollars,
+		"cost_this_week":  h.costWeek.Load() + remoteAgg.CostThisWeekMicrodollars,
+		"cost_last_week":  h.costLastWeek.Load() + remoteAgg.CostLastWeekMicrodollars,
+		"cost_this_month": h.costThisMonth.Load() + remoteAgg.CostThisMonthMicrodollars,
+		"cost_last_month": h.costLastMonth.Load() + remoteAgg.CostLastMonthMicrodollars,
+		"cost_projected":  h.costProjected.Load() + remoteAgg.CostProjectedMicrodollars,
 	}
 	if rendered := costs.RenderCostLine(h.costLineTemplate, costVars, h.costLineHideWhenZero); rendered != "" {
 		costStyle := lipgloss.NewStyle().Foreground(ColorCyan)
@@ -9804,9 +10432,15 @@ func (h *Home) View() string {
 	b.WriteString("\n")
 
 	// ═══════════════════════════════════════════════════════════════════
-	// HELP BAR (context-aware shortcuts)
+	// HELP BAR (context-aware shortcuts) — replaced by the insert-mode
+	// indicator when the user is typing through to a focused session (#1069).
 	// ═══════════════════════════════════════════════════════════════════
-	helpBar := h.renderHelpBar()
+	var helpBar string
+	if h.insertMode {
+		helpBar = h.renderInsertModeBar()
+	} else {
+		helpBar = h.renderHelpBar()
+	}
 	b.WriteString(helpBar)
 
 	// Debug performance overlay (AGENTDECK_DEBUG=1 only)
@@ -10208,8 +10842,13 @@ func clampViewToViewport(content string, width, height int) string {
 	}
 
 	for i, line := range lines {
-		if ansi.StringWidth(line) > width {
-			lines[i] = ansi.Truncate(line, width, "")
+		// #937 v2: cellWidth/cellTruncate (not ansi.*) so this final
+		// viewport-clamp safety net sees keycap clusters at their true
+		// terminal cell count. Any line that slips past upstream gates
+		// with a #️⃣ 0️⃣–9️⃣ *️⃣ glyph would otherwise overflow into the
+		// next row here — exactly @jennings's pane-content drift report.
+		if cellWidth(line) > width {
+			lines[i] = cellTruncate(line, width, "")
 		}
 	}
 
@@ -10268,24 +10907,34 @@ func ensureExactWidth(content string, width int) string {
 func (h *Home) renderDualColumnLayout(contentHeight int) string {
 	var b strings.Builder
 
-	// Calculate panel widths (35% left, 65% right for more preview space)
-	leftWidth := int(float64(h.width) * 0.35)
-	rightWidth := h.width - leftWidth - 3 // -3 for separator
+	// Calculate panel widths from configurable split (issue #1092 — [ui] preview_pct)
+	// with chrome / min-width clamping (issue #1113) so the PREVIEW pane never
+	// shrinks below its title width.
+	leftWidth, rightWidth := h.splitPaneWidths()
 
 	// Panel title is exactly 2 lines (title + underline)
 	// Panel content gets the remaining space: contentHeight - 2
 	panelTitleLines := 2
 	panelContentHeight := contentHeight - panelTitleLines
 
-	// Build left panel (session list) with styled title
-	leftTitle := h.renderPanelTitle("SESSIONS", leftWidth)
+	// Build left panel (session list) with styled title.
+	// Issue #1092: when the user just adjusted the split, briefly append
+	// the new ratio to both titles so the change is visible.
+	sessionsTitle := "SESSIONS"
+	previewTitle := "PREVIEW"
+	if !h.previewPctOverlayAt.IsZero() && time.Now().Before(h.previewPctOverlayAt) {
+		pct := h.getPreviewPct()
+		sessionsTitle = fmt.Sprintf("SESSIONS %d%%", 100-pct)
+		previewTitle = fmt.Sprintf("PREVIEW %d%%", pct)
+	}
+	leftTitle := h.renderPanelTitle(sessionsTitle, leftWidth)
 	leftContent := h.renderSessionList(leftWidth, panelContentHeight)
 	// CRITICAL: Ensure left content has exactly panelContentHeight lines
 	leftContent = ensureExactHeight(leftContent, panelContentHeight)
 	leftPanel := leftTitle + "\n" + leftContent
 
 	// Build right panel (preview) with styled title
-	rightTitle := h.renderPanelTitle("PREVIEW", rightWidth)
+	rightTitle := h.renderPanelTitle(previewTitle, rightWidth)
 	rightContent := h.renderPreviewPane(rightWidth, panelContentHeight)
 	// CRITICAL: Ensure right content has exactly panelContentHeight lines
 	rightContent = ensureExactHeight(rightContent, panelContentHeight)
@@ -10453,6 +11102,44 @@ func renderDetectedAtLine(b *strings.Builder, detectedAt time.Time) {
 	b.WriteString("\n")
 }
 
+// renderLaunchModelInfoLines renders the per-session model/version override,
+// or an explicit tool-default marker when the tool supports model selection.
+func renderLaunchModelInfoLines(b *strings.Builder, inst *session.Instance) {
+	if inst == nil || !session.SupportsLaunchModel(inst.Tool) {
+		return
+	}
+
+	labelStyle := lipgloss.NewStyle().Foreground(ColorText)
+	valueStyle := lipgloss.NewStyle().Foreground(ColorAccent)
+	dimStyle := lipgloss.NewStyle().Foreground(ColorText).Italic(true)
+
+	info := inst.LaunchModelInfo()
+	if info.ModelID == "" {
+		b.WriteString(labelStyle.Render("Model:   "))
+		b.WriteString(dimStyle.Render("tool default"))
+		b.WriteString("\n")
+		return
+	}
+
+	model := info.Model
+	if model == "" {
+		model = info.ModelID
+	}
+	b.WriteString(labelStyle.Render("Model:   "))
+	b.WriteString(valueStyle.Render(model))
+	b.WriteString("\n")
+
+	if info.Version != "" {
+		b.WriteString(labelStyle.Render("Version: "))
+		b.WriteString(valueStyle.Render(info.Version))
+		b.WriteString("\n")
+	}
+
+	b.WriteString(labelStyle.Render("Model ID:"))
+	b.WriteString(valueStyle.Render(" " + info.ModelID))
+	b.WriteString("\n")
+}
+
 // renderForkHintLine renders the fork keyboard hint line.
 func (h *Home) renderForkHintLine(b *strings.Builder) {
 	quickForkKey := h.actionKey(hotkeyQuickFork)
@@ -10516,10 +11203,11 @@ func renderSimpleMCPLine(b *strings.Builder, mcpInfo *session.MCPInfo, width int
 
 	for i, part := range mcpParts {
 		plainPart := tmux.StripANSI(part)
-		// #937: ansi.StringWidth (uniseg grapheme-cluster aware) instead of
-		// runewidth.StringWidth, which under-counts <codepoint>+VS16 emoji
-		// sequences and produced row-offset drift on titles like "🏷️ ...".
-		partWidth := ansi.StringWidth(plainPart)
+		// #937 v2: cellWidth promotes keycap clusters (#️⃣ 0️⃣–9️⃣ *️⃣) to 2
+		// cells; ansi.StringWidth reports them at 1 and let MCP rows drift
+		// past the right edge — see internal/ui/cellwidth.go for the
+		// uniseg/terminal disagreement that motivates this shim.
+		partWidth := cellWidth(plainPart)
 
 		addedWidth := partWidth
 		if mcpCount > 0 {
@@ -10534,7 +11222,7 @@ func renderSimpleMCPLine(b *strings.Builder, mcpInfo *session.MCPInfo, width int
 			wouldExceed = currentWidth+addedWidth > mcpMaxWidth
 		} else {
 			moreIndicator := fmt.Sprintf(" (+%d more)", remaining)
-			moreWidth := ansi.StringWidth(moreIndicator)
+			moreWidth := cellWidth(moreIndicator)
 			wouldExceed = currentWidth+addedWidth+moreWidth > mcpMaxWidth
 		}
 
@@ -11046,6 +11734,7 @@ func (h *Home) renderHelpBarFull() string {
 	// Global shortcuts (right side) - more compact with separators
 	globalStyle := lipgloss.NewStyle().Foreground(ColorComment)
 	globalParts := []string{globalStyle.Render("↑↓ Nav")}
+	globalParts = append(globalParts, globalStyle.Render("+/- Move"))
 	if key := h.actionKey(hotkeySearch); key != "" {
 		globalParts = append(globalParts, globalStyle.Render(key+" Search"))
 	}
@@ -11717,14 +12406,19 @@ func (h *Home) renderSessionItem(
 	)
 
 	// Append pane title filling remaining row space (only for the selected item).
-	// lipgloss.Width(row) accounts for indentation, tree connectors, and all badges,
-	// so deeply-nested sessions with many badges naturally get less pane title space.
+	// #937 v2: cellWidth/cellTruncate (not lipgloss.Width / ansi.Truncate)
+	// for both the row budget and the pane-title fit check. pane titles
+	// often surface tmux pane content which can contain keycap glyphs
+	// (#️⃣ 0️⃣–9️⃣ *️⃣) — uniseg reports those at 1 cell, terminals render 2,
+	// so the prior measurement let the trailing pane-title text overflow
+	// the panel and shove subsequent rows down by one cell. See
+	// internal/ui/cellwidth.go for the upstream disagreement.
 	if selected && instState.paneTitle != "" {
-		remaining := h.width - lipgloss.Width(row) - 2 // -2 for trailing margin
+		remaining := h.width - cellWidth(row) - 2 // -2 for trailing margin
 		if remaining > 10 {
 			pt := instState.paneTitle
-			if lipgloss.Width(pt) > remaining {
-				pt = ansi.Truncate(pt, remaining, "…")
+			if cellWidth(pt) > remaining {
+				pt = cellTruncate(pt, remaining, "…")
 			}
 			row += DimStyle.Render(" " + pt)
 		}
@@ -11914,12 +12608,55 @@ func (h *Home) renderRemoteGroupItem(b *strings.Builder, item session.Item, sele
 		selPrefix = "▶ "
 	}
 
-	b.WriteString(fmt.Sprintf("%s%s %s%s\n",
+	b.WriteString(fmt.Sprintf("%s%s %s%s%s\n",
 		selPrefix,
 		expandIcon,
 		nameStyle.Render("remotes/"+item.RemoteName),
 		countStyle.Render(fmt.Sprintf(" (%d)", count)),
+		h.renderRemoteLatencyMarker(item.RemoteName, selected),
 	))
+}
+
+// renderRemoteLatencyMarker returns the colored ` — Xms` (or ` — offline`)
+// suffix for a remote group header. Empty string when no measurement has
+// been taken yet so the header doesn't jitter on first paint. See #1103.
+//
+// Color thresholds:
+//   - green:  <  50ms        (lipgloss color 2)
+//   - yellow: 50-200ms       (color 3)
+//   - red:    > 200ms or offline (color 1)
+func (h *Home) renderRemoteLatencyMarker(remoteName string, selected bool) string {
+	h.remoteLatencyMu.RLock()
+	lat, ok := h.remoteLatency[remoteName]
+	h.remoteLatencyMu.RUnlock()
+	if !ok || lat.MeasuredAt.IsZero() {
+		return ""
+	}
+
+	var text string
+	var color lipgloss.Color
+	switch {
+	case lat.Offline:
+		text = " — offline"
+		color = lipgloss.Color("1") // red
+	case lat.MS < 50:
+		text = fmt.Sprintf(" — %dms", lat.MS)
+		color = lipgloss.Color("2") // green
+	case lat.MS <= 200:
+		text = fmt.Sprintf(" — %dms", lat.MS)
+		color = lipgloss.Color("3") // yellow
+	default:
+		text = fmt.Sprintf(" — %dms", lat.MS)
+		color = lipgloss.Color("1") // red
+	}
+
+	style := lipgloss.NewStyle().Foreground(color)
+	if selected {
+		// On the selected row, preserve color so the threshold signal
+		// stays readable against the highlight background.
+		style = style.Bold(true)
+	}
+	return style.Render(text)
 }
 
 // renderRemoteSessionItem renders a single remote session row
@@ -11960,7 +12697,10 @@ func (h *Home) renderRemoteSessionItem(b *strings.Builder, item session.Item, se
 
 	toolStr := ""
 	if rs.Tool != "" {
-		tStyle := DimStyle
+		// #1091: use brand-specific color (claude=orange, gemini=purple, …)
+		// so SSH-remote rows match local rows. Falls back to ColorTextDim
+		// for unknown/empty tool names via GetToolStyle.
+		tStyle := GetToolStyle(rs.Tool)
 		if selected {
 			tStyle = SessionStatusSelStyle
 		}
@@ -12039,6 +12779,13 @@ func (h *Home) renderLaunchingState(inst *session.Instance, width int, startTime
 			toolDesc = "Resuming OpenCode session..."
 		} else {
 			toolDesc = "Starting OpenCode..."
+		}
+	case "cursor":
+		toolName = "Cursor Agent"
+		if isResuming {
+			toolDesc = "Resuming Cursor session..."
+		} else {
+			toolDesc = "Starting Cursor Agent..."
 		}
 	default:
 		toolName = "Shell"
@@ -12543,6 +13290,7 @@ func (h *Home) renderPreviewPane(width, height int) string {
 			b.WriteString(statusStyle.Render("○ Not connected"))
 			b.WriteString("\n")
 		}
+		renderLaunchModelInfoLines(&b, selected)
 
 		// MCP servers - compact format with source indicators and sync status
 		mcpInfo := selected.GetMCPInfo()
@@ -12636,10 +13384,10 @@ func (h *Home) renderPreviewPane(width, height int) string {
 			for i, part := range mcpParts {
 				// Strip ANSI codes to measure actual display width
 				plainPart := tmux.StripANSI(part)
-				// #937: ansi.StringWidth (uniseg grapheme-cluster aware)
-				// instead of runewidth.StringWidth — see comment at the other
-				// MCP-row sizing loop for full rationale.
-				partWidth := ansi.StringWidth(plainPart)
+				// #937 v2: cellWidth (not ansi.StringWidth) so keycap
+				// clusters in MCP names — see cellwidth.go — are sized
+				// at the cell count terminals actually render.
+				partWidth := cellWidth(plainPart)
 
 				// Calculate width including separator if not first
 				addedWidth := partWidth
@@ -12659,7 +13407,7 @@ func (h *Home) renderPreviewPane(width, height int) string {
 				} else {
 					// Not last - check with indicator space reserved
 					moreIndicator := fmt.Sprintf(" (+%d more)", remaining)
-					moreWidth := ansi.StringWidth(moreIndicator)
+					moreWidth := cellWidth(moreIndicator)
 					wouldExceed = currentWidth+addedWidth+moreWidth > mcpMaxWidth
 				}
 
@@ -12730,16 +13478,7 @@ func (h *Home) renderPreviewPane(width, height int) string {
 			b.WriteString(labelStyle.Render("Session: "))
 			b.WriteString(valueStyle.Render(selected.GeminiSessionID))
 			b.WriteString("\n")
-
-			// Display active model
-			modelDisplay := "auto"
-			if selected.GeminiModel != "" {
-				modelDisplay = selected.GeminiModel
-			}
-			accentStyle := lipgloss.NewStyle().Foreground(ColorAccent)
-			b.WriteString(labelStyle.Render("Model:   "))
-			b.WriteString(accentStyle.Render(modelDisplay))
-			b.WriteString("\n")
+			renderLaunchModelInfoLines(&b, selected)
 
 			// MCPs for Gemini (global only)
 			mcpInfo := selected.GetMCPInfo()
@@ -12749,6 +13488,7 @@ func (h *Home) renderPreviewPane(width, height int) string {
 			b.WriteString(labelStyle.Render("Status:  "))
 			b.WriteString(statusStyle.Render("○ Not connected"))
 			b.WriteString("\n")
+			renderLaunchModelInfoLines(&b, selected)
 		}
 	}
 
@@ -12777,6 +13517,7 @@ func (h *Home) renderPreviewPane(width, height int) string {
 			b.WriteString(labelStyle.Render("Session: "))
 			b.WriteString(valueStyle.Render(selected.OpenCodeSessionID))
 			b.WriteString("\n")
+			renderLaunchModelInfoLines(&b, selected)
 
 			// Show when session was detected
 			if !selected.OpenCodeDetectedAt.IsZero() {
@@ -12799,12 +13540,14 @@ func (h *Home) renderPreviewPane(width, height int) string {
 				b.WriteString(labelStyle.Render("Status:  "))
 				b.WriteString(statusStyle.Render("◐ Detecting session..."))
 				b.WriteString("\n")
+				renderLaunchModelInfoLines(&b, selected)
 			} else {
 				// Detection completed but no session found
 				statusStyle := lipgloss.NewStyle().Foreground(ColorText)
 				b.WriteString(labelStyle.Render("Status:  "))
 				b.WriteString(statusStyle.Render("○ No session found"))
 				b.WriteString("\n")
+				renderLaunchModelInfoLines(&b, selected)
 			}
 		}
 	}
@@ -12816,6 +13559,7 @@ func (h *Home) renderPreviewPane(width, height int) string {
 		b.WriteString("\n")
 
 		renderToolStatusLine(&b, selected.CodexSessionID, selected.CodexDetectedAt, true)
+		renderLaunchModelInfoLines(&b, selected)
 		if selected.CodexSessionID != "" {
 			renderDetectedAtLine(&b, selected.CodexDetectedAt)
 		}
@@ -13351,12 +14095,14 @@ func (h *Home) renderPreviewPane(width, height int) string {
 			}
 			consecutiveEmpty = 0 // Reset counter on non-empty line
 
-			// Truncate based on display width using ANSI-aware measurement
-			// ansi.StringWidth ignores escape sequences for accurate width
-			displayWidth := ansi.StringWidth(safeLine)
+			// Truncate based on display width using ANSI-aware measurement.
+			// #937 v2: cellWidth/cellTruncate so pane-content lines from
+			// the tmux capture-pane buffer — which is where @jennings's
+			// keycap glyphs live — are sized at the cell count terminals
+			// actually render.
+			displayWidth := cellWidth(safeLine)
 			if displayWidth > maxWidth {
-				// ansi.Truncate preserves ANSI codes while truncating visible content
-				safeLine = ansi.Truncate(safeLine, maxWidth-3, "...")
+				safeLine = cellTruncate(safeLine, maxWidth-3, "...")
 			}
 
 			b.WriteString(safeLine)
@@ -13376,11 +14122,13 @@ func (h *Home) renderPreviewPane(width, height int) string {
 	lines := strings.Split(result, "\n")
 	var truncatedLines []string
 	for _, line := range lines {
-		// Use ANSI-aware width measurement to handle lines with escape codes
-		displayWidth := ansi.StringWidth(line)
+		// #937 v2: cellWidth/cellTruncate so the right-panel width
+		// enforcement before lipgloss.JoinHorizontal handles keycap
+		// clusters; ansi.* alone under-counted them and let oversized
+		// lines bleed into the left panel.
+		displayWidth := cellWidth(line)
 		if displayWidth > maxWidth {
-			// ANSI-aware truncation preserves escape codes while trimming visible content
-			line = ansi.Truncate(line, maxWidth-3, "...")
+			line = cellTruncate(line, maxWidth-3, "...")
 		}
 		// Issue #699: captured Claude output (e.g., highlighted input line) can
 		// contain an unclosed SGR whose reset was off-screen or clipped by
@@ -13471,7 +14219,11 @@ func (h *Home) renderNotesSection(inst *session.Instance, width, maxLines int) s
 		}
 
 		for _, line := range viewLines {
-			lines = append(lines, ansi.Truncate(line, contentWidth, "..."))
+			// #937 v2: cellTruncate for notes-editor lines so a keycap
+			// glyph the user typed into the notes editor doesn't overflow
+			// the panel — same drift class as the renderNotesSection path
+			// just below.
+			lines = append(lines, cellTruncate(line, contentWidth, "..."))
 		}
 
 		lines = append(lines, hintStyle.Render("Ctrl+S save • Esc cancel"))
@@ -13497,13 +14249,13 @@ func (h *Home) renderNotesSection(inst *session.Instance, width, maxLines int) s
 			}
 			for _, line := range displayLines {
 				safe := stripControlCharsPreserveANSI(line)
-				// #937: ansi.Truncate is uniseg grapheme-cluster aware so
-				// pane content (notes lines) containing emoji+VS16 stays
-				// inside the panel width budget — runewidth.Truncate
-				// under-counted by 1 cell per VS16 sequence and let the
-				// overflow scroll the layout. Reported by @jennings as
-				// the pane-content half of #937.
-				safe = ansi.Truncate(safe, contentWidth, "...")
+				// #937 v2: cellTruncate (not ansi.Truncate) is the truncation
+				// gate for pane content. ansi/uniseg miss keycap clusters
+				// (#️⃣ 0️⃣–9️⃣ *️⃣) — exactly the emoji @jennings reported
+				// against v1.9.3 — so PR #948's swap to ansi.Truncate alone
+				// still let oversized lines past the gate and reproduced
+				// #937's per-frame row-offset drift. See cellwidth.go.
+				safe = cellTruncate(safe, contentWidth, "...")
 				lines = append(lines, notesStyle.Render(safe))
 			}
 			if overflow && len(lines) > 0 {
@@ -13602,12 +14354,15 @@ func remapANSIBackground(s, replacement string) string {
 
 // truncatePath shortens a path to fit within maxLen display width.
 //
-// #937: width and truncate route through ansi.* (uniseg grapheme-cluster
-// aware) instead of runewidth.*, which under-counts <codepoint>+VS16 emoji
-// sequences and let oversized titles past the truncation gate, producing
-// row-offset drift on titles like "🏷️ /Users/foo/project".
+// #937 v2: width and truncate route through cellWidth/cellTruncate (which
+// promote keycap clusters such as #️⃣ to 2 cells on top of ansi/uniseg's
+// VS16 handling). ansi.* alone — what PR #948 shipped — still let
+// keycap-prefixed titles past the truncation gate and reproduced #937's
+// row-offset drift on titles like "#️⃣ /Users/foo/keycap-channel".
+// See internal/ui/cellwidth.go for the upstream disagreement that
+// motivates this shim.
 func truncatePath(path string, maxLen int) string {
-	pathWidth := ansi.StringWidth(path)
+	pathWidth := cellWidth(path)
 	if pathWidth <= maxLen {
 		return path
 	}
@@ -13621,7 +14376,7 @@ func truncatePath(path string, maxLen int) string {
 	endLen := maxLen*2/3 - 3
 	if startLen+endLen+3 > len(runes) {
 		// Path is short in runes but wide in display - use width-aware truncation
-		return ansi.Truncate(path, maxLen-3, "...")
+		return cellTruncate(path, maxLen-3, "...")
 	}
 	return string(runes[:startLen]) + "..." + string(runes[len(runes)-endLen:])
 }
@@ -13678,7 +14433,7 @@ func (h *Home) renderGroupPreview(group *session.Group, width, height int) strin
 	b.WriteString("\n\n")
 
 	// Status breakdown with inline badges
-	running, waiting, idle, errored := 0, 0, 0, 0
+	running, waiting, idle, stopped, errored := 0, 0, 0, 0, 0
 	for _, sess := range group.Sessions {
 		switch sess.Status {
 		case session.StatusRunning:
@@ -13687,7 +14442,11 @@ func (h *Home) renderGroupPreview(group *session.Group, width, height int) strin
 			waiting++
 		case session.StatusIdle:
 			idle++
-		case session.StatusError, session.StatusStopped:
+		case session.StatusStopped:
+			// Issue #953: keep stopped separate from errored in the group
+			// preview panel for the same reason as the header counter.
+			stopped++
+		case session.StatusError:
 			errored++
 		}
 	}
@@ -13708,6 +14467,9 @@ func (h *Home) renderGroupPreview(group *session.Group, width, height int) strin
 	}
 	if idle > 0 {
 		statuses = append(statuses, lipgloss.NewStyle().Foreground(ColorText).Render(fmt.Sprintf("○ %d idle", idle)))
+	}
+	if stopped > 0 {
+		statuses = append(statuses, lipgloss.NewStyle().Foreground(ColorTextDim).Render(fmt.Sprintf("■ %d stopped", stopped)))
 	}
 	if errored > 0 {
 		statuses = append(statuses, lipgloss.NewStyle().Foreground(ColorRed).Render(fmt.Sprintf("✕ %d error", errored)))
@@ -13817,13 +14579,13 @@ func (h *Home) renderGroupPreview(group *session.Group, width, height int) strin
 	var truncatedLines []string
 	for _, line := range lines {
 		cleanLine := tmux.StripANSI(line)
-		// #937: ansi.StringWidth + ansi.Truncate are uniseg-aware and
-		// count <codepoint>+VS16 emoji sequences as 2 cells (matching
-		// terminal rendering); runewidth.* counts them as 1 and let
-		// oversized lines overflow into the next row.
-		displayWidth := ansi.StringWidth(cleanLine)
+		// #937 v2: cellWidth + cellTruncate add keycap-cluster handling on
+		// top of ansi/uniseg's VS16 awareness, so group-preview lines
+		// containing #️⃣ 0️⃣–9️⃣ *️⃣ (jennings's pane-content reopen) stay
+		// inside the panel budget. See cellwidth.go.
+		displayWidth := cellWidth(cleanLine)
 		if displayWidth > maxWidth {
-			truncated := ansi.Truncate(cleanLine, maxWidth-3, "...")
+			truncated := cellTruncate(cleanLine, maxWidth-3, "...")
 			truncatedLines = append(truncatedLines, truncated)
 		} else {
 			truncatedLines = append(truncatedLines, line)
@@ -14017,26 +14779,14 @@ func (h *Home) finishWorktree(inst *session.Instance, sessionID, sessionTitle, b
 	return func() tea.Msg {
 		merged := false
 
-		// Step 1: Merge (if requested)
+		// Step 1: Merge (if requested). git.MergeBack handles both regular
+		// and bare-repo layouts; in bare layouts the project root has no
+		// working tree, so checkout/merge cannot run there (#891).
 		if mergeEnabled {
-			// Checkout target branch in main repo
-			cmd := exec.Command("git", "-C", repoRoot, "checkout", targetBranch)
-			checkoutOutput, err := cmd.CombinedOutput()
-			if err != nil {
+			if err := git.MergeBack(repoRoot, branchName, targetBranch); err != nil {
 				return worktreeFinishResultMsg{
 					sessionID: sessionID, sessionTitle: sessionTitle,
-					err: fmt.Errorf("failed to checkout %s: %s", targetBranch, strings.TrimSpace(string(checkoutOutput))),
-				}
-			}
-
-			// Merge the worktree branch
-			if err := git.MergeBranch(repoRoot, branchName); err != nil {
-				// Abort the merge to leave things clean
-				abortCmd := exec.Command("git", "-C", repoRoot, "merge", "--abort")
-				_ = abortCmd.Run()
-				return worktreeFinishResultMsg{
-					sessionID: sessionID, sessionTitle: sessionTitle,
-					err: fmt.Errorf("merge failed (aborted): %v", err),
+					err: fmt.Errorf("merge failed: %v", err),
 				}
 			}
 			merged = true

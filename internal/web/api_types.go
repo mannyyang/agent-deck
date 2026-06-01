@@ -6,6 +6,7 @@ import "github.com/asheshgoplani/agent-deck/internal/session"
 const (
 	ErrCodeUnauthorized     = "UNAUTHORIZED"
 	ErrCodeForbidden        = "MUTATIONS_DISABLED"
+	ErrCodeCSRF             = "CROSS_ORIGIN_BLOCKED"
 	ErrCodeNotFound         = "NOT_FOUND"
 	ErrCodeBadRequest       = "INVALID_REQUEST"
 	ErrCodeMethodNotAllowed = "METHOD_NOT_ALLOWED"
@@ -21,6 +22,7 @@ type CreateSessionRequest struct {
 	Tool        string `json:"tool"`
 	ProjectPath string `json:"projectPath"`
 	GroupPath   string `json:"groupPath,omitempty"`
+	ModelID     string `json:"modelId,omitempty"`
 }
 
 // CreateGroupRequest is the body for POST /api/groups.
@@ -38,6 +40,25 @@ type RenameGroupRequest struct {
 type SessionActionResponse struct {
 	SessionID string         `json:"sessionId"`
 	Status    session.Status `json:"status"`
+}
+
+// WorktreeFinishRequest is the body for POST /api/sessions/{id}/worktree/finish.
+// All fields are optional. Mirrors `agent-deck worktree finish` CLI flags.
+// See issue #1126.
+type WorktreeFinishRequest struct {
+	Into       string `json:"into,omitempty"`
+	NoMerge    bool   `json:"noMerge,omitempty"`
+	KeepBranch bool   `json:"keepBranch,omitempty"`
+	Force      bool   `json:"force,omitempty"`
+}
+
+// WorktreeFinishResponse is returned by POST /api/sessions/{id}/worktree/finish.
+type WorktreeFinishResponse struct {
+	SessionID     string `json:"sessionId"`
+	Branch        string `json:"branch"`
+	MergedInto    string `json:"mergedInto,omitempty"`
+	Merged        bool   `json:"merged"`
+	BranchDeleted bool   `json:"branchDeleted"`
 }
 
 // SettingsResponse is returned by GET /api/settings.

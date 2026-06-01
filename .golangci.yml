@@ -1,0 +1,104 @@
+version: "2"
+linters:
+  enable:
+    - gosec
+    - forbidigo
+  settings:
+    forbidigo:
+      # Issue #1163: raw os.Environ() in a spawn path leaks the conductor's
+      # CLAUDE_CONFIG_DIR (telegram=true scratch) + TELEGRAM_* into child
+      # claude/MCP processes, which then load the telegram plugin and fire
+      # duplicate bun pollers (409 storm). The single chokepoint is
+      # internal/childenv (ChildLaunchEnv / ForLaunch) — build child env there.
+      forbid:
+        - pattern: os\.Environ
+          msg: "build child-process env via internal/childenv (ChildLaunchEnv / ForLaunch); raw os.Environ() leaks the conductor's CLAUDE_CONFIG_DIR + TELEGRAM_* into children (#1163)"
+    gosec:
+      excludes:
+        - G104 # errors.New / fmt.Errorf — errcheck already covers real cases
+        - G306 # 0o644 on cache/log files is intentional; files containing
+        # secrets explicitly use 0o600 (see vapid_keys.go, gmail.go writeTokenAtomic).
+        - G703 # Path traversal via taint analysis — false-positive prone for
+        # internal-only path operations (worktree includes, Claude project
+        # dirs, mcppool log dirs). Real path validation lives at boundary
+        # entry points.
+    staticcheck:
+      # Only run bug-finding (SA*) checks. The quickfix (QF*), stylistic (ST*),
+      # and simplification (S1*) checks are noisy and not security-relevant; we
+      # keep them out of strict CI to focus on real correctness issues.
+      checks:
+        - SA*
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    rules:
+      - linters:
+          - errcheck
+          - gosec
+        path: _test\.go
+      # forbidigo (os.Environ ban, #1163) applies to spawn paths. Test files,
+      # the childenv chokepoint itself, and non-spawn helpers are exempt:
+      #   - internal/childenv: the one allow-listed home for os.Environ()
+      #   - internal/git: worktree setup script runner (not a claude child)
+      #   - internal/web: tmux PTY bridge env (not a claude child)
+      #   - internal/testutil + tests/eval: test scaffolding
+      - linters:
+          - forbidigo
+        path: _test\.go
+      - linters:
+          - forbidigo
+        path: internal/childenv/
+      - linters:
+          - forbidigo
+        path: internal/git/
+      - linters:
+          - forbidigo
+        path: internal/web/
+      - linters:
+          - forbidigo
+        path: internal/testutil/
+      - linters:
+          - forbidigo
+        path: tests/eval/
+      - linters:
+          - gosec
+        path: docs/
+      # Test infrastructure helpers — G204 (subprocess) and G115 (cast) are
+      # expected; these are internal-only test fixtures, never reachable in
+      # production binaries.
+      - linters:
+          - gosec
+        path: internal/testutil/
+      # Eval harness fakes (shim binaries, scripted PTY runners) — gosec
+      # subprocess/perm warnings are intentional for test scaffolding.
+      - linters:
+          - gosec
+        path: tests/eval/
+      # Docker container management — every exec.CommandContext takes "docker"
+      # as a fixed binary and an internal container name; G204 is a consistent
+      # false positive across this package.
+      - linters:
+          - gosec
+        path: internal/docker/
+      # tmux package wraps the tmux CLI: every exec.Command is "tmux" with
+      # agent-deck-constructed args (subcommand + internal -L socket plumbing).
+      # G204 fires on each call but the inputs are never external.
+      - linters:
+          - gosec
+        text: G204
+        path: internal/tmux/
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+formatters:
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$

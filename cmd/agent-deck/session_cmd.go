@@ -19,6 +19,7 @@ import (
 	"github.com/asheshgoplani/agent-deck/internal/session"
 	"github.com/asheshgoplani/agent-deck/internal/tmux"
 	"github.com/asheshgoplani/agent-deck/internal/ui"
+	"github.com/asheshgoplani/agent-deck/internal/vcs"
 )
 
 // handleSession dispatches session subcommands
@@ -51,6 +52,11 @@ func handleSession(profile string, args []string) {
 		handleSessionSetParent(profile, args[1:])
 	case "unset-parent":
 		handleSessionUnsetParent(profile, args[1:])
+	case "update":
+		// Issue #974: users expect `session update <id> --no-parent` and
+		// `session update <id> --parent <p>` to mirror typical CRUD verbs.
+		// Route to the existing canonical handlers.
+		handleSessionUpdate(profile, args[1:])
 	case "set-transition-notify":
 		handleSessionSetTransitionNotify(profile, args[1:])
 	case "set-title-lock":
@@ -61,6 +67,8 @@ func handleSession(profile string, args []string) {
 		handleSessionMove(profile, args[1:])
 	case "send":
 		handleSessionSend(profile, args[1:])
+	case "send-keys":
+		handleSessionSendKeys(profile, args[1:])
 	case "output":
 		handleSessionOutput(profile, args[1:])
 	case "search":
@@ -97,6 +105,8 @@ func printSessionHelp() {
 	fmt.Println("  search <query>          Search message content across Claude sessions")
 	fmt.Println("  set-parent <id> <parent>  Link session as sub-session of parent")
 	fmt.Println("  unset-parent <id>       Remove sub-session link")
+	fmt.Println("  update <id> --no-parent          Alias for unset-parent <id>")
+	fmt.Println("  update <id> --parent <pid>       Alias for set-parent <id> <pid>")
 	fmt.Println("  set-transition-notify <id> <on|off>  Enable/disable transition notifications")
 	fmt.Println("  set-title-lock <id> <on|off>         Lock/unlock title from Claude session-name sync (#697)")
 	fmt.Println()
@@ -598,6 +608,8 @@ func handleSessionFork(profile string, args []string) {
 	worktreeBranchLong := fs.String("worktree", "", "Create fork in git worktree for branch")
 	newBranch := fs.Bool("b", false, "Create new branch (use with --worktree)")
 	newBranchLong := fs.Bool("new-branch", false, "Create new branch")
+	withState := fs.Bool("with-state", false, "Copy parent's staged+unstaged+untracked files into the new worktree (#1029, requires -w)")
+	withStateGitignored := fs.Bool("with-state-and-gitignored", false, "Like --with-state, plus gitignored files (e.g. .env). Implies --with-state. Requires -w.")
 	sandbox := fs.Bool("sandbox", false, "Run forked session in Docker sandbox")
 	sandboxImage := fs.String("sandbox-image", "", "Docker image for sandbox (overrides config default)")
 
@@ -615,6 +627,8 @@ func handleSessionFork(profile string, args []string) {
 		fmt.Println("  agent-deck session fork my-project -t \"my-fork\" -g \"experiments\"")
 		fmt.Println("  agent-deck session fork my-project -w fork/experiment")
 		fmt.Println("  agent-deck session fork my-project -w fork/new-idea -b")
+		fmt.Println("  agent-deck session fork my-project -w fork/wip -b --with-state")
+		fmt.Println("  agent-deck session fork my-project -w fork/wip -b --with-state-and-gitignored")
 	}
 
 	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
@@ -687,38 +701,43 @@ func handleSessionFork(profile string, args []string) {
 	}
 	createNewBranch := *newBranch || *newBranchLong
 
+	// #1029: --with-state-and-gitignored implies --with-state.
+	wantState := *withState || *withStateGitignored
+	if wantState && wtBranch == "" {
+		out.Error("--with-state requires an explicit worktree branch (-w/--worktree)", ErrCodeInvalidOperation)
+		os.Exit(1)
+	}
+
 	// Handle worktree creation
 	var opts *session.ClaudeOptions
+	var worktreeType string
 	if wtBranch != "" {
-		if !git.IsGitRepoOrBareProjectRoot(inst.ProjectPath) {
-			out.Error("session path is not a git repository", ErrCodeInvalidOperation)
-			os.Exit(1)
-		}
-		repoRoot, err := git.GetWorktreeBaseRoot(inst.ProjectPath)
+		backend, err := detectAndCreateBackend(inst.ProjectPath)
 		if err != nil {
-			out.Error(fmt.Sprintf("failed to get repo root: %v", err), ErrCodeInvalidOperation)
+			out.Error(fmt.Sprintf("%v", err), ErrCodeInvalidOperation)
 			os.Exit(1)
 		}
+		worktreeType = string(backend.Type())
+		repoRoot := backend.RepoDir()
 
 		// Apply configured branch prefix before validation/existence checks
 		wtSettings := session.GetWorktreeSettings()
 		wtBranch = wtSettings.ApplyBranchPrefix(wtBranch)
 
-		if !createNewBranch && !git.BranchExists(repoRoot, wtBranch) {
+		if !createNewBranch && !backend.BranchExists(wtBranch) {
 			out.Error(fmt.Sprintf("branch '%s' does not exist (use -b to create)", wtBranch), ErrCodeInvalidOperation)
 			os.Exit(1)
 		}
 
-		worktreePath := git.WorktreePath(git.WorktreePathOptions{
+		worktreePath := backend.WorktreePath(vcs.WorktreePathOptions{
 			Branch:    wtBranch,
 			Location:  wtSettings.DefaultLocation,
-			RepoDir:   repoRoot,
 			SessionID: git.GeneratePathID(),
 			Template:  wtSettings.Template(),
 		})
 
 		// Check for an existing worktree for this branch before creating a new one
-		if existingPath, err := git.GetWorktreeForBranch(repoRoot, wtBranch); err == nil && existingPath != "" {
+		if existingPath, err := backend.GetWorktreeForBranch(wtBranch); err == nil && existingPath != "" {
 			fmt.Fprintf(os.Stderr, "Reusing existing worktree at %s for branch %s\n", existingPath, wtBranch)
 			worktreePath = existingPath
 		} else {
@@ -732,13 +751,28 @@ func handleSessionFork(profile string, args []string) {
 				os.Exit(1)
 			}
 
-			setupErr, err := git.CreateWorktreeWithSetup(repoRoot, worktreePath, wtBranch, os.Stdout, os.Stderr, session.GetWorktreeSettings().SetupTimeout())
-			if err != nil {
-				out.Error(fmt.Sprintf("worktree creation failed: %v", err), ErrCodeInvalidOperation)
-				os.Exit(1)
-			}
-			if setupErr != nil {
-				fmt.Fprintf(os.Stderr, "Warning: worktree setup script failed: %v\n", setupErr)
+			// --with-state* is git-specific (uses index/stash). Reject for jujutsu.
+			if backend.Type() == vcs.TypeGit {
+				setupErr, err := git.CreateWorktreeWithStateAndSetup(
+					repoRoot, worktreePath, wtBranch,
+					git.WorktreeStateOptions{WithState: wantState, WithIgnored: *withStateGitignored},
+					os.Stdout, os.Stderr, session.GetWorktreeSettings().SetupTimeout())
+				if err != nil {
+					out.Error(fmt.Sprintf("worktree creation failed: %v", err), ErrCodeInvalidOperation)
+					os.Exit(1)
+				}
+				if setupErr != nil {
+					fmt.Fprintf(os.Stderr, "Warning: worktree setup script failed: %v\n", setupErr)
+				}
+			} else {
+				if wantState {
+					out.Error("--with-state is only supported for git repositories", ErrCodeInvalidOperation)
+					os.Exit(1)
+				}
+				if err := backend.CreateWorktree(worktreePath, wtBranch); err != nil {
+					out.Error(fmt.Sprintf("worktree creation failed: %v", err), ErrCodeInvalidOperation)
+					os.Exit(1)
+				}
 			}
 		}
 
@@ -755,6 +789,10 @@ func handleSessionFork(profile string, args []string) {
 	if err != nil {
 		out.Error(fmt.Sprintf("failed to create fork: %v", err), ErrCodeInvalidOperation)
 		os.Exit(1)
+	}
+
+	if worktreeType != "" {
+		forkedInst.WorktreeType = worktreeType
 	}
 
 	// Apply sandbox config if requested.
@@ -947,6 +985,8 @@ func handleSessionShow(profile string, args []string) {
 		"tool":                 inst.Tool,
 		"created_at":           inst.CreatedAt.Format(time.RFC3339),
 	}
+	modelInfo := inst.LaunchModelInfo()
+	addModelInfoJSON(jsonData, modelInfo)
 
 	if inst.Command != "" {
 		jsonData["command"] = inst.Command
@@ -1005,6 +1045,17 @@ func handleSessionShow(profile string, args []string) {
 	}
 
 	sb.WriteString(fmt.Sprintf("Tool:    %s\n", inst.Tool))
+	if modelInfo.ModelID != "" {
+		if modelInfo.Model != "" {
+			sb.WriteString(fmt.Sprintf("Model:   %s\n", modelInfo.Model))
+		}
+		if modelInfo.Version != "" {
+			sb.WriteString(fmt.Sprintf("Version: %s\n", modelInfo.Version))
+		}
+		sb.WriteString(fmt.Sprintf("ModelID: %s\n", modelInfo.ModelID))
+	} else if session.SupportsLaunchModel(inst.Tool) {
+		sb.WriteString("Model:   tool default\n")
+	}
 
 	if inst.Command != "" {
 		sb.WriteString(fmt.Sprintf("Command: %s\n", inst.Command))
@@ -1107,6 +1158,8 @@ func handleSessionSet(profile string, args []string) {
 		fmt.Println("  color              Optional TUI row tint: '#RRGGBB' or ANSI '0'..'255' or '' (issue #391)")
 		fmt.Println("  claude-session-id  Claude conversation ID")
 		fmt.Println("  gemini-session-id  Gemini conversation ID")
+		fmt.Println("  account            Named account slot (#924) — resolves via [profiles.<account>.claude].config_dir; restart required")
+		fmt.Println("  idle-timeout       Auto-stop after no tmux output for this duration (#1143; Go duration: 30m, 1h, 24h; 0 disables)")
 		fmt.Println()
 		fmt.Println("Options:")
 		fs.PrintDefaults()
@@ -1484,6 +1537,74 @@ func handleSessionSetParent(profile string, args []string) {
 	})
 }
 
+// resolveSessionUpdateAlias maps `session update <id>` invocations with
+// CRUD-style flags onto the existing canonical handlers. Returns the
+// canonical verb (`unset-parent` or `set-parent`) and the rewritten args
+// that handler expects.
+//
+// Issue #974: `session update <id> --no-parent` should behave the same as
+// `session unset-parent <id>`; `session update <id> --parent <pid>` should
+// behave the same as `session set-parent <id> <pid>`. If neither flag is
+// present we route to the generic `set` handler so the verb stays useful
+// for other field updates.
+//
+// Pure function — no I/O, safe to unit test.
+func resolveSessionUpdateAlias(args []string) (canonical string, newArgs []string) {
+	hasNoParent := false
+	hasParent := false
+	parentVal := ""
+	filtered := make([]string, 0, len(args))
+
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "--no-parent" || a == "-no-parent":
+			hasNoParent = true
+		case a == "--parent" || a == "-parent":
+			if i+1 < len(args) {
+				parentVal = args[i+1]
+				i++
+			}
+			hasParent = true
+		case strings.HasPrefix(a, "--parent="):
+			parentVal = strings.TrimPrefix(a, "--parent=")
+			hasParent = true
+		case strings.HasPrefix(a, "-parent="):
+			parentVal = strings.TrimPrefix(a, "-parent=")
+			hasParent = true
+		default:
+			filtered = append(filtered, a)
+		}
+	}
+
+	switch {
+	case hasNoParent:
+		// `set-parent` and `--no-parent` together is contradictory; prefer
+		// the explicit detach (`--no-parent`) — matches the user's stated
+		// intent in the issue reproducer.
+		return "unset-parent", filtered
+	case hasParent:
+		return "set-parent", append(filtered, parentVal)
+	default:
+		return "set", filtered
+	}
+}
+
+// handleSessionUpdate dispatches `session update <id> [flags]` to the
+// appropriate canonical handler. See resolveSessionUpdateAlias for the
+// mapping rationale.
+func handleSessionUpdate(profile string, args []string) {
+	canonical, rewritten := resolveSessionUpdateAlias(args)
+	switch canonical {
+	case "unset-parent":
+		handleSessionUnsetParent(profile, rewritten)
+	case "set-parent":
+		handleSessionSetParent(profile, rewritten)
+	default:
+		handleSessionSet(profile, rewritten)
+	}
+}
+
 // handleSessionUnsetParent removes the sub-session link
 func handleSessionUnsetParent(profile string, args []string) {
 	fs := flag.NewFlagSet("session unset-parent", flag.ExitOnError)
@@ -1741,7 +1862,7 @@ func handleSessionSend(profile string, args []string) {
 	wait := fs.Bool("wait", false, "Block until agent finishes processing, then print output")
 	stream := fs.Bool("stream", false, "Stream JSONL events (Claude only) to stdout instead of returning a snapshot")
 	draft := fs.Bool("draft", false, "Pre-fill the prompt without submitting (incompatible with --wait/--stream/--no-wait)")
-	timeout := fs.Duration("timeout", 10*time.Minute, "Max time to wait for completion (used with --wait)")
+	timeout := fs.Duration("timeout", 10*time.Minute, "Max time to wait for the agent to become ready and (with --wait) to finish processing")
 	streamIdle := fs.Duration("stream-idle", 10*time.Second, "Max idle time before --stream aborts with error")
 	streamCharBudget := fs.Int("stream-char-budget", 4000, "Char budget for text flush in --stream mode")
 	streamToolBudget := fs.Int("stream-tool-budget", 3, "Tool-event budget for text flush in --stream mode")
@@ -1821,6 +1942,17 @@ func handleSessionSend(profile string, args []string) {
 		os.Exit(1)
 	}
 
+	if shouldSkipConductorHeartbeatSend(inst, message) {
+		out.Success(fmt.Sprintf("Skipped heartbeat for '%s'", inst.Title), map[string]interface{}{
+			"success":       true,
+			"skipped":       true,
+			"session_id":    inst.ID,
+			"session_title": inst.Title,
+			"message":       message,
+		})
+		return
+	}
+
 	// Get tmux session
 	tmuxSess := inst.GetTmuxSession()
 	if tmuxSess == nil {
@@ -1828,11 +1960,27 @@ func handleSessionSend(profile string, args []string) {
 		os.Exit(1)
 	}
 
-	// Wait for agent to be ready (unless --no-wait is specified)
+	// Wait for agent to be ready (unless --no-wait is specified).
+	// Issue #957: honor --timeout for the readiness phase too, not just the
+	// post-ready completion wait. Otherwise --timeout 5m against a busy
+	// recipient silently fails at ~80s.
 	if !*noWait {
-		if err := waitForAgentReady(tmuxSess, inst.Tool); err != nil {
+		if err := waitForAgentReady(tmuxSess, inst.Tool, *timeout); err != nil {
 			out.Error(fmt.Sprintf("timeout waiting for agent: %v", err), ErrCodeInvalidOperation)
 			os.Exit(1)
+		}
+		// Issue #966: after a restart, Claude reaches "waiting" + composer
+		// visible before its slash-command parser registers. Bare `/foo`
+		// in that window is silently dropped. Hold back only when needed.
+		if shouldGateSlashRegistration(inst.Tool, message) {
+			slashTimeout := *timeout
+			if slashTimeout <= 0 || slashTimeout > 10*time.Second {
+				slashTimeout = 10 * time.Second
+			}
+			if err := waitForSlashCommandReady(tmuxSess, inst.Tool, slashTimeout); err != nil {
+				out.Error(fmt.Sprintf("timeout waiting for slash-command registration: %v", err), ErrCodeInvalidOperation)
+				os.Exit(1)
+			}
 		}
 	}
 
@@ -1953,6 +2101,32 @@ func defaultSendOptions() sendRetryOptions {
 		checkDelay:     300 * time.Millisecond,
 		verifyDelivery: true,
 	}
+}
+
+func shouldSkipConductorHeartbeatSend(inst *session.Instance, message string) bool {
+	if inst == nil || !session.IsConductorHeartbeatMessage(message) {
+		return false
+	}
+	name := strings.TrimPrefix(inst.Title, session.ConductorSessionTitlePrefix)
+	if name == inst.Title || name == "" {
+		return false
+	}
+	meta, err := session.LoadConductorMeta(name)
+	if err != nil {
+		return false
+	}
+	idleMinutes := meta.GetHeartbeatIdleMinutes()
+	if idleMinutes <= 0 {
+		return false
+	}
+	lastActivity, err := session.GetConductorLastActivity(name, meta.Profile)
+	if err != nil {
+		return false
+	}
+	if lastActivity.IsZero() {
+		return false
+	}
+	return time.Since(lastActivity) >= time.Duration(idleMinutes)*time.Minute
 }
 
 // sendWithRetry sends a message atomically and retries Enter if the agent
@@ -2195,14 +2369,13 @@ func sendWithRetryTarget(target sendRetryTarget, message string, skipVerify bool
 					waitingNoActivityChecks = 0
 					_ = target.SendCtrlC()
 					time.Sleep(200 * time.Millisecond)
-					if resendErr := target.SendKeysAndEnter(message); resendErr == nil {
-						// A successful resend is not yet evidence of receipt
-						// — the next iteration must still observe a positive
-						// signal — but we record the attempt so verifyDelivery
-						// can distinguish "send pipe ever fired" from "never
-						// even acked". Intentionally NOT setting
-						// sawDeliveryEvidence here.
-					}
+					// A successful resend is not yet evidence of receipt — the
+					// next iteration must still observe a positive signal — so
+					// we intentionally do NOT set sawDeliveryEvidence here, even
+					// when SendKeysAndEnter returns nil. The send attempt is
+					// recorded only so verifyDelivery can distinguish "pipe ever
+					// fired" from "never even acked".
+					_ = target.SendKeysAndEnter(message)
 					continue
 				}
 
@@ -2257,17 +2430,38 @@ func messageDeliveryToken(message string) string {
 	return trimmed
 }
 
+// agentReadyChecker abstracts the tmux surface that waitForAgentReady needs.
+// Lets tests exercise the readiness/timeout loop without a real tmux session.
+// *tmux.Session satisfies this interface naturally.
+type agentReadyChecker interface {
+	GetStatus() (string, error)
+	CapturePaneFresh() (string, error)
+}
+
 // waitForAgentReady waits for Claude/Gemini/other agents to be ready for input
-// Uses status detection: waits for "active" → "waiting" transition
-func waitForAgentReady(tmuxSess *tmux.Session, tool string) error {
+// Uses status detection: waits for "active" → "waiting" transition.
+//
+// Issue #957: before v1.9.x this loop was hardcoded to 80s and silently
+// overrode the caller's --timeout. `--timeout` now bounds the agent-ready
+// phase too, so `session send --timeout 5m` against a busy recipient actually
+// waits up to 5m for readiness before giving up.
+func waitForAgentReady(target agentReadyChecker, tool string, timeout time.Duration) error {
+	const pollInterval = 200 * time.Millisecond
+	if timeout <= 0 {
+		timeout = 80 * time.Second // preserve historical default if caller passes zero
+	}
+	maxAttempts := int(timeout / pollInterval)
+	if maxAttempts < 1 {
+		maxAttempts = 1
+	}
+
 	sawActive := false
 	readyCount := 0
-	maxAttempts := 400 // 80 seconds max (400 * 200ms)
 
 	for attempt := 0; attempt < maxAttempts; attempt++ {
-		time.Sleep(200 * time.Millisecond)
+		time.Sleep(pollInterval)
 
-		status, err := tmuxSess.GetStatus()
+		status, err := target.GetStatus()
 		if err != nil {
 			readyCount = 0
 			continue
@@ -2291,7 +2485,7 @@ func waitForAgentReady(tmuxSess *tmux.Session, tool string) error {
 		alreadyReady := readyCount >= 10 && attempt >= 15 // At least 3s elapsed
 		if (sawActive && (status == "waiting" || status == "idle")) || alreadyReady {
 			if tool == "claude" {
-				if rawContent, captureErr := tmuxSess.CapturePaneFresh(); captureErr == nil && !send.HasCurrentComposerPrompt(tmux.StripANSI(rawContent)) {
+				if rawContent, captureErr := target.CapturePaneFresh(); captureErr == nil && !send.HasCurrentComposerPrompt(tmux.StripANSI(rawContent)) {
 					// Claude can report waiting before the interactive prompt is visible.
 					// Keep polling until the prompt line is present.
 					continue
@@ -2300,7 +2494,7 @@ func waitForAgentReady(tmuxSess *tmux.Session, tool string) error {
 			// Gate Codex sends on prompt readiness: wait for "codex>" or
 			// "Continue?" to be visible before considering the agent ready.
 			if tool == "codex" {
-				if rawContent, captureErr := tmuxSess.CapturePaneFresh(); captureErr == nil {
+				if rawContent, captureErr := target.CapturePaneFresh(); captureErr == nil {
 					content := tmux.StripANSI(rawContent)
 					detector := tmux.NewPromptDetector("codex")
 					if !detector.HasPrompt(content) {
@@ -2314,7 +2508,71 @@ func waitForAgentReady(tmuxSess *tmux.Session, tool string) error {
 		}
 	}
 
-	return fmt.Errorf("agent not ready after 80 seconds")
+	return fmt.Errorf("agent not ready after %s", timeout)
+}
+
+// shouldGateSlashRegistration reports whether a send needs to wait for
+// Claude's slash-command parser to finish registering before relaying.
+//
+// Issue #966: after `session restart`, Claude reaches "waiting" with the
+// composer prompt visible *before* its slash-command router is armed. A
+// bare `/foo` sent in that window is silently dropped. The gate fires only
+// for the trigger condition — Claude tool plus a bare slash payload — so
+// conversational text and non-Claude tools don't pay the latency.
+func shouldGateSlashRegistration(tool, message string) bool {
+	if tool != "claude" {
+		return false
+	}
+	trimmed := strings.TrimLeft(message, " \t")
+	if trimmed == "" {
+		return false
+	}
+	return strings.HasPrefix(trimmed, "/")
+}
+
+// waitForSlashCommandReady polls the pane until the composer prompt has been
+// continuously visible for the slash-registration settle window, then returns.
+// Callers must have already passed waitForAgentReady; this is an additional
+// hold-back specifically for the #966 race.
+//
+// The function probes (rather than blind-sleeps) so a long-already-ready
+// Claude returns near-immediately on retries, while a freshly restarted
+// Claude pays the full settle window.
+func waitForSlashCommandReady(target agentReadyChecker, tool string, timeout time.Duration) error {
+	const pollInterval = 100 * time.Millisecond
+	// Eight stable composer observations (~800ms) is the empirical floor
+	// for Claude to finish registering its slash-command parser after the
+	// composer first renders. Bumping this is a no-op for healthy sessions
+	// (we early-return as soon as stability is met); it only delays the
+	// first send after a restart.
+	const minStableHits = 8
+
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	deadline := time.Now().Add(timeout)
+
+	stable := 0
+	for time.Now().Before(deadline) {
+		time.Sleep(pollInterval)
+
+		rawContent, err := target.CapturePaneFresh()
+		if err != nil {
+			stable = 0
+			continue
+		}
+		content := tmux.StripANSI(rawContent)
+		if !send.HasCurrentComposerPrompt(content) {
+			stable = 0
+			continue
+		}
+		stable++
+		if stable >= minStableHits {
+			return nil
+		}
+	}
+
+	return fmt.Errorf("slash-command registration not ready after %s (tool=%s)", timeout, tool)
 }
 
 // statusChecker abstracts tmux status polling so waitForCompletion is testable.
@@ -2528,6 +2786,11 @@ func handleSessionOutput(profile string, args []string) {
 	quiet := fs.Bool("quiet", false, "Minimal output")
 	quietShort := fs.Bool("q", false, "Minimal output (short)")
 	copyFlag := fs.Bool("copy", false, "Copy output to system clipboard")
+	// #1101: --pane returns the raw tmux capture-pane content (with ANSI escapes
+	// and the tool's full UI chrome) instead of the parsed transcript "last
+	// response". The local TUI preview uses capture-pane; remote sessions
+	// fetched via SSH need this same content to render claude-formatted output.
+	paneFlag := fs.Bool("pane", false, "Return tmux capture-pane content (full UI with ANSI)")
 
 	fs.Usage = func() {
 		fmt.Println("Usage: agent-deck session output [id|title] [options]")
@@ -2572,6 +2835,32 @@ func handleSessionOutput(profile string, args []string) {
 			inst.ClaudeSessionID = freshID
 			inst.ClaudeDetectedAt = time.Now()
 		}
+	}
+
+	// #1101: --pane short-circuits the transcript path and returns the live
+	// tmux pane capture so remote previews can render the same claude-formatted
+	// content the local preview shows. We still emit a ResponseOutput-shaped
+	// JSON so the wire format is unchanged.
+	if *paneFlag {
+		paneContent, paneErr := inst.PreviewFull()
+		if paneErr != nil {
+			out.Error(fmt.Sprintf("failed to capture pane: %v", paneErr), ErrCodeInvalidOperation)
+			os.Exit(1)
+		}
+		jsonData := map[string]interface{}{
+			"success":       true,
+			"session_id":    inst.ID,
+			"session_title": inst.Title,
+			"tool":          inst.Tool,
+			"role":          "pane",
+			"content":       paneContent,
+		}
+		if quietMode {
+			fmt.Println(paneContent)
+			return
+		}
+		out.Print(paneContent, jsonData)
+		return
 	}
 
 	// Get the last response (best-effort fallback for smoother CLI reads)

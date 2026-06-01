@@ -521,11 +521,14 @@ func initStyles() {
 		"claude":   lipgloss.NewStyle().Foreground(ColorOrange),
 		"gemini":   lipgloss.NewStyle().Foreground(ColorPurple),
 		"codex":    lipgloss.NewStyle().Foreground(ColorCyan),
+		"copilot":  lipgloss.NewStyle().Foreground(ColorAccent),
+		"hermes":   lipgloss.NewStyle().Foreground(ColorYellow),
 		"pi":       lipgloss.NewStyle().Foreground(ColorAccent),
 		"aider":    lipgloss.NewStyle().Foreground(ColorRed),
 		"cursor":   lipgloss.NewStyle().Foreground(ColorAccent),
 		"shell":    lipgloss.NewStyle().Foreground(ColorText),
 		"opencode": lipgloss.NewStyle().Foreground(ColorText),
+		"crush":    lipgloss.NewStyle().Foreground(ColorPurple),
 	}
 
 	// DefaultToolStyle
@@ -599,10 +602,16 @@ func ToolIcon(tool string) string {
 		return IconOpenCode
 	case "codex":
 		return IconCodex
-	case "pi":
-		return IconPi
+	case "copilot":
+		return "🐙"
+	case "crush":
+		return "💘"
 	case "cursor":
 		return "📝"
+	case "hermes":
+		return "☤"
+	case "pi":
+		return IconPi
 	case "shell":
 		return IconShell
 	default:
@@ -620,12 +629,18 @@ func ToolColor(tool string) lipgloss.Color {
 		return ColorPurple // Google AI purple
 	case "codex":
 		return ColorCyan // Light blue for OpenAI
+	case "copilot":
+		return ColorAccent // Blue for GitHub Copilot
+	case "crush":
+		return ColorPurple // Pink/magenta for Charm Crush
+	case "cursor":
+		return ColorAccent // Blue for Cursor
+	case "hermes":
+		return ColorYellow // Gold for Hermes Agent
 	case "pi":
 		return ColorAccent
 	case "aider":
 		return ColorRed // Red for Aider
-	case "cursor":
-		return ColorAccent // Blue for Cursor
 	default:
 		return ColorTextDim // Default gray
 	}

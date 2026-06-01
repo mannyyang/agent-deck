@@ -108,6 +108,27 @@ func emitScrollbackClear(w io.Writer) {
 	_, _ = io.WriteString(w, itermClearScrollback)
 }
 
+// StartAttachPTY starts cmd attached to a new PTY pre-sized to tty's current
+// dimensions.
+//
+// #1167: tmux clients connect at their PTY's size. A detached `new-session`
+// (no -x/-y) is born at tmux's 80x24 default-size, and a bare pty.Start creates
+// the attach client's PTY at the same 80x24 default — so window-size=largest
+// pins the window to 80 cols, ~half of a wide terminal, until an async SIGWINCH
+// grows it. Reading the controlling terminal's real size up front and starting
+// the PTY with it makes the client full-width from frame one.
+//
+// When tty is not a terminal (size probe fails), it falls back to a plain start
+// at the default size: a degraded attach is still better than no attach.
+func StartAttachPTY(cmd *exec.Cmd, tty *os.File) (*os.File, error) {
+	if tty != nil {
+		if ws, err := pty.GetsizeFull(tty); err == nil && ws.Cols > 0 && ws.Rows > 0 {
+			return pty.StartWithSize(cmd, ws)
+		}
+	}
+	return pty.Start(cmd)
+}
+
 // Attach attaches to the tmux session with full PTY support.
 // The configured detach key (default Ctrl+Q) will detach and return to the caller.
 // Pass an optional detachByte to override the default (0x11 / Ctrl+Q).
@@ -143,6 +164,15 @@ func (s *Session) Attach(ctx context.Context, detachByte ...byte) error {
 	// it off at runtime. AGENTDECK_ITERM_BADGE=1 ad-hoc enables.
 	emitITermBadge(os.Stdout, s.DisplayName, s.terminalChromeIsEnabled())
 
+	// #1114: subscribe to mid-attach badge updates from the Claude
+	// rename hook. The hook subprocess has no controlling tty (Claude
+	// spawns hooks detached via setsid), so its EmitITermBadgeViaTty
+	// path silently no-ops. Instead, the hook drops a file under
+	// ~/.agent-deck/badge-updates/ and this goroutine — which DOES own
+	// the outer iTerm2 tty via os.Stdout — re-emits the OSC. Stopped
+	// by the ctx cancel that fires in cleanupAttach.
+	go WatchBadgeUpdates(ctx, s.Name, os.Stdout, s.terminalChromeIsEnabled(), nil)
+
 	// Create context with cancel for detach
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -160,8 +190,9 @@ func (s *Session) Attach(ctx context.Context, detachByte ...byte) error {
 	// SIGINT is restored in cleanupAttach() via signal.Reset(syscall.SIGINT).
 	signal.Ignore(syscall.SIGINT)
 
-	// Start command with PTY
-	ptmx, err := pty.Start(cmd)
+	// Start command with PTY, pre-sized to the controlling terminal so the
+	// tmux client connects full-width from frame one (#1167).
+	ptmx, err := StartAttachPTY(cmd, os.Stdin)
 	if err != nil {
 		signal.Reset(syscall.SIGINT)
 		return fmt.Errorf("failed to start pty: %w", err)

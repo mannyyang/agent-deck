@@ -207,6 +207,10 @@ func (e *Engine) Start() error {
 			continue
 		}
 
+		// #nosec G118 -- adapterCancel is preserved on entry.cancel; the parent
+		// context e.ctx is canceled by Stop() (see line 594), which propagates
+		// to all derived adapter contexts. Explicit per-entry cancel is reserved
+		// for selective restart in future hot-reload work.
 		adapterCtx, adapterCancel := context.WithCancel(e.ctx)
 		entry.cancel = adapterCancel
 
@@ -432,6 +436,7 @@ func (e *Engine) writerLoop() {
 				}
 
 				// Non-blocking send to routedEventCh for TUI consumption.
+				env.event.RoutedTo = routedTo
 				select {
 				case e.routedEventCh <- env.event:
 				default:

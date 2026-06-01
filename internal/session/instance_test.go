@@ -1459,6 +1459,94 @@ func TestBuildCodexCommand_UsesConfiguredCommandForBuiltinCodex(t *testing.T) {
 	}
 }
 
+func TestBuildCodexCommand_ModelOption(t *testing.T) {
+	tmpDir := t.TempDir()
+	originalHome := os.Getenv("HOME")
+	os.Setenv("HOME", tmpDir)
+	defer os.Setenv("HOME", originalHome)
+	ClearUserConfigCache()
+	defer ClearUserConfigCache()
+
+	inst := NewInstanceWithTool("codex-model", "/tmp/codex-model", "codex")
+	if err := inst.SetCodexOptions(&CodexOptions{Model: "gpt-5"}); err != nil {
+		t.Fatalf("SetCodexOptions: %v", err)
+	}
+
+	cmd := inst.buildCodexCommand("codex")
+	if !strings.Contains(cmd, "--model gpt-5") {
+		t.Fatalf("buildCodexCommand should include selected model, got %q", cmd)
+	}
+}
+
+func TestApplyLaunchModel_SetsToolSpecificFields(t *testing.T) {
+	tmpDir := t.TempDir()
+	originalHome := os.Getenv("HOME")
+	os.Setenv("HOME", tmpDir)
+	defer os.Setenv("HOME", originalHome)
+	ClearUserConfigCache()
+	defer ClearUserConfigCache()
+
+	tests := []struct {
+		name string
+		tool string
+		want func(t *testing.T, inst *Instance)
+	}{
+		{
+			name: "claude",
+			tool: "claude",
+			want: func(t *testing.T, inst *Instance) {
+				t.Helper()
+				opts := inst.GetClaudeOptions()
+				if opts == nil || opts.Model != "claude-sonnet-4-6" {
+					t.Fatalf("Claude model = %#v, want claude-sonnet-4-6", opts)
+				}
+			},
+		},
+		{
+			name: "gemini",
+			tool: "gemini",
+			want: func(t *testing.T, inst *Instance) {
+				t.Helper()
+				if inst.GeminiModel != "claude-sonnet-4-6" {
+					t.Fatalf("GeminiModel = %q, want claude-sonnet-4-6", inst.GeminiModel)
+				}
+			},
+		},
+		{
+			name: "codex",
+			tool: "codex",
+			want: func(t *testing.T, inst *Instance) {
+				t.Helper()
+				opts := inst.GetCodexOptions()
+				if opts == nil || opts.Model != "claude-sonnet-4-6" {
+					t.Fatalf("Codex model = %#v, want claude-sonnet-4-6", opts)
+				}
+			},
+		},
+		{
+			name: "opencode",
+			tool: "opencode",
+			want: func(t *testing.T, inst *Instance) {
+				t.Helper()
+				opts := inst.GetOpenCodeOptions()
+				if opts == nil || opts.Model != "claude-sonnet-4-6" {
+					t.Fatalf("OpenCode model = %#v, want claude-sonnet-4-6", opts)
+				}
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			inst := NewInstanceWithTool("model-"+tc.tool, "/tmp/model", tc.tool)
+			if err := inst.ApplyLaunchModel("claude-sonnet-4-6"); err != nil {
+				t.Fatalf("ApplyLaunchModel: %v", err)
+			}
+			tc.want(t, inst)
+		})
+	}
+}
+
 func TestBuildCodexCommand_ConfiguredCommandResume(t *testing.T) {
 	tmpDir := t.TempDir()
 	originalHome := os.Getenv("HOME")
@@ -1647,6 +1735,34 @@ func TestBuildCodexCommand_InlineCodexHomeDropsStaleID(t *testing.T) {
 	}
 }
 
+func TestBuildCursorCommand(t *testing.T) {
+	inst := NewInstanceWithTool("c1", "/tmp/c1", "cursor")
+	inst.Command = ""
+	got := inst.buildCursorCommand(inst.Command, false)
+	if !strings.Contains(got, "cursor agent") {
+		t.Fatalf("fresh session: want cursor agent in command, got %q", got)
+	}
+	if strings.Contains(strings.ToLower(got), "--continue") {
+		t.Fatalf("fresh session: should not add --continue, got %q", got)
+	}
+
+	got = inst.buildCursorCommand("cursor agent", true)
+	if !strings.Contains(strings.ToLower(got), "--continue") {
+		t.Fatalf("restart: want --continue, got %q", got)
+	}
+
+	inst.Command = "cursor agent --continue"
+	got = inst.buildCursorCommand(inst.Command, true)
+	if strings.Count(strings.ToLower(got), "--continue") != 1 {
+		t.Fatalf("duplicate --continue: got %q", got)
+	}
+
+	inst.Tool = "shell"
+	if passthrough := inst.buildCursorCommand("echo hi", true); passthrough != "echo hi" {
+		t.Fatalf("non-cursor tool should passthrough, got %q", passthrough)
+	}
+}
+
 // writeFakeCodexRollout creates an empty rollout JSONL under
 // codexHome/sessions/YYYY/MM/DD/ matching the layout buildCodexCommand
 // globs against (Issue #756).
@@ -1777,6 +1893,109 @@ func TestBuildCodexCommand_RespectsCodexHomeForRolloutCheck(t *testing.T) {
 	cmd := inst.buildCodexCommand(inst.Command)
 	if !strings.Contains(cmd, "resume "+id) {
 		t.Fatalf("expected resume under CODEX_HOME=%s, got %q", codexHome, cmd)
+	}
+}
+
+func TestBuildCodexCommand_UsesProfileCodexConfigDirAsCodexHome(t *testing.T) {
+	tmpDir := t.TempDir()
+	originalHome := os.Getenv("HOME")
+	_ = os.Setenv("HOME", tmpDir)
+	defer func() { _ = os.Setenv("HOME", originalHome) }()
+	originalCodexHome := os.Getenv("CODEX_HOME")
+	_ = os.Unsetenv("CODEX_HOME")
+	defer func() {
+		if originalCodexHome != "" {
+			_ = os.Setenv("CODEX_HOME", originalCodexHome)
+		} else {
+			_ = os.Unsetenv("CODEX_HOME")
+		}
+	}()
+	originalProfile := os.Getenv("AGENTDECK_PROFILE")
+	_ = os.Setenv("AGENTDECK_PROFILE", "work")
+	defer func() {
+		if originalProfile != "" {
+			_ = os.Setenv("AGENTDECK_PROFILE", originalProfile)
+		} else {
+			_ = os.Unsetenv("AGENTDECK_PROFILE")
+		}
+	}()
+	ClearUserConfigCache()
+
+	agentDeckDir := filepath.Join(tmpDir, ".agent-deck")
+	if err := os.MkdirAll(agentDeckDir, 0o700); err != nil {
+		t.Fatalf("mkdir %s: %v", agentDeckDir, err)
+	}
+	cfg := &UserConfig{
+		Profiles: map[string]ProfileSettings{
+			"work": {Codex: ProfileCodexSettings{ConfigDir: "~/.codex-work"}},
+		},
+	}
+	if err := SaveUserConfig(cfg); err != nil {
+		t.Fatalf("SaveUserConfig: %v", err)
+	}
+	ClearUserConfigCache()
+
+	inst := NewInstanceWithTool("work-codex", "/tmp/work-codex", "codex")
+	cmd := inst.buildCodexCommand(inst.Command)
+	want := "CODEX_HOME=" + filepath.Join(tmpDir, ".codex-work")
+	if !strings.Contains(cmd, want) {
+		t.Fatalf("expected command to include %q, got %q", want, cmd)
+	}
+}
+
+func TestBuildCodexCommand_CreatesMissingExplicitCodexHomeDir(t *testing.T) {
+	tmpDir := t.TempDir()
+	originalHome := os.Getenv("HOME")
+	_ = os.Setenv("HOME", tmpDir)
+	defer func() { _ = os.Setenv("HOME", originalHome) }()
+	originalCodexHome := os.Getenv("CODEX_HOME")
+	_ = os.Unsetenv("CODEX_HOME")
+	defer func() {
+		if originalCodexHome != "" {
+			_ = os.Setenv("CODEX_HOME", originalCodexHome)
+		} else {
+			_ = os.Unsetenv("CODEX_HOME")
+		}
+	}()
+	originalProfile := os.Getenv("AGENTDECK_PROFILE")
+	_ = os.Setenv("AGENTDECK_PROFILE", "personal")
+	defer func() {
+		if originalProfile != "" {
+			_ = os.Setenv("AGENTDECK_PROFILE", originalProfile)
+		} else {
+			_ = os.Unsetenv("AGENTDECK_PROFILE")
+		}
+	}()
+	ClearUserConfigCache()
+
+	agentDeckDir := filepath.Join(tmpDir, ".agent-deck")
+	if err := os.MkdirAll(agentDeckDir, 0o700); err != nil {
+		t.Fatalf("mkdir %s: %v", agentDeckDir, err)
+	}
+	cfg := &UserConfig{
+		Profiles: map[string]ProfileSettings{
+			"personal": {Codex: ProfileCodexSettings{ConfigDir: "~/.codex-personal"}},
+		},
+	}
+	if err := SaveUserConfig(cfg); err != nil {
+		t.Fatalf("SaveUserConfig: %v", err)
+	}
+	ClearUserConfigCache()
+
+	codexHome := filepath.Join(tmpDir, ".codex-personal")
+	if _, err := os.Stat(codexHome); !os.IsNotExist(err) {
+		t.Fatalf("precondition failed: %s should not exist yet", codexHome)
+	}
+
+	inst := NewInstanceWithTool("personal-codex", "/tmp/personal-codex", "codex")
+	_ = inst.buildCodexCommand(inst.Command)
+
+	info, err := os.Stat(codexHome)
+	if err != nil {
+		t.Fatalf("expected codex home to be created, stat err: %v", err)
+	}
+	if !info.IsDir() {
+		t.Fatalf("expected %s to be a directory", codexHome)
 	}
 }
 
@@ -2893,6 +3112,15 @@ func TestBuildClaudeExtraFlags_NilOpts(t *testing.T) {
 	}
 	if strings.Contains(flags, "--allow-dangerously-skip-permissions") {
 		t.Errorf("nil opts should not add permission flags, got %q", flags)
+	}
+}
+
+func TestBuildClaudeExtraFlags_Model(t *testing.T) {
+	inst := &Instance{Tool: "claude"}
+	flags := inst.buildClaudeExtraFlags(&ClaudeOptions{Model: "claude-sonnet-4-6"})
+
+	if !strings.Contains(flags, "--model claude-sonnet-4-6") {
+		t.Fatalf("expected --model flag, got %q", flags)
 	}
 }
 

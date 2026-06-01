@@ -53,7 +53,43 @@ var hostHasTelegramConductor = func() bool {
 	if err != nil || cfg == nil {
 		return false
 	}
-	return strings.TrimSpace(cfg.Conductor.Telegram.Token) != ""
+	return configDeclaresTelegram(cfg)
+}
+
+// configDeclaresTelegram reports whether the host runs a telegram conductor
+// under EITHER the legacy single-bot topology OR the modern per-conductor
+// env_file topology (issue #1163).
+//
+// The legacy field `[conductor.telegram].token` is empty under the 7-bot
+// setup — each conductor declares its bot via a `[conductors.<name>].claude.env_file`
+// whose .envrc exports TELEGRAM_STATE_DIR. Reading only the legacy field left
+// the scratch-pin gate (#759/#1137) permanently disarmed, so conductor-spawned
+// children inherited the conductor's telegram=true CLAUDE_CONFIG_DIR and fired
+// duplicate default-bot pollers. Detecting the modern topology re-arms the gate
+// for every spawn path.
+func configDeclaresTelegram(cfg *UserConfig) bool {
+	if cfg == nil {
+		return false
+	}
+	// Legacy single-bot token.
+	if strings.TrimSpace(cfg.Conductor.Telegram.Token) != "" {
+		return true
+	}
+	// Modern topology: any conductor whose env_file defines TELEGRAM_STATE_DIR.
+	for _, c := range cfg.Conductors {
+		ef := strings.TrimSpace(c.Claude.EnvFile)
+		if ef == "" {
+			continue
+		}
+		data, err := os.ReadFile(ExpandPath(ef))
+		if err != nil {
+			continue // missing/unreadable env_file is not a telegram declaration
+		}
+		if strings.Contains(string(data), "TELEGRAM_STATE_DIR") {
+			return true
+		}
+	}
+	return false
 }
 
 // NeedsWorkerScratchConfigDir is true when a scratch CLAUDE_CONFIG_DIR
@@ -62,10 +98,19 @@ var hostHasTelegramConductor = func() bool {
 //  2. Per-session plugin enablement (RFC docs/rfc/PLUGIN_ATTACH.md) —
 //     write enabledPlugins[<id>] = true without contaminating the ambient
 //     profile or peer sessions.
+//  3. GLOBAL_ANTIPATTERN guard (issue #941) — channel-owning conductor with
+//     `enabledPlugins.telegram=true` already in the ambient settings.json.
+//     The TelegramValidator surfaces this as DOUBLE_LOAD but warnings
+//     don't prevent the spawn; the scratch pins telegram off so --channels
+//     is the only activation source and exactly one bun poller runs.
 //
-// When both fire, EnsureWorkerScratchConfigDir combines the deny+allow lists.
+// When multiple reasons fire, EnsureWorkerScratchConfigDir combines the
+// deny+allow lists.
 func (i *Instance) NeedsWorkerScratchConfigDir() bool {
-	return needsScratchForTelegram(i) || needsScratchForExplicitPlugins(i)
+	return needsScratchForTelegram(i) ||
+		needsScratchForExplicitPlugins(i) ||
+		needsScratchForGlobalChannelConflict(i) ||
+		needsScratchForTelegramChannelOwner(i)
 }
 
 func needsScratchForTelegram(i *Instance) bool {
@@ -82,9 +127,96 @@ func needsScratchForExplicitPlugins(i *Instance) bool {
 	return len(i.Plugins) > 0
 }
 
+// needsScratchForGlobalChannelConflict fires for issue #941: a
+// channel-owning conductor session whose ambient profile has
+// `enabledPlugins."telegram@claude-plugins-official" = true`.
+// Without intervention, claude loads the plugin twice (once from the
+// global setting, once from --channels) and two bun pollers race for
+// the same bot token → 409 Conflict.
+//
+// We can't just rely on the user disabling the global flag — the rule
+// is documented but not enforced. This predicate detects the topology
+// and triggers a scratch CLAUDE_CONFIG_DIR that pins telegram off.
+// --channels remains the only activation, yielding exactly one poller.
+func needsScratchForGlobalChannelConflict(i *Instance) bool {
+	if i == nil || i.Tool != "claude" {
+		return false
+	}
+	if !sessionHasTelegramChannel(i) {
+		return false
+	}
+	sourceDir := GetClaudeConfigDirForInstance(i)
+	if sourceDir == "" {
+		return false
+	}
+	return globalTelegramEnablementSet(sourceDir)
+}
+
+func sessionHasTelegramChannel(i *Instance) bool {
+	for _, ch := range i.Channels {
+		if strings.HasPrefix(ch, telegramChannelPrefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// globalTelegramEnablementSet reports whether the source profile's
+// settings.json has enabledPlugins."telegram@claude-plugins-official"=true.
+// Missing files, parse errors, or absent keys all return false — we
+// only fire the scratch guard when the antipattern is unambiguously present.
+func globalTelegramEnablementSet(sourceProfileDir string) bool {
+	data, err := os.ReadFile(filepath.Join(sourceProfileDir, "settings.json"))
+	if err != nil {
+		return false
+	}
+	var parsed map[string]interface{}
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		return false
+	}
+	plugins, _ := parsed["enabledPlugins"].(map[string]interface{})
+	v, ok := plugins[telegramPluginID].(bool)
+	return ok && v
+}
+
 func computeDenyList(i *Instance) []string {
-	if needsScratchForTelegram(i) {
+	// Issue #1134: channel-owning sessions MUST keep their channel
+	// plugin enabled — `--channels` is a routing/wiring directive and
+	// claude only opens the MCP stdio transport when the plugin is
+	// enabled in settings.json. Denying telegram here causes the bun
+	// child to spawn in task-mode (no MCP handshake) and crash-respawn,
+	// taking Telegram inbound offline for the conductor.
+	// computeChannelPluginAllowList re-enables the plugin in scratch
+	// settings.json; we must also stop denying it here so the deny
+	// pass doesn't overwrite the allow.
+	if sessionHasTelegramChannel(i) {
+		return nil
+	}
+	if needsScratchForTelegram(i) || needsScratchForGlobalChannelConflict(i) {
 		return []string{telegramPluginID}
+	}
+	return nil
+}
+
+// computeChannelPluginAllowList returns plugin IDs that this session
+// references via .Channels and MUST therefore be ENABLED in the
+// scratch settings.json. Channel plugins are wired by claude's
+// `--channels` arg AFTER the plugin's MCP server starts; if the plugin
+// is disabled in settings.json the server never starts, `--channels`
+// has nothing to wire, and bun crashes in a respawn loop. Issue #1134.
+//
+// Today only telegram is a channel plugin; if other channel plugins
+// land in the future, add their (channel-prefix, plugin-id) pairs
+// here. The allow list is applied AFTER computeAllowList so it cannot
+// be silently dropped by the catalog default-false pass.
+func computeChannelPluginAllowList(i *Instance) []string {
+	if i == nil {
+		return nil
+	}
+	for _, ch := range i.Channels {
+		if strings.HasPrefix(ch, telegramChannelPrefix) {
+			return []string{telegramPluginID}
+		}
 	}
 	return nil
 }
@@ -204,6 +336,15 @@ func (i *Instance) EnsureWorkerScratchConfigDir(sourceProfileDir string) (string
 		plugins[id] = true
 		allowSet[id] = struct{}{}
 	}
+	// Issue #1134: channel-owning sessions need their channel plugin
+	// enabled so claude's `--channels` flag has a live MCP server to
+	// wire its routing to. Applied AFTER computeAllowList so the
+	// catalog default-false pass below treats channel plugins as
+	// attached and leaves them true.
+	for _, id := range computeChannelPluginAllowList(i) {
+		plugins[id] = true
+		allowSet[id] = struct{}{}
+	}
 	for id := range catalogIDs {
 		if _, attached := allowSet[id]; attached {
 			continue
@@ -230,20 +371,39 @@ func (i *Instance) EnsureWorkerScratchConfigDir(sourceProfileDir string) (string
 	return scratch, nil
 }
 
+// credentialsFileName is the profile's OAuth credentials file. It is the one
+// scratch entry that must be RE-ASSERTED (not merely left alone) on every
+// seeding — see reassertCredentialSymlink and issue #1222.
+const credentialsFileName = ".credentials.json"
+
 // mirrorProfileEntries symlinks every top-level entry in source (except
-// settings.json) into dest. Idempotent: existing dest entries are left
-// alone; G6 EEXIST races are benign.
+// settings.json) into dest. For most entries it is idempotent the simple way:
+// an existing dest entry is left alone (G6 EEXIST races are benign).
+//
+// `.credentials.json` is the exception. It is handled by
+// reassertCredentialSymlink, which heals the issue #1222 clobber: running
+// `/login` inside a managed session replaces the scratch symlink with a
+// real-file COPY of the OAuth token. Anthropic rotates the refresh token on
+// each refresh, so that stale copy 401s on the next rotation while the fresh
+// token is stranded in scratch. Re-asserting the symlink (and promoting a
+// fresh in-session login to canonical first) restores the single-source-of-
+// truth invariant on the next start/restart/resume.
 func mirrorProfileEntries(dest, source string) error {
 	entries, err := os.ReadDir(source)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil
+			// Source absent: still re-assert credentials in case scratch
+			// holds a stranded in-session login to promote (no canonical).
+			return reassertCredentialSymlink(dest, source)
 		}
 		return fmt.Errorf("read source profile: %w", err)
 	}
 	for _, entry := range entries {
 		name := entry.Name()
-		if name == "settings.json" {
+		// settings.json is OWNED (copied + mutated) by the scratch seeding;
+		// .credentials.json is re-asserted explicitly below. Both are skipped
+		// from the generic leave-alone mirror.
+		if name == "settings.json" || name == credentialsFileName {
 			continue
 		}
 		linkPath := filepath.Join(dest, name)
@@ -258,6 +418,97 @@ func mirrorProfileEntries(dest, source string) error {
 			return fmt.Errorf("symlink %s: %w", name, err)
 		}
 	}
+	return reassertCredentialSymlink(dest, source)
+}
+
+// reassertCredentialSymlink guarantees dest/.credentials.json is a symlink to
+// source/.credentials.json (the canonical profile credentials), healing the
+// in-session `/login` clobber described in issue #1222.
+//
+//   - dest entry is the correct symlink → left untouched (idempotent).
+//   - dest entry is absent → symlinked to canonical (when canonical exists).
+//   - dest entry is a symlink to the WRONG target → repointed to canonical.
+//   - dest entry is a real file STALE relative to canonical → replaced with
+//     the symlink; canonical is the source of truth and is left unchanged.
+//   - dest entry is a real file NEWER than canonical (a fresh in-session
+//     `/login`) → its contents are atomically promoted to canonical FIRST
+//     (temp+rename, 0600 token perms preserved, canonical never torn), THEN
+//     dest is replaced with the symlink — so the fresh token propagates to
+//     every symlinked session instead of being stranded in this scratch.
+//
+// WARNING for operators: do NOT run `/login` inside a managed agent-deck
+// session. Log in once in the canonical profile and every session inherits it
+// through this symlink. An in-session login is recovered here on the next
+// start, but only after a restart.
+func reassertCredentialSymlink(dest, source string) error {
+	target := filepath.Join(source, credentialsFileName)
+	linkPath := filepath.Join(dest, credentialsFileName)
+
+	li, lerr := os.Lstat(linkPath)
+	switch {
+	case lerr != nil && os.IsNotExist(lerr):
+		// Nothing in scratch yet — link to canonical when it exists.
+		if _, terr := os.Stat(target); terr == nil {
+			return symlinkReplace(target, linkPath)
+		}
+		return nil
+	case lerr != nil:
+		return fmt.Errorf("lstat scratch credentials: %w", lerr)
+	}
+
+	if li.Mode()&os.ModeSymlink != 0 {
+		// Already a symlink — leave it iff it points at canonical.
+		if cur, rerr := os.Readlink(linkPath); rerr == nil && cur == target {
+			return nil
+		}
+		// Wrong/stale symlink → repoint (only meaningful if canonical exists).
+		if _, terr := os.Stat(target); terr != nil {
+			return nil
+		}
+		return symlinkReplace(target, linkPath)
+	}
+
+	// dest is a REAL FILE (the `/login` clobber). Decide promote vs relink.
+	promote := false
+	ti, terr := os.Stat(target)
+	switch {
+	case terr != nil && os.IsNotExist(terr):
+		promote = true // canonical missing → scratch is the only copy
+	case terr != nil:
+		return fmt.Errorf("stat canonical credentials: %w", terr)
+	default:
+		// Promote only when the scratch copy is strictly newer — a fresh
+		// in-session login. Equal/older is treated as stale (relink only).
+		promote = li.ModTime().After(ti.ModTime())
+	}
+
+	if promote {
+		data, rerr := os.ReadFile(linkPath)
+		if rerr != nil {
+			return fmt.Errorf("read scratch credentials for promote: %w", rerr)
+		}
+		// Atomic temp+rename into canonical: 0600 token perms preserved,
+		// canonical never torn even under a concurrent reader (G5/G1).
+		if err := atomicWriteFile(target, data, 0o600); err != nil {
+			return fmt.Errorf("promote scratch credentials to canonical: %w", err)
+		}
+	}
+
+	return symlinkReplace(target, linkPath)
+}
+
+// symlinkReplace atomically points linkPath at target, removing any existing
+// entry first. An EEXIST from a concurrent creator is benign.
+func symlinkReplace(target, linkPath string) error {
+	if err := os.Remove(linkPath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove stale credentials entry: %w", err)
+	}
+	if err := os.Symlink(target, linkPath); err != nil {
+		if os.IsExist(err) {
+			return nil
+		}
+		return fmt.Errorf("symlink credentials: %w", err)
+	}
 	return nil
 }
 
@@ -268,6 +519,25 @@ func (i *Instance) CleanupWorkerScratchConfigDir() {
 	}
 	_ = os.RemoveAll(i.WorkerScratchConfigDir)
 	i.WorkerScratchConfigDir = ""
+}
+
+// applyWorkerScratchOverride is the single seam where the worker-scratch
+// CLAUDE_CONFIG_DIR replaces the resolved one. Returns the effective
+// config dir to use. Centralising the override here means every
+// spawn-env builder (buildClaudeCommandWithMessage, buildBashExportPrefix,
+// buildClaudeResumeCommand) logs the swap with identical wording. Issue
+// #922 (reporter @bautrey) closed the silent-override hole by making
+// this the only place the swap can happen.
+func (i *Instance) applyWorkerScratchOverride(resolvedConfigDir string) string {
+	if i.WorkerScratchConfigDir == "" {
+		return resolvedConfigDir
+	}
+	sessionLog.Info("worker_scratch_override",
+		slog.String("instance_id", i.ID),
+		slog.String("resolved_config_dir", resolvedConfigDir),
+		slog.String("worker_scratch_config_dir", i.WorkerScratchConfigDir),
+	)
+	return i.WorkerScratchConfigDir
 }
 
 // prepareWorkerScratchConfigDirForSpawn is the spawn-path wrapper
@@ -292,6 +562,19 @@ func (i *Instance) prepareWorkerScratchConfigDirForSpawn() {
 		return
 	}
 	sourceDir := GetClaudeConfigDirForInstance(i)
+
+	// Issue #941: surface the GLOBAL_ANTIPATTERN at spawn so operators can
+	// flip enabledPlugins.telegram=false in their profile and stop relying
+	// on this guard. Log-level WARN keeps it visible without blocking.
+	if needsScratchForGlobalChannelConflict(i) {
+		sessionLog.Warn("telegram_global_antipattern_suppressed",
+			slog.String("instance_id", i.ID),
+			slog.String("title", i.Title),
+			slog.String("source_profile_dir", sourceDir),
+			slog.String("plugin_id", telegramPluginID),
+			slog.String("guidance", "enabledPlugins.\"telegram@claude-plugins-official\"=true in the ambient settings.json would have caused a duplicate bun telegram poller (issue #941). Pinning the plugin off in a per-session scratch config dir so --channels is the sole activation. Recommended fix: remove the global enablement and rely on --channels."),
+		)
+	}
 
 	// Step 1: install plugin code into the SOURCE profile (not scratch).
 	// Best-effort — failures log but don't block. Runs first so the
@@ -318,6 +601,21 @@ func (i *Instance) prepareWorkerScratchConfigDirForSpawn() {
 		return
 	}
 	i.WorkerScratchConfigDir = scratch
+
+	// Issue #1138: post-write verification. After the scratch
+	// settings.json is rewritten, confirm the channel plugin is
+	// actually enabled in the EFFECTIVE config dir (scratch when
+	// present, ambient otherwise). Any failure here means `--channels`
+	// would land on a disabled plugin and bun-telegram would never
+	// spawn — surface it loudly so operators can heal manually if the
+	// force-correct itself somehow drifted.
+	effectiveDir := scratch
+	if effectiveDir == "" {
+		effectiveDir = sourceDir
+	}
+	if result := VerifyTelegramChannelEnabled(effectiveDir, i.Channels); !result.OK {
+		EmitTelegramChannelDriftWarning(i.Title, i.ID, effectiveDir, i.Channels, result)
+	}
 }
 
 // macOSScratchWarningEmitter is the package-level seam that lets tests

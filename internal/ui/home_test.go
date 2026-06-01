@@ -158,6 +158,26 @@ func TestCreateSessionTool_Copilot(t *testing.T) {
 	}
 }
 
+// TUI session creation must produce Tool="crush" rather than
+// Tool="shell" with Command="crush", matching the tmux/userconfig
+// wiring for the charmbracelet/crush integration (Issue #940).
+func TestCreateSessionTool_Crush(t *testing.T) {
+	tool, command := createSessionTool("crush")
+	if tool != "crush" || command != "crush" {
+		t.Fatalf("createSessionTool(\"crush\") = (%q, %q), want (\"crush\", \"crush\")", tool, command)
+	}
+}
+
+// TUI session creation must produce Tool="hermes" rather than
+// Tool="shell" with Command="hermes", matching the tmux/userconfig
+// wiring for the Hermes Agent CLI integration.
+func TestCreateSessionTool_Hermes(t *testing.T) {
+	tool, command := createSessionTool("hermes")
+	if tool != "hermes" || command != "hermes" {
+		t.Fatalf("createSessionTool(\"hermes\") = (%q, %q), want (\"hermes\", \"hermes\")", tool, command)
+	}
+}
+
 func TestHomeInit(t *testing.T) {
 	home := NewHome()
 	cmd := home.Init()
@@ -2991,7 +3011,8 @@ func TestRegression743_NOnRemoteGroup_QuickCreatesNoDialog(t *testing.T) {
 // added alongside the existing vi-style pagination (#38). PgUp/PgDn are
 // half-page aliases of Ctrl+U/Ctrl+D; Home/End jump to the first/last item
 // (End fills the gap where no single-key jump-to-bottom existed, since G
-// opens global search).
+// opens global search). Also covers the emacs-style Ctrl+N/Ctrl+P line
+// navigation aliases for the main session list.
 func TestHome_TerminalNavigationKeys(t *testing.T) {
 	// Build a 100-item list so pagination + absolute jumps have room to move.
 	items := make([]session.Item, 100)
@@ -3028,6 +3049,11 @@ func TestHome_TerminalNavigationKeys(t *testing.T) {
 		{"Home at top no-op", tea.KeyMsg{Type: tea.KeyHome}, 0, 0},
 		{"End from middle", tea.KeyMsg{Type: tea.KeyEnd}, 5, last},
 		{"End at bottom no-op", tea.KeyMsg{Type: tea.KeyEnd}, last, last},
+		// Emacs-style line navigation (ctrl+n / ctrl+p)
+		{"ctrl+n moves down", tea.KeyMsg{Type: tea.KeyCtrlN}, 10, 11},
+		{"ctrl+n clamps at bottom", tea.KeyMsg{Type: tea.KeyCtrlN}, last, last},
+		{"ctrl+p moves up", tea.KeyMsg{Type: tea.KeyCtrlP}, 10, 9},
+		{"ctrl+p clamps at top", tea.KeyMsg{Type: tea.KeyCtrlP}, 0, 0},
 	}
 
 	for _, tc := range tests {

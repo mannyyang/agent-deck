@@ -14,19 +14,24 @@ import (
 // only used to verify that buildWebServer wires whatever is passed in.
 type noopMutator struct{}
 
-func (noopMutator) CreateSession(string, string, string, string) (string, error) {
+func (noopMutator) CreateSession(string, string, string, string, string) (string, error) {
 	return "", nil
 }
 func (noopMutator) StartSession(string) error          { return nil }
 func (noopMutator) StopSession(string) error           { return nil }
 func (noopMutator) RestartSession(string) error        { return nil }
 func (noopMutator) DeleteSession(string) error         { return nil }
+func (noopMutator) CloseSession(string) error          { return nil }
+func (noopMutator) UndoDelete() (string, error)        { return "", web.ErrUndoNothing }
 func (noopMutator) ForkSession(string) (string, error) { return "", nil }
 func (noopMutator) CreateGroup(string, string) (string, error) {
 	return "", nil
 }
 func (noopMutator) RenameGroup(string, string) error { return nil }
 func (noopMutator) DeleteGroup(string) error         { return nil }
+func (noopMutator) FinishWorktree(string, web.WorktreeFinishOptions) (web.WorktreeFinishResult, error) {
+	return web.WorktreeFinishResult{}, nil
+}
 
 // Compile-time guard that ui.WebMutator continues to satisfy
 // web.SessionMutator. Catches accidental signature drift between the two

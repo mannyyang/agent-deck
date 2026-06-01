@@ -54,6 +54,32 @@ and answer: How do I fork a session?
 
 https://github.com/user-attachments/assets/e4f55917-435c-45ba-92cc-89737d0d1401
 
+## Quickstart: orchestrate a fleet of AI agents
+
+Five minutes from zero to a Telegram bot that watches every Claude session you have running.
+
+```bash
+# 1. Create a Telegram bot via @BotFather, grab the token + your user ID from @userinfobot.
+# 2. Run the wizard — it sets up the conductor, bridge daemon, and heartbeat in one shot.
+agent-deck conductor setup work --description "Work fleet"
+agent-deck session start conductor-work
+# 3. Message your bot:  /status
+```
+
+That's it. From now on every other agent-deck session you run is supervised by a single
+"conductor" session that answers routine questions, escalates the interesting ones to your
+phone, and never lets a `waiting` worker rot.
+
+Two short guides to read next:
+
+- [**`docs/CONDUCTOR-SETUP.md`**](docs/CONDUCTOR-SETUP.md) — five-minute walkthrough,
+  Telegram/Slack/Discord wiring, the gotchas (why the plugin auto-disables globally, channel
+  topology, multi-conductor patterns).
+- [**`docs/WATCHER-SETUP.md`**](docs/WATCHER-SETUP.md) — add "doorbells" so the outside world
+  (GitHub events, gmail, ntfy pushes, meetings) can wake the conductor up.
+
+![Fleet topology: phone → conductor → child sessions, with watchers on the side](docs/images/fleet-topology.png)
+
 ## The Problem
 
 Running Claude Code on 10 projects? OpenCode on 5 more? Another agent somewhere in the background?
@@ -201,15 +227,34 @@ default_location = "subdirectory"  # "sibling" (default), "subdirectory", or a c
 
 `sibling` creates worktrees next to the repo (`repo-branch`). `subdirectory` creates them inside it (`repo/.worktrees/branch`). A custom path like `~/worktrees` or `/tmp/worktrees` creates repo-namespaced worktrees at `<path>/<repo_name>/<branch>`. The `--location` flag overrides the config per session.
 
+#### Copying Gitignored Files (`.worktreeinclude`)
+
+Gitignored files (`.env`, `.mcp.json`, etc.) aren't copied into new worktrees by default.
+To declare which gitignored files should be copied automatically, create a `.worktreeinclude` file in your repo root:
+
+```gitignore
+# .worktreeinclude — gitignore-syntax patterns
+.env
+.env.local
+.mcp.json
+secrets/
+```
+
+Only files that are both pattern-matched AND gitignored get copied — tracked files are never duplicated.
+Directories are copied recursively and merged into existing destinations.
+Existing files in the worktree are not overwritten.
+
+This works for both single-repo and multi-repo worktree sessions.
+Matches [Claude Code Desktop semantics](https://code.claude.com/docs/en/worktrees#copy-gitignored-files-into-worktrees).
+
 #### Worktree Setup Script
 
-Gitignored files (`.env`, `.mcp.json`, etc.) aren't copied into new worktrees. To automate this, create a setup script at `.agent-deck/worktree-setup.sh` in your repo. Agent-deck runs it automatically after creating a worktree.
+For imperative setup tasks (installing dependencies, running migrations, etc.), create a script at `.agent-deck/worktree-setup.sh`.
+Agent-deck runs it automatically after creating a worktree and processing `.worktreeinclude`.
 
 ```sh
 #!/bin/sh
-for f in .env .env.local .mcp.json; do
-    [ -f "$AGENT_DECK_REPO_ROOT/$f" ] && cp "$AGENT_DECK_REPO_ROOT/$f" "$AGENT_DECK_WORKTREE_PATH/$f"
-done
+npm install
 ```
 
 The script receives two environment variables:
@@ -220,7 +265,11 @@ The script runs via `sh -e` with a 60-second timeout. If it fails, the worktree 
 
 #### Bare repositories and worktrees
 
-Agent-deck supports the [bare-repo layout](https://git-scm.com/docs/git-worktree) where the git metadata sits in `.bare/` and every worktree is a peer (no "main" checkout). A typical tree:
+Agent-deck supports two flavors of the [bare-repo layout](https://git-scm.com/docs/git-worktree) where every worktree is a peer (no "main" checkout). The two are distinguished by convention — the basename of the bare git dir.
+
+##### Nested `.bare/` layout
+
+The bare git metadata sits inside a normal-looking project dir at `.bare/`:
 
 ```
 project/
@@ -233,35 +282,52 @@ project/
     └── .git
 ```
 
-How agent-deck resolves this layout (v1.7.58+):
+##### True-bare-at-root layout
 
-- **All three paths work.** `agent-deck add project/`, `agent-deck add project/.bare`, and `agent-deck add project/worktree-a` all resolve to the same "project root" — `project/`, the directory that hosts `.bare/`. Every linked worktree is treated as equal; there is no default or main.
-- **The project root is where shared config lives.** Place `.agent-deck/worktree-setup.sh` at `project/.agent-deck/worktree-setup.sh`, next to `.bare/`. Agent-deck looks for it at exactly that path once it has resolved the project root — it does not search individual worktrees.
-- **`AGENT_DECK_REPO_ROOT` inside the setup script points to `project/`.** So `cp "$AGENT_DECK_REPO_ROOT/.env" "$AGENT_DECK_WORKTREE_PATH/.env"` copies the shared `.env` you keep alongside `.bare/` into each new worktree.
-- **New worktree location follows your `[worktree]` setting.** With `default_location = "subdirectory"` (or `--location subdirectory`) new worktrees land inside the project root at `project/.worktrees/<branch-name>`.
+The result of a plain `git clone --bare repo.git`: the directory itself *is* the bare repo and linked worktrees live as direct children alongside its internal files:
+
+```
+project.git/                       # this dir IS the bare repo
+├── HEAD, config, objects/, refs/, packed-refs, worktrees/, ...
+├── .agent-deck/
+│   └── worktree-setup.sh          # shared setup script (optional)
+├── main/                          # linked worktree on main
+│   └── .git                       # file: gitdir: ../worktrees/main
+└── feature-x/                     # linked worktree on feature-x
+    └── .git
+```
+
+How agent-deck resolves these layouts (v1.7.58+ for nested, v1.9.10+ for at-root):
+
+- **All three handles work.** `agent-deck add <project-root>`, `agent-deck add <bare-dir>`, and `agent-deck add <linked-worktree>` all resolve to the same project root. For the nested layout that's the dir holding `.bare/`. For the at-root layout that's the bare dir itself (`project.git/`). Every linked worktree is treated as equal.
+- **The project root is where shared config lives.** Place `.agent-deck/worktree-setup.sh` at `<projectRoot>/.agent-deck/worktree-setup.sh`. Agent-deck looks for it at exactly that path — it does not search individual worktrees. In the at-root layout that means `.agent-deck/` lives *inside* the bare dir alongside `HEAD` and `objects/`.
+- **`AGENT_DECK_REPO_ROOT` inside the setup script points to the project root.** Same as above — for at-root that's the bare dir itself.
+- **New worktree location** depends on the layout:
+  - **Nested:** follows your `[worktree]` setting. `default_location = "subdirectory"` lands worktrees at `<projectRoot>/.worktrees/<branch>`; `"sibling"` lands them next to the project dir.
+  - **At-root:** auto-overrides `sibling`/`subdirectory` and lands new worktrees as direct children of the bare dir (`<bareDir>/<branch>`) — neither default makes sense when the project root *is* the bare repo. The `path_template` config still wins if you want a fully custom path.
 
 Example — create a new worktree against a bare repo from anywhere:
 
 ```sh
-# From the project root
+# Nested .bare/ layout
 agent-deck add project/ -c claude --worktree feature/c --new-branch
-
-# Or point directly at the bare dir
 agent-deck add project/.bare -c claude --worktree feature/c --new-branch
-
-# Or from any existing linked worktree
 agent-deck add project/worktree-a -c claude --worktree feature/c --new-branch
+# All three resolve to project/, create project/.worktrees/feature-c/, run project/.agent-deck/worktree-setup.sh.
+
+# True-bare-at-root layout
+agent-deck add project.git/ -c claude --worktree feature/c --new-branch
+agent-deck add project.git/main -c claude --worktree feature/c --new-branch
+# Both resolve to project.git/, create project.git/feature-c/, run project.git/.agent-deck/worktree-setup.sh.
 ```
 
-All three commands create `project/.worktrees/feature-c/` (with `subdirectory` location) and run `project/.agent-deck/worktree-setup.sh` with `AGENT_DECK_REPO_ROOT=project`.
-
-`agent-deck worktree list` and `agent-deck worktree finish` also work from any of those three locations.
+`agent-deck worktree list` and `agent-deck worktree finish` work from any of those locations.
 
 Common gotchas:
 
-- **`.agent-deck/` must live at the project root**, next to `.bare/`. If you commit `.agent-deck/` into a specific branch's worktree instead, agent-deck will not find it — the lookup resolves to the project root, not the current worktree.
-- **The bare repo must be a direct child of the project root.** The auto-discovery scans `<projectRoot>/.bare` first, then direct children as a fallback. A bare repo named something other than `.bare` (e.g. `.git-bare/`) still works; one nested several levels deep does not, so point `agent-deck add` at its parent directly in that case.
-- **If you also keep a `.git` file at the project root** pointing to `.bare/` (a variant some tutorials recommend), point `agent-deck add` at `.bare/` or at a linked worktree rather than at the project root — the `.git` file shadows the bare-repo detection path.
+- **`.agent-deck/` must live at the project root.** For nested layouts that's next to `.bare/`; for at-root layouts that's inside the bare dir. If you commit `.agent-deck/` into a specific branch's worktree instead, agent-deck will not find it — the lookup resolves to the project root, not the current worktree.
+- **Detection is by convention: basename `.bare` ⇒ nested layout, anything else ⇒ at-root.** A bare repo named something other than `.bare` inside a project dir (e.g. `project/.git-bare/`) is treated as at-root if you point at it directly. For a fully nested layout, use the canonical name `.bare`.
+- **If you keep a `.git` file at the project root** pointing to `.bare/` (a variant some tutorials recommend), point `agent-deck add` at `.bare/` or at a linked worktree rather than at the project root — the `.git` file shadows the bare-repo detection path.
 
 ### Docker Sandbox
 
@@ -493,7 +559,10 @@ Agent Deck works with any terminal-based AI tool:
 | **Gemini CLI** | Full (status, MCP, resume) |
 | **OpenCode** | Status detection, organization |
 | **Codex** | Status detection, organization, conductor |
+| **Copilot** | Organization, launch |
+| **Crush** (charmbracelet/crush) | Status detection, organization, launch |
 | **Cursor** (terminal) | Status detection, organization |
+| **Hermes Agent** | Organization, launch |
 | **Custom tools** | Configurable via `[tools.*]` in config.toml |
 
 ### Cost Tracking Dashboard
@@ -638,6 +707,11 @@ agent-deck remote update dev      # specific remote
 
 Remote configuration is stored under `[remotes]` in `~/.agent-deck/config.toml`. All `remote` subcommands support `--json` output for scripting. Run `agent-deck remote --help` for the full flag reference.
 
+#### Security
+
+- **SSH host-key stance.** agent-deck verifies remote host keys against your `~/.ssh/known_hosts` using OpenSSH's secure default — it never sets `StrictHostKeyChecking=no` and never points `UserKnownHostsFile` at `/dev/null`. Every connection (list, attach, deploy) runs with `BatchMode=yes`, so an **unknown or changed host key fails fast** with a clear `Host key verification failed` error instead of silently trusting the host or hanging on a prompt. Add each remote to `known_hosts` first (e.g. `ssh user@host` once interactively, or `ssh-keyscan`), and authenticate with keys/an agent (BatchMode disables interactive password prompts). A changed host key is treated as a potential MITM and refused until you resolve it.
+- **Verified binary deploys.** `agent-deck remote update` downloads the GitHub release archive and verifies its **SHA-256 against the release's published `checksums.txt`** before deploying. A missing `checksums.txt`, a missing entry, or a hash mismatch aborts the deploy — an unverified or tampered artifact is never piped to a remote.
+
 ### Reaching services running inside remote sessions
 
 If you run a dev server, REPL, or web UI inside a remote session and want to reach it from your local browser, use **[Tailscale](https://tailscale.com)** rather than ad-hoc SSH port forwarding. Tailscale gives every machine on your tailnet a direct IP, so a service on `localhost:3000` of your remote box is reachable at `http://<remote-tailnet-ip>:3000` from your laptop with no `-L`/`-R` setup, no port collisions when multiple sessions share a remote, and no ControlMaster edge cases.
@@ -762,11 +836,18 @@ See [TUI Reference](skills/agent-deck/references/tui-reference.md) for all short
 
 ## Documentation
 
-**User guides** — start here if you are new:
+**Onboarding** — five-minute walkthroughs for new users:
 
 | Guide | What's Inside |
 |-------|---------------|
-| [Conductor](documentation/CONDUCTOR.md) | What a conductor is, quickstart, channel pairing, state files, multi-conductor setups |
+| [Conductor Setup](docs/CONDUCTOR-SETUP.md) | Zero to a Telegram-controlled conductor in five minutes, with diagrams and gotchas |
+| [Watcher Setup](docs/WATCHER-SETUP.md) | Give your fleet ears: GitHub / Gmail / ntfy / Slack / calendar event forwarding |
+
+**User guides** — reference material for going deeper:
+
+| Guide | What's Inside |
+|-------|---------------|
+| [Conductor](documentation/CONDUCTOR.md) | What a conductor is, channel pairing, state files, multi-conductor setups |
 | [Skills](documentation/SKILLS.md) | User-level vs pool skills, authoring, attach/detach, when to use which tier |
 | [Watchdog](documentation/WATCHDOG.md) | Optional Python daemon that auto-restarts critical sessions and nudges stuck children |
 | [Watchers](documentation/WATCHERS.md) | Event-forwarding framework: doorbell model, built-in adapters, custom watchers, gotchas |

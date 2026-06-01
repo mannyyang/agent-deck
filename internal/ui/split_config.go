@@ -1,0 +1,146 @@
+// Sessions/Preview split configuration (issue #1092).
+//
+// Resolves a configurable horizontal split between the SESSIONS list and
+// the PREVIEW pane. Defaults preserve the historical 35/65 layout.
+//
+// Two surfaces:
+//   - Config file: ~/.agent-deck/config.toml -> [ui] preview_pct (10-90)
+//   - Runtime keybinding: < shrinks preview by 5%, > grows it by 5%
+//
+// The runtime adjustment persists back to config.toml so it survives
+// restart. The brief overlay showing the new ratio is drawn by the
+// home renderer when previewPctOverlayAt is in the future.
+
+package ui
+
+import (
+	"time"
+
+	"github.com/asheshgoplani/agent-deck/internal/session"
+)
+
+// previewPctStep is the percentage delta per < / > keystroke.
+const previewPctStep = 5
+
+// previewPctOverlayDuration is how long the "Sessions / Preview ratio"
+// overlay stays visible after an adjustment.
+const previewPctOverlayDuration = 1500 * time.Millisecond
+
+// Pane chrome / minimum widths for the dual layout (issue #1113).
+//
+// The dual layout draws " │ " (3 cols) between sessions and preview. At
+// extreme preview_pct values or narrow widths the integer percentage math
+// alone would shrink one pane below its title. These minimums guarantee
+// both panel titles always render without truncation; splitPaneWidths
+// clamps to them and gives the leftover columns to the other pane.
+const (
+	paneSeparatorWidth   = 3 // " │ "
+	minSessionsPaneWidth = 8 // fits "SESSIONS"
+	minPreviewPaneWidth  = 8 // fits "PREVIEW " (with overlay suffix budget)
+)
+
+// getPreviewPct returns the current preview percentage with bounds
+// applied. Falls back to the package default when the field is zero
+// (which is the case for Home instances built before this feature
+// landed and for tests that bypass NewHome).
+func (h *Home) getPreviewPct() int {
+	if h.previewPct <= 0 {
+		return session.DefaultPreviewPct
+	}
+	if h.previewPct < session.MinPreviewPct {
+		return session.MinPreviewPct
+	}
+	if h.previewPct > session.MaxPreviewPct {
+		return session.MaxPreviewPct
+	}
+	return h.previewPct
+}
+
+// sessionsPaneWidth returns the column width allocated to the sessions
+// list panel in the dual layout. Replaces the historical
+// `int(float64(h.width) * 0.35)` literal.
+func (h *Home) sessionsPaneWidth() int {
+	left, _ := h.splitPaneWidths()
+	return left
+}
+
+// splitPaneWidths resolves the (sessions, preview) column widths for the
+// dual layout, accounting for the 3-column separator chrome and clamping
+// each pane to its title-fit minimum (issue #1113). Returned widths
+// always satisfy left + paneSeparatorWidth + right == h.width when
+// h.width is wide enough to fit both minimums plus the separator. For
+// degenerate widths (below the chrome budget), the function falls back
+// gracefully: it gives whatever it can to each pane without producing
+// negative widths.
+func (h *Home) splitPaneWidths() (int, int) {
+	if h.width <= 0 {
+		return 0, 0
+	}
+	previewPct := h.getPreviewPct()
+	sessionsPct := 100 - previewPct
+	left := int(float64(h.width) * float64(sessionsPct) / 100.0)
+	right := h.width - left - paneSeparatorWidth
+
+	chromeBudget := minSessionsPaneWidth + minPreviewPaneWidth + paneSeparatorWidth
+	if h.width < chromeBudget {
+		// Not enough room for both minimums. Keep widths non-negative;
+		// renderDualColumnLayout is only routed to above
+		// layoutBreakpointStacked (80), so this branch is safety for
+		// edge calls (tests, dynamic resize churn).
+		return max(left, 0), max(right, 0)
+	}
+
+	// Below the preview minimum: borrow from sessions.
+	if right < minPreviewPaneWidth {
+		right = minPreviewPaneWidth
+		left = h.width - right - paneSeparatorWidth
+	}
+	// Below the sessions minimum: borrow from preview.
+	if left < minSessionsPaneWidth {
+		left = minSessionsPaneWidth
+		right = h.width - left - paneSeparatorWidth
+	}
+	return left, right
+}
+
+// adjustPreviewPct shifts the preview percentage by delta (in percent
+// points), clamps to [MinPreviewPct, MaxPreviewPct], persists the new
+// value to config.toml, and arms the on-screen overlay.
+//
+// Returns true if the value actually changed so callers can decide
+// whether to trigger a repaint.
+func (h *Home) adjustPreviewPct(delta int) bool {
+	current := h.getPreviewPct()
+	next := current + delta
+	if next < session.MinPreviewPct {
+		next = session.MinPreviewPct
+	}
+	if next > session.MaxPreviewPct {
+		next = session.MaxPreviewPct
+	}
+	if next == current {
+		// Already at a bound; still arm the overlay so the user gets
+		// visual feedback that the keystroke was received.
+		h.previewPctOverlayAt = time.Now().Add(previewPctOverlayDuration)
+		return false
+	}
+	h.previewPct = next
+	h.previewPctOverlayAt = time.Now().Add(previewPctOverlayDuration)
+	persistPreviewPct(next)
+	return true
+}
+
+// persistPreviewPct writes the new preview percentage to config.toml.
+// Errors are swallowed: a failed save shouldn't crash the TUI, and the
+// in-memory value still takes effect for the current session.
+func persistPreviewPct(pct int) {
+	cfg, err := session.LoadUserConfig()
+	if err != nil || cfg == nil {
+		return
+	}
+	if cfg.UI.PreviewPct == pct {
+		return
+	}
+	cfg.UI.PreviewPct = pct
+	_ = session.SaveUserConfig(cfg)
+}

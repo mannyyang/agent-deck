@@ -29,6 +29,8 @@ const (
 	FieldNoTransitionNotify = "no-transition-notify"
 	FieldSkipPermissions    = "skip-permissions"
 	FieldAutoMode           = "auto-mode"
+	FieldAccount            = "account"      // #924 per-session named account slot
+	FieldIdleTimeout        = "idle-timeout" // #1143 auto-stop dormant sessions
 )
 
 var ValidMutableFields = []string{
@@ -48,6 +50,8 @@ var ValidMutableFields = []string{
 	FieldNoTransitionNotify,
 	FieldSkipPermissions,
 	FieldAutoMode,
+	FieldAccount,
+	FieldIdleTimeout,
 }
 
 type FieldRestartPolicy int
@@ -60,7 +64,7 @@ const (
 func RestartPolicyFor(field string) FieldRestartPolicy {
 	switch field {
 	case FieldCommand, FieldWrapper, FieldTool, FieldChannels, FieldPlugins, FieldExtraArgs, FieldPath,
-		FieldSkipPermissions, FieldAutoMode:
+		FieldSkipPermissions, FieldAutoMode, FieldAccount:
 		return FieldRestartRequired
 	default:
 		return FieldLive
@@ -227,6 +231,16 @@ func SetField(inst *Instance, field, value string, extraArgsTokens []string) (ol
 		inst.ClaudeSessionID = value
 		inst.ClaudeDetectedAt = time.Now()
 		postCommit = makeSessionEnvPostCommit(inst, "CLAUDE_SESSION_ID", value)
+		// Issue #923 (reporter @bautrey): when the user explicitly clears
+		// the session id, the hook .sid sidecar at
+		// `~/.agent-deck/hooks/<id>.sid` must also be removed. Otherwise
+		// the next restart's spawn-env construction reads the stale anchor
+		// via ReadHookSessionAnchor and re-injects the old id, undoing the
+		// clear. DB is authoritative for the empty case; empty means
+		// abandon, not "fall back to last seen".
+		if value == "" {
+			ClearHookSessionAnchor(inst.ID)
+		}
 
 	case FieldGeminiSessionID:
 		oldValue = inst.GeminiSessionID
@@ -265,6 +279,25 @@ func SetField(inst *Instance, field, value string, extraArgsTokens []string) (ol
 		if err != nil {
 			return oldValue, nil, err
 		}
+
+	case FieldAccount:
+		// #924 per-session named account slot. Stored verbatim; an
+		// unconfigured name silently falls through the resolver chain.
+		// Empty string clears the override (back to conductor/group/env).
+		// Restart required (see RestartPolicyFor) — the in-flight
+		// conversation is lost, that's the documented Option 1 tradeoff.
+		oldValue = inst.Account
+		inst.Account = strings.TrimSpace(value)
+
+	case FieldIdleTimeout:
+		// #1143: parses a Go duration like "30m"; 0 (or "0", "") disables.
+		// Live: the next watcher tick reads the new value.
+		oldValue = strconv.FormatInt(inst.IdleTimeoutSecs, 10)
+		secs, perr := ParseIdleTimeoutFlag(strings.TrimSpace(value))
+		if perr != nil {
+			return oldValue, nil, &MutationError{Field: field, Msg: perr.Error()}
+		}
+		inst.IdleTimeoutSecs = secs
 
 	default:
 		return "", nil, &MutationError{

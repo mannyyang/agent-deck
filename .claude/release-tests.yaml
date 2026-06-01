@@ -1062,7 +1062,7 @@ tests:
 - id: v1724-multirepo-restore-reconnect-workdir
   added: '2026-04-18'
   task: v1724-multirepo-restore-663
-  file: internal/session/multirepo_restore_test.go
+  file: internal/session/multi_repo_restore_test.go
   test_name: TestRestore_ReconnectSeedsWorkDirFromMultiRepoTempDir
   purpose: 'Issue #663 site 1 — storage.go convertToInstances must seed tmux WorkDir from MultiRepoTempDir, not the ProjectPath symlink. Otherwise the restart pane launches in the wrong cwd and Claude''s JSONL encoded-path key never matches, silently dropping the prior conversation.'
   source: .planning/investigate-multirepo-restart/REPORT.md
@@ -1073,7 +1073,7 @@ tests:
 - id: v1724-multirepo-restore-recreate-workdir
   added: '2026-04-18'
   task: v1724-multirepo-restore-663
-  file: internal/session/multirepo_restore_test.go
+  file: internal/session/multi_repo_restore_test.go
   test_name: TestRestore_RecreateTmuxSessionUsesEffectiveWorkingDir
   purpose: 'Issue #663 site 2 — instance.go recreateTmuxSession must use EffectiveWorkingDir(), not ProjectPath, when the TUI restart path finds the prior tmux session dead. Without this, multi-repo TUI restarts spawn the replacement tmux session inside the symlinked source repo rather than the worktree parent dir.'
   source: .planning/investigate-multirepo-restart/REPORT.md
@@ -1084,7 +1084,7 @@ tests:
 - id: v1724-multirepo-restore-jsonl-discovery
   added: '2026-04-18'
   task: v1724-multirepo-restore-663
-  file: internal/session/multirepo_restore_test.go
+  file: internal/session/multi_repo_restore_test.go
   test_name: TestRestore_DiscoverJSONLUsesMultiRepoTempDir
   purpose: 'Issue #663 site 3 — ensureClaudeSessionIDFromDisk must probe discoverLatestClaudeJSONL with EffectiveWorkingDir(). ProjectPath on a multi-repo session EvalSymlinks-resolves into the original source repo, so the encoded path never finds the JSONL that Claude wrote while cwd=MultiRepoTempDir. Without this, Start() silently enters the fresh-session branch and the prior conversation vanishes.'
   source: .planning/investigate-multirepo-restart/REPORT.md
@@ -1425,13 +1425,13 @@ tests:
 - id: v1728-watcher-event-dedup-busy-retry
   added: '2026-04-18'
   task: v1728-flake-fix
-  file: internal/statedb/statedb_test.go
+  file: internal/statedb/statedb_hostsensitive_test.go
   test_name: TestWatcherEventDedup
-  purpose: 'Pre-existing race flake on CI — SaveWatcherEvent now retries on SQLITE_BUSY with linear backoff. This pins the concurrent-insert dedup guarantee (exactly 1 row after 2 goroutines racing the same dedup key) while tolerating transient busy errors that previously failed release CI intermittently.'
+  purpose: 'Pre-existing race flake on CI — SaveWatcherEvent now retries on SQLITE_BUSY with linear backoff. This pins the concurrent-insert dedup guarantee (exactly 1 row after 2 goroutines racing the same dedup key) while tolerating transient busy errors that previously failed release CI intermittently. Moved behind the `hostsensitive` build tag in #969 because the SQLITE_BUSY race remained host-sensitive under -race; the nightly job runs it with `-tags hostsensitive`.'
   source: v1.7.28-release-prep
   manual: false
   run:
-    command: go test ./internal/statedb/ -run TestWatcherEventDedup -count=3 -race -v
+    command: go test -tags hostsensitive ./internal/statedb/ -run TestWatcherEventDedup -count=3 -race -v
     expected: pass
 - id: v1727-issue662-hidden-dir-encoding
   added: '2026-04-19'

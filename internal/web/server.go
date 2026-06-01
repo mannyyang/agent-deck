@@ -19,16 +19,76 @@ import (
 
 // Config defines runtime options for the web server.
 type Config struct {
-	ListenAddr          string
-	Profile             string
-	ReadOnly            bool
-	WebMutations        bool // When false, POST/PATCH/DELETE endpoints return 403
-	Token               string
+	ListenAddr   string
+	Profile      string
+	ReadOnly     bool
+	WebMutations bool // When false, POST/PATCH/DELETE endpoints return 403
+	Token        string
+	// InsecureBind explicitly acknowledges binding a non-loopback address
+	// with no auth token (an unauthenticated RCE surface). Without it the
+	// server refuses to start in that configuration. See bind.go / report #1.
+	InsecureBind        bool
 	MenuData            MenuDataLoader
 	PushVAPIDPublicKey  string
 	PushVAPIDPrivateKey string
 	PushVAPIDSubject    string
 	PushTestInterval    time.Duration
+}
+
+// DefaultUndoWindow is the default Chrome-style undo grace period for
+// session deletes (POST /api/sessions/undelete). Mirrors the TUI ctrl+z
+// in-memory undo stack window.
+const DefaultUndoWindow = 30 * time.Second
+
+// ErrUndoNothing is returned by SessionMutator.UndoDelete when the undo
+// stack is empty.
+var ErrUndoNothing = errors.New("nothing to undo")
+
+// ErrUndoExpired is returned by SessionMutator.UndoDelete when the most
+// recent delete is older than the configured undo window.
+var ErrUndoExpired = errors.New("undo window expired")
+
+// ErrSessionNotFound is returned by SessionMutator.FinishWorktree when the
+// target session id does not resolve to a live instance. The handler maps
+// this to 404. See issue #1126.
+var ErrSessionNotFound = errors.New("session not found")
+
+// ErrNotAWorktree is returned by SessionMutator.FinishWorktree when the
+// target session exists but is not in a git/jujutsu worktree (so there is
+// nothing to merge or clean up). The handler maps this to 400. See issue
+// #1126.
+var ErrNotAWorktree = errors.New("session is not in a worktree")
+
+// WorktreeFinishOptions configures a SessionMutator.FinishWorktree call.
+// All fields are optional; the zero value asks the implementation to
+// auto-detect the target branch, perform the merge, delete the source
+// branch, and refuse if the worktree is dirty.
+type WorktreeFinishOptions struct {
+	// Into is the target branch to merge the worktree branch into. When
+	// empty the backend's default branch is used (matches the
+	// `agent-deck worktree finish --into` flag).
+	Into string
+	// NoMerge skips the merge step (mirrors --no-merge). The branch is
+	// still removed (unless KeepBranch) and the worktree torn down.
+	NoMerge bool
+	// KeepBranch leaves the source branch in place after finishing
+	// (mirrors --keep-branch). Useful when the branch already lives on a
+	// remote PR.
+	KeepBranch bool
+	// Force skips the dirty-worktree safety check and forces branch
+	// deletion even if the merge fast-forward didn't succeed.
+	Force bool
+}
+
+// WorktreeFinishResult is what SessionMutator.FinishWorktree returns on
+// success. Mirrors the JSON-output payload of `agent-deck worktree finish
+// --json`.
+type WorktreeFinishResult struct {
+	SessionID     string
+	Branch        string
+	MergedInto    string
+	Merged        bool
+	BranchDeleted bool
 }
 
 // MenuDataLoader provides menu snapshots for web APIs and push notifications.
@@ -39,15 +99,31 @@ type MenuDataLoader interface {
 // SessionMutator is implemented by internal/ui.WebMutator and injected at startup.
 // It bridges web HTTP handlers to the TUI session/group management methods.
 type SessionMutator interface {
-	CreateSession(title, tool, projectPath, groupPath string) (string, error)
+	CreateSession(title, tool, projectPath, groupPath, modelID string) (string, error)
 	StartSession(sessionID string) error
 	StopSession(sessionID string) error
 	RestartSession(sessionID string) error
 	DeleteSession(sessionID string) error
+	// CloseSession stops the session process while keeping its metadata
+	// in storage (TUI Shift+D — non-destructive close).
+	CloseSession(sessionID string) error
 	ForkSession(sessionID string) (string, error)
+	// UndoDelete restores the most-recently deleted session if it was
+	// deleted within the implementation's undo window. Returns the
+	// restored session id. Implementations should return ErrUndoNothing
+	// when the stack is empty and ErrUndoExpired when the most recent
+	// entry is older than the window — the handler maps both to 404.
+	UndoDelete() (string, error)
 	CreateGroup(name, parentPath string) (string, error)
 	RenameGroup(groupPath, newName string) error
 	DeleteGroup(groupPath string) error
+	// FinishWorktree merges (or skips), removes the worktree, optionally
+	// deletes the source branch, kills the tmux session, and removes the
+	// session from storage. Mirrors the TUI W/shift+w hotkey and the
+	// `agent-deck worktree finish` CLI. Returns ErrSessionNotFound when
+	// the id doesn't resolve and ErrNotAWorktree when the session exists
+	// but lacks worktree metadata. See issue #1126.
+	FinishWorktree(sessionID string, opts WorktreeFinishOptions) (WorktreeFinishResult, error)
 }
 
 // Server wraps an HTTP server for Agent Deck web mode.
@@ -65,6 +141,8 @@ type Server struct {
 
 	costStore       *costs.Store
 	mutator         SessionMutator
+	skills          SkillsService
+	mcpMgr          MCPManager
 	mutationLimiter *rate.Limiter
 
 	// hookStatusLoader returns the latest hook payload for every instance
@@ -112,12 +190,17 @@ func NewServer(cfg Config) *Server {
 		}
 
 		resp := map[string]any{
-			"ok":           true,
-			"profile":      cfg.Profile,
-			"readOnly":     cfg.ReadOnly,
-			"webMutations": cfg.WebMutations,
-			"version":      buildVersion(),
-			"time":         time.Now().UTC().Format(time.RFC3339),
+			"ok":   true,
+			"time": time.Now().UTC().Format(time.RFC3339),
+		}
+		// Report #6: only disclose profile/version/mode detail to authorized
+		// callers. When no token is configured (default loopback dev) every
+		// request is authorized, so behavior is unchanged for normal users.
+		if s.authorizeRequest(r) {
+			resp["profile"] = cfg.Profile
+			resp["readOnly"] = cfg.ReadOnly
+			resp["webMutations"] = cfg.WebMutations
+			resp["version"] = buildVersion()
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(resp)
@@ -125,6 +208,11 @@ func NewServer(cfg Config) *Server {
 	mux.HandleFunc("/api/menu", s.handleMenu)
 	mux.HandleFunc("/api/session/", s.handleSessionByID)
 	mux.HandleFunc("/api/sessions", s.handleSessionsCollection)
+	// /api/sessions/undelete is a collection-level action (Chrome-style
+	// ctrl+z undo). Register before the subtree pattern so Go 1.22+
+	// ServeMux precedence routes it cleanly instead of treating
+	// "undelete" as a sessionID.
+	mux.HandleFunc("POST /api/sessions/undelete", s.handleSessionUndelete)
 	mux.HandleFunc("/api/sessions/", s.handleSessionByAction)
 	mux.HandleFunc("/api/groups", s.handleGroupsCollection)
 	mux.HandleFunc("/api/groups/", s.handleGroupByPath)
@@ -149,7 +237,17 @@ func NewServer(cfg Config) *Server {
 
 	mux.HandleFunc("/api/system/stats", s.handleSystemStats)
 
-	handler := withRecover(mux)
+	mux.HandleFunc("/api/skills", s.handleSkillsCatalog)
+
+	// MCP management (Web UI parity with TUI `m` key dialog). Closes the
+	// four MISSING rows under "MCP MANAGEMENT" in PARITY_MATRIX.md.
+	mux.HandleFunc("/api/mcps", s.handleMCPsCatalog)
+	mux.HandleFunc("GET /api/sessions/{id}/mcps", s.handleSessionMCPsRouter)
+	mux.HandleFunc("POST /api/sessions/{id}/mcps/{name}", s.handleSessionMCPsRouter)
+	mux.HandleFunc("DELETE /api/sessions/{id}/mcps/{name}", s.handleSessionMCPsRouter)
+	mux.HandleFunc("PATCH /api/sessions/{id}/mcps/{name}", s.handleSessionMCPsRouter)
+
+	handler := withRecover(s.csrfProtect(mux))
 
 	s.httpServer = &http.Server{
 		Addr:              cfg.ListenAddr,
@@ -175,6 +273,12 @@ func (s *Server) Handler() http.Handler {
 // Start starts the HTTP server and blocks until shutdown or error.
 // Returns nil on graceful shutdown.
 func (s *Server) Start() error {
+	// Defense-in-depth: refuse to bind an unauthenticated non-loopback
+	// address even if a caller bypassed the CLI flag check. See report #1.
+	if err := s.checkBindSecurity(); err != nil {
+		return err
+	}
+
 	webLog := logging.ForComponent(logging.CompWeb)
 	if watcher, err := session.NewStatusFileWatcher(func() {
 		s.notifyMenuChanged()
@@ -276,6 +380,12 @@ func (s *Server) SetCostStore(store *costs.Store) {
 // SetMutator injects the session mutator implementation (typically *ui.WebMutator).
 func (s *Server) SetMutator(m SessionMutator) {
 	s.mutator = m
+}
+
+// SetSkillsService injects an alternate SkillsService (used by tests).
+// When nil, handlers fall back to defaultSkillsService.
+func (s *Server) SetSkillsService(svc SkillsService) {
+	s.skills = svc
 }
 
 // HasMutator reports whether a SessionMutator has been wired. Mutating

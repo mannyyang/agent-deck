@@ -8,6 +8,25 @@ on:
   push:
     tags:
       - 'v*'
+  # Manual escape hatch. A standalone tag re-push does not reliably re-fire
+  # the tag-push event when the ref->SHA mapping is unchanged (GitHub
+  # suppresses the duplicate event), which left v1.9.36 tagged but never
+  # published. Dispatch this against `main` with the tag to publish, e.g.
+  # `gh workflow run release.yml --ref main -f tag=v1.9.36`.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to publish (e.g. v1.9.36). Must already exist.'
+        required: true
+        type: string
+
+# Serialize publish per tag. If a duplicate run is queued for the same tag
+# (e.g. local worker accidentally re-publishes), goreleaser would race with
+# itself and the second uploader would 422 already_exists on each of the 5
+# assets (the v1.9.0-v1.9.5 race).
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -15,20 +34,26 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
+    # Tag-push runs use the pushed tag; manual dispatch supplies it explicitly.
+    env:
+      REF_NAME: ${{ inputs.tag || github.ref_name }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
+          # Check out the tag itself so GoReleaser sees the version tag at HEAD,
+          # even when dispatched against main.
+          ref: ${{ inputs.tag || github.ref_name }}
           fetch-depth: 0
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
 
       - name: Validate tag matches code version
         run: |
-          TAG="${GITHUB_REF_NAME#v}"
+          TAG="${REF_NAME#v}"
           CODE=$(grep 'var Version' cmd/agent-deck/main.go | head -1 | sed 's/.*= "\([^"]*\)".*/\1/')
           if [ "$TAG" != "$CODE" ]; then
             echo "ERROR: Tag v$TAG does not match code Version $CODE"
@@ -46,7 +71,7 @@ jobs:
           zoxide --version
 
       - name: Run tests
-        run: go test -race ./...
+        run: go test -race -timeout 20m ./...
 
       # Evaluator harness full tier. Blocking — a release that fails eval
       # does not get a tag. See docs/rfc/EVALUATOR_HARNESS.md (#37).
@@ -55,7 +80,7 @@ jobs:
       # too, not just on PRs.
       - name: Run eval harness (full tier)
         env:
-          GOTOOLCHAIN: go1.24.0
+          GOTOOLCHAIN: go1.25.10
         run: |
           go test -tags 'eval_smoke eval_full' -race -count=1 -timeout 6m ./tests/eval/... ./internal/ui/...
 
@@ -72,10 +97,10 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          echo "Validating assets for release ${GITHUB_REF_NAME} (version ${VERSION})..."
+          VERSION="${REF_NAME#v}"
+          echo "Validating assets for release ${REF_NAME} (version ${VERSION})..."
 
-          ASSETS=$(gh api "repos/${{ github.repository }}/releases/tags/${GITHUB_REF_NAME}" --jq '.assets[].name')
+          ASSETS=$(gh api "repos/${{ github.repository }}/releases/tags/${REF_NAME}" --jq '.assets[].name')
 
           EXPECTED=(
             "agent-deck_${VERSION}_darwin_amd64.tar.gz"

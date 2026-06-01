@@ -15,6 +15,13 @@ const (
 	notifyPollMedium = 2 * time.Second
 	notifyPollSlow   = 3 * time.Second
 	hookFreshWindow  = 45 * time.Second
+
+	// inboxTTLSweepInterval rate-limits the per-process TTL sweep over
+	// every inbox file. Issue #962 variant: without a periodic sweep,
+	// the cleanup-on-success path alone can't reach entries whose
+	// children never transition again. One pass per hour keeps the
+	// disk churn negligible while bounding inbox size to TTL+1h.
+	inboxTTLSweepInterval = time.Hour
 )
 
 type hookTransitionCandidate struct {
@@ -31,6 +38,17 @@ type TransitionDaemon struct {
 
 	lastStatus  map[string]map[string]string
 	initialized map[string]bool
+
+	// lastDone tracks the most recently emitted completion sentinel per
+	// (profile, instance) so a finished event (issue #1186) is emitted once
+	// per distinct completion. Re-reading the same done-bearing hook file
+	// across polls — or a later identical Stop — does not re-fire.
+	lastDone map[string]map[string]DoneSignal
+
+	// lastInboxTTLSweep tracks the most recent SweepInboxByTTL call so
+	// the daemon runs it at most once per inboxTTLSweepInterval. Zero
+	// means "never run" — the first SyncOnce pass will perform it.
+	lastInboxTTLSweep time.Time
 }
 
 func NewTransitionDaemon() *TransitionDaemon {
@@ -39,6 +57,7 @@ func NewTransitionDaemon() *TransitionDaemon {
 		storages:    map[string]*Storage{},
 		lastStatus:  map[string]map[string]string{},
 		initialized: map[string]bool{},
+		lastDone:    map[string]map[string]DoneSignal{},
 	}
 }
 
@@ -79,8 +98,70 @@ func (d *TransitionDaemon) SyncOnce(_ context.Context) time.Duration {
 		if interval < nextInterval {
 			nextInterval = interval
 		}
+		// Issue #1214: replay any durable task-worker completion record whose
+		// parent was down/busy when the worker exited. Restart-safe and
+		// exactly-once via the record's Acked flag.
+		d.ReplayUnackedCompletions(profile)
 	}
+
+	d.maybeSweepInboxTTL()
+
 	return nextInterval
+}
+
+// ReplayUnackedCompletions re-delivers durable task-worker completion records
+// (issue #1214) that have not yet been acknowledged — the wrapper wrote the
+// record but no live parent was reachable to wake (conductor down/busy at exit).
+// On a successful wake the record is acked so it never fires again. This is the
+// restart-durability half of the kernel-exit mechanism: a completion that
+// happened while the conductor was offline is delivered exactly once when it
+// returns, with no double-wake.
+func (d *TransitionDaemon) ReplayUnackedCompletions(profile string) {
+	recs, err := LoadCompletionRecords(profile)
+	if err != nil {
+		return
+	}
+	for _, rec := range recs {
+		if rec.Acked || strings.TrimSpace(rec.Status) == "" {
+			continue
+		}
+		if d.notifier.DeliverCompletion(rec) {
+			_ = AckCompletion(rec.Profile, rec.ChildID)
+			continue
+		}
+		// Not committed: the parent is unresolvable (e.g. removed) or a
+		// transient error. Count it against the bounded dead-letter budget so
+		// an unresolvable completion is dead-lettered to a terminal state after
+		// MaxUnresolvedAttempts polls instead of replaying ~1/sec forever
+		// (issue #1225 — the dropped_no_target runaway). Acking after
+		// dead-letter is safe: the record is durably parked, not lost.
+		ev := TransitionNotificationEvent{
+			ChildSessionID: rec.ChildID,
+			ChildTitle:     rec.Title,
+			Profile:        rec.Profile,
+			Kind:           transitionKindFinished,
+			DoneStatus:     rec.Status,
+			DoneSummary:    rec.Summary,
+			Timestamp:      time.Now(),
+		}
+		if d.notifier.deadLetterSink().RecordUnresolvable(ev) {
+			_ = AckCompletion(rec.Profile, rec.ChildID)
+		}
+	}
+}
+
+// maybeSweepInboxTTL invokes SweepInboxByTTL when more than
+// inboxTTLSweepInterval has elapsed since the last call. Issue #962
+// variant: prevents inbox-file growth from children that never see a
+// later transition (the cleanup-on-success path alone can't reach
+// them).
+func (d *TransitionDaemon) maybeSweepInboxTTL() {
+	now := time.Now()
+	if !d.lastInboxTTLSweep.IsZero() && now.Sub(d.lastInboxTTLSweep) < inboxTTLSweepInterval {
+		return
+	}
+	d.lastInboxTTLSweep = now
+	_, _ = SweepInboxByTTL(InboxTTL())
 }
 
 func profilesForTransitionDaemon() []string {
@@ -105,11 +186,13 @@ func (d *TransitionDaemon) syncProfile(profile string) time.Duration {
 
 	byID := make(map[string]*Instance, len(instances))
 	hookCandidates := make(map[string]hookTransitionCandidate, len(instances))
+	hookStatuses := make(map[string]*HookStatus, len(instances))
 	for _, inst := range instances {
 		byID[inst.ID] = inst
 		if IsClaudeCompatible(inst.Tool) || inst.Tool == "codex" || inst.Tool == "gemini" {
 			if hs := d.hookStatusForInstance(inst.ID); hs != nil {
 				inst.UpdateHookStatus(hs)
+				hookStatuses[inst.ID] = hs
 				if candidate, ok := terminalHookTransitionCandidate(inst.Tool, hs); ok {
 					hookCandidates[inst.ID] = candidate
 				}
@@ -151,17 +234,10 @@ func (d *TransitionDaemon) syncProfile(profile string) time.Duration {
 		}
 	}
 
-	// Drain any transitions that were deferred in a prior poll because the
-	// target was StatusRunning. This runs before the initialized-guard so
-	// that each invocation (including `notify-daemon --once`) still retries
-	// persisted queue entries. Without this, deferred events are lost
-	// forever: the child's new status ends up in d.lastStatus below, so the
-	// next poll sees waiting→waiting (no transition) and never retries.
-	d.notifier.DrainRetryQueue(profile)
-
 	if !d.initialized[profile] {
 		// Cover fast transitions that completed before we observed a running snapshot.
 		d.emitHookTransitionCandidates(profile, byID, nil, statuses, hookCandidates)
+		d.emitDoneSignals(profile, byID, hookStatuses)
 		d.lastStatus[profile] = copyStatusMap(statuses)
 		d.initialized[profile] = true
 		return choosePollInterval(statuses)
@@ -175,10 +251,7 @@ func (d *TransitionDaemon) syncProfile(profile string) time.Duration {
 			continue
 		}
 		inst := byID[id]
-		if inst == nil {
-			continue
-		}
-		if !notifyEnabled || inst.NoTransitionNotify {
+		if !notifyEnabled || !instanceAcceptsTransitionEvents(inst) {
 			continue
 		}
 		event := TransitionNotificationEvent{
@@ -188,13 +261,76 @@ func (d *TransitionDaemon) syncProfile(profile string) time.Duration {
 			FromStatus:     from,
 			ToStatus:       to,
 			Timestamp:      time.Now(),
+			LastOutputHash: transitionEventOutputHash(inst),
 		}
 		_ = d.notifier.NotifyTransition(event)
 	}
 	d.emitHookTransitionCandidates(profile, byID, prev, statuses, hookCandidates)
+	d.emitDoneSignals(profile, byID, hookStatuses)
 
 	d.lastStatus[profile] = copyStatusMap(statuses)
 	return choosePollInterval(statuses)
+}
+
+// emitDoneSignals turns a worker-printed completion sentinel (persisted into
+// the hook status file by the Stop-hook handler, issue #1186) into a distinct
+// "finished" event delivered to the parent. Per-task idempotency is enforced
+// via d.lastDone: the same sentinel re-read across polls — or repeated on a
+// later identical Stop — fires at most once. A genuinely new completion
+// (different status/summary) fires again. Stale hook files (older than
+// hookFreshWindow) are ignored so a daemon restart doesn't replay a long-dead
+// completion.
+func (d *TransitionDaemon) emitDoneSignals(profile string, byID map[string]*Instance, hookStatuses map[string]*HookStatus) {
+	if len(hookStatuses) == 0 {
+		return
+	}
+	notifyEnabled := GetNotificationsSettings().GetTransitionEventsEnabled()
+	for id, hs := range hookStatuses {
+		if hs == nil || strings.TrimSpace(hs.DoneStatus) == "" {
+			continue
+		}
+		// Issue #1214: a task worker run one-shot under the completion wrapper
+		// owns its own done signal via the kernel-exit path (cmd.Wait ->
+		// durable record -> active wake). Stand down from poll-inference for it
+		// — the freshness window + lastDone dedup that simulate exactly-once
+		// over a polled file are exactly what the kernel exit replaces. The
+		// claim record exists for the whole run, so this also wins the race
+		// against the worker's own Stop hook. Interactive sessions (no record)
+		// keep the path below unchanged.
+		if CompletionRecordExists(profile, id) {
+			continue
+		}
+		if !hs.UpdatedAt.IsZero() && time.Since(hs.UpdatedAt) > hookFreshWindow {
+			continue
+		}
+		sig := DoneSignal{
+			Status:  strings.ToLower(strings.TrimSpace(hs.DoneStatus)),
+			Summary: strings.TrimSpace(hs.DoneSummary),
+		}
+		if prev, ok := d.lastDone[profile][id]; ok && prev == sig {
+			continue // already emitted this exact completion
+		}
+
+		inst := byID[id]
+		if !notifyEnabled || !instanceAcceptsTransitionEvents(inst) {
+			continue
+		}
+
+		event := TransitionNotificationEvent{
+			ChildSessionID: id,
+			ChildTitle:     inst.Title,
+			Profile:        profile,
+			DoneStatus:     sig.Status,
+			DoneSummary:    sig.Summary,
+			Timestamp:      hs.UpdatedAt,
+		}
+		_ = d.notifier.NotifyFinished(event)
+
+		if d.lastDone[profile] == nil {
+			d.lastDone[profile] = map[string]DoneSignal{}
+		}
+		d.lastDone[profile][id] = sig
+	}
 }
 
 func (d *TransitionDaemon) getStorage(profile string) *Storage {
@@ -304,10 +440,12 @@ func readHookStatusFile(instanceID string) *HookStatus {
 		return nil
 	}
 	var raw struct {
-		Status    string `json:"status"`
-		SessionID string `json:"session_id"`
-		Event     string `json:"event"`
-		Timestamp int64  `json:"ts"`
+		Status      string `json:"status"`
+		SessionID   string `json:"session_id"`
+		Event       string `json:"event"`
+		Timestamp   int64  `json:"ts"`
+		DoneStatus  string `json:"done_status"`
+		DoneSummary string `json:"done_summary"`
 	}
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return nil
@@ -320,10 +458,12 @@ func readHookStatusFile(instanceID string) *HookStatus {
 		updatedAt = time.Unix(raw.Timestamp, 0)
 	}
 	return &HookStatus{
-		Status:    raw.Status,
-		SessionID: raw.SessionID,
-		Event:     raw.Event,
-		UpdatedAt: updatedAt,
+		Status:      raw.Status,
+		SessionID:   raw.SessionID,
+		Event:       raw.Event,
+		UpdatedAt:   updatedAt,
+		DoneStatus:  raw.DoneStatus,
+		DoneSummary: raw.DoneSummary,
 	}
 }
 
@@ -340,10 +480,13 @@ func (d *TransitionDaemon) emitHookTransitionCandidates(
 	notifyEnabled := GetNotificationsSettings().GetTransitionEventsEnabled()
 	for id, candidate := range candidates {
 		inst := byID[id]
-		if inst == nil {
+		if !notifyEnabled || !instanceAcceptsTransitionEvents(inst) {
 			continue
 		}
-		if !notifyEnabled || inst.NoTransitionNotify {
+		// Issue #1214: the completion wrapper owns a task worker's terminal
+		// signal; suppress poll-inferred candidates for it. Interactive
+		// sessions (no completion record) are unaffected.
+		if CompletionRecordExists(profile, id) {
 			continue
 		}
 
@@ -371,6 +514,7 @@ func (d *TransitionDaemon) emitHookTransitionCandidates(
 			FromStatus:     string(StatusRunning),
 			ToStatus:       to,
 			Timestamp:      candidate.Timestamp,
+			LastOutputHash: transitionEventOutputHash(inst),
 		}
 		_ = d.notifier.NotifyTransition(event)
 	}

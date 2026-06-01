@@ -102,6 +102,12 @@ type UserConfig struct {
 	// Copilot defines GitHub Copilot CLI integration settings (Issue #556)
 	Copilot CopilotSettings `toml:"copilot"`
 
+	// Crush defines charmbracelet/crush CLI integration settings (Issue #940)
+	Crush CrushSettings `toml:"crush"`
+
+	// Hermes defines Hermes Agent CLI integration settings
+	Hermes HermesSettings `toml:"hermes"`
+
 	// Worktree defines git worktree preferences
 	Worktree WorktreeSettings `toml:"worktree"`
 
@@ -177,6 +183,129 @@ type UserConfig struct {
 
 	// Web defines `agent-deck web` HTTP server settings.
 	Web WebSettings `toml:"web"`
+
+	// UI defines TUI layout settings (split ratios, etc).
+	UI UISettings `toml:"ui"`
+}
+
+// UISettings controls TUI layout proportions.
+// See issue #1092.
+type UISettings struct {
+	// PreviewPct is the percentage of horizontal width allocated to the
+	// preview pane (sessions list gets the remainder). Valid range: 10-90.
+	// Default: 65 (current behavior — sessions 35 / preview 65).
+	// Adjustable at runtime via < and > keybindings (5% step).
+	PreviewPct int `toml:"preview_pct"`
+
+	// ITermOpenAs controls whether Shift+Enter pops the focused session
+	// into a new iTerm2 *tab* or a new iTerm2 *window* on macOS. Valid
+	// values: "tab", "window". Empty defaults to "tab" (iTerm's natural
+	// UX). Issue #1100, follow-up to #1098 — credit @ddorman-dn.
+	ITermOpenAs string `toml:"iterm_open_as"`
+	// RemoteLatencyRefreshSecs sets how often the TUI re-measures the
+	// round-trip latency to each configured remote (issue #1103). Valid
+	// range: 2-300. Default: matches [system_stats].refresh_seconds (5s)
+	// so the latency marker ticks alongside CPU/RAM/load.
+	RemoteLatencyRefreshSecs int `toml:"remote_latency_refresh_secs"`
+	// RemoteSessionRefreshSecs sets how often the TUI re-fetches the remote
+	// session list over SSH (issue #1170). Remote sessions created after the
+	// TUI launched were invisible until quit+relaunch; this is the poll
+	// cadence that reconciles the list. Valid range: 5-300. Default: 15s,
+	// tightening the visibility latency reported on v1.9.30.
+	RemoteSessionRefreshSecs int `toml:"remote_session_refresh_secs"`
+}
+
+// DefaultPreviewPct is the default preview-pane width percentage.
+// Matches the historical hardcoded 0.35 sessions / 0.65 preview split.
+const DefaultPreviewPct = 65
+
+// MinPreviewPct and MaxPreviewPct bound the preview width to keep both
+// panes usable.
+const (
+	MinPreviewPct = 10
+	MaxPreviewPct = 90
+)
+
+// iTerm "open as" modes for Shift+Enter dispatch.
+const (
+	ITermOpenAsTab     = "tab"
+	ITermOpenAsWindow  = "window"
+	DefaultITermOpenAs = ITermOpenAsTab
+)
+
+// GetPreviewPct returns the configured preview percentage, clamped to
+// [MinPreviewPct, MaxPreviewPct]. Falls back to DefaultPreviewPct when
+// unset or out of range.
+func (u UISettings) GetPreviewPct() int {
+	if u.PreviewPct <= 0 {
+		return DefaultPreviewPct
+	}
+	if u.PreviewPct < MinPreviewPct {
+		return MinPreviewPct
+	}
+	if u.PreviewPct > MaxPreviewPct {
+		return MaxPreviewPct
+	}
+	return u.PreviewPct
+}
+
+// GetITermOpenAs returns the configured iTerm open mode. Unknown or
+// empty values fall through to the default ("tab"). Matching is
+// case-insensitive so users can write "Tab" or "WINDOW" in TOML.
+func (u UISettings) GetITermOpenAs() string {
+	switch strings.ToLower(strings.TrimSpace(u.ITermOpenAs)) {
+	case ITermOpenAsWindow:
+		return ITermOpenAsWindow
+	case ITermOpenAsTab:
+		return ITermOpenAsTab
+	}
+	return DefaultITermOpenAs
+}
+
+// Remote session-list poll cadence bounds (issue #1170). The default is
+// deliberately tighter than the historical hardcoded 30s so new remote
+// sessions surface promptly; the min keeps a floor on SSH frequency.
+const (
+	DefaultRemoteSessionRefreshSecs = 15
+	MinRemoteSessionRefreshSecs     = 5
+	MaxRemoteSessionRefreshSecs     = 300
+)
+
+// GetRemoteSessionRefreshSecs returns the remote session-list poll interval
+// in seconds, clamped to [MinRemoteSessionRefreshSecs,
+// MaxRemoteSessionRefreshSecs]. Unset (<= 0) falls back to
+// DefaultRemoteSessionRefreshSecs. See issue #1170.
+func (u UISettings) GetRemoteSessionRefreshSecs() int {
+	val := u.RemoteSessionRefreshSecs
+	if val <= 0 {
+		return DefaultRemoteSessionRefreshSecs
+	}
+	if val < MinRemoteSessionRefreshSecs {
+		return MinRemoteSessionRefreshSecs
+	}
+	if val > MaxRemoteSessionRefreshSecs {
+		return MaxRemoteSessionRefreshSecs
+	}
+	return val
+}
+
+// GetRemoteLatencyRefreshSecs returns the remote latency refresh interval
+// in seconds, clamped to [2, 300]. When the user has not set this value
+// it falls back to fallbackSecs (typically the system_stats refresh
+// interval, so the latency marker ticks at the same cadence as CPU/RAM
+// per #1103). fallbackSecs <= 0 maps to 5.
+func (u UISettings) GetRemoteLatencyRefreshSecs(fallbackSecs int) int {
+	val := u.RemoteLatencyRefreshSecs
+	if val <= 0 {
+		val = fallbackSecs
+	}
+	if val < 2 {
+		val = 5
+	}
+	if val > 300 {
+		val = 300
+	}
+	return val
 }
 
 // WebSettings configures the `agent-deck web` HTTP server.
@@ -245,6 +374,8 @@ func (rc RemoteConfig) GetProfile() string {
 type ProfileSettings struct {
 	// Claude defines Claude Code overrides for a specific profile.
 	Claude ProfileClaudeSettings `toml:"claude"`
+	// Codex defines Codex CLI overrides for a specific profile.
+	Codex ProfileCodexSettings `toml:"codex"`
 	// Costs defines profile-specific cost-tracking overrides.
 	// Nil pointer means "no [profiles.<name>.costs] block in TOML"; the
 	// resolver falls through to global [costs] settings.
@@ -254,6 +385,12 @@ type ProfileSettings struct {
 // ProfileClaudeSettings defines profile-specific Claude overrides.
 type ProfileClaudeSettings struct {
 	// ConfigDir overrides [claude].config_dir for this profile only.
+	ConfigDir string `toml:"config_dir"`
+}
+
+// ProfileCodexSettings defines profile-specific Codex overrides.
+type ProfileCodexSettings struct {
+	// ConfigDir overrides [codex].config_dir for this profile only.
 	ConfigDir string `toml:"config_dir"`
 }
 
@@ -542,6 +679,15 @@ type ShellSettings struct {
 	// IgnoreMissingEnvFiles silently ignores missing .env files (default: true)
 	// When false, sessions will error if an env_file doesn't exist
 	IgnoreMissingEnvFiles *bool `toml:"ignore_missing_env_files"`
+
+	// ExitToShell, when true, wraps built-in agent spawn commands so that
+	// exiting the agent (e.g. `/exit` from Claude Code) drops the pane back to
+	// an interactive shell at the same cwd instead of the pane dying / the TUI
+	// auto-restarting. This restores the pre-#503 workflow: exit → do shell-only
+	// work (aws-vault exec, direnv, …) → `claude --resume` the same session.
+	// Default: false (opt-in). Issue #1161, design doc
+	// docs/decisions/1161-exit-to-shell-then-resume.md.
+	ExitToShell *bool `toml:"exit_to_shell"`
 }
 
 // GetIgnoreMissingEnvFiles returns whether to ignore missing env files, defaulting to true
@@ -550,6 +696,15 @@ func (s *ShellSettings) GetIgnoreMissingEnvFiles() bool {
 		return true // Default: ignore missing files (fail-safe)
 	}
 	return *s.IgnoreMissingEnvFiles
+}
+
+// GetExitToShell returns whether agent sessions should fall back to an
+// interactive shell on agent exit, defaulting to false (opt-in). Issue #1161.
+func (s *ShellSettings) GetExitToShell() bool {
+	if s.ExitToShell == nil {
+		return false // Default: OFF (preserve current exit/resume behavior)
+	}
+	return *s.ExitToShell
 }
 
 // GetShowAnalytics returns whether to show analytics, defaulting to false
@@ -684,6 +839,12 @@ type ClaudeSettings struct {
 	// copied to Instance.ExtraArgs when a Claude session is created.
 	ExtraArgs []string `toml:"extra_args"`
 
+	// DefaultModel is the model to preselect for new Claude sessions
+	// (e.g., "claude-opus-4-7"). Mirrors [gemini]/[opencode]/[copilot]
+	// default_model. When empty, the dialog leaves the model unset and Claude
+	// Code falls back to its own default (#1172).
+	DefaultModel string `toml:"default_model"`
+
 	// UseChrome enables --chrome by default for Claude sessions.
 	UseChrome bool `toml:"use_chrome"`
 
@@ -700,6 +861,13 @@ type ClaudeSettings struct {
 	// for instant, deterministic status updates instead of polling tmux content.
 	// Default: true (nil = use default true, set false to disable)
 	HooksEnabled *bool `toml:"hooks_enabled"`
+
+	// AutoResumeSummary auto-presses Enter on Claude's "Resume from summary"
+	// picker that appears after `claude --resume` on long-running sessions
+	// (>~250k tokens). Critical for unattended conductors which would
+	// otherwise sit frozen on the picker forever (closes #67).
+	// Default: true (nil = use default true, set false to disable).
+	AutoResumeSummary *bool `toml:"auto_resume_summary"`
 }
 
 // GetProfileClaudeConfigDir returns the profile-specific Claude config directory, if configured.
@@ -714,28 +882,37 @@ func (c *UserConfig) GetProfileClaudeConfigDir(profile string) string {
 	return ExpandPath(profileCfg.Claude.ConfigDir)
 }
 
-// GetGroupClaudeConfigDir returns the group-specific Claude config directory, if configured.
+// GetGroupClaudeConfigDir returns the group-specific Claude config directory,
+// walking ancestor groups when the exact path has no override. A child group
+// like "personal/foo" inherits the [groups."personal".claude].config_dir
+// setting from its parent so per-group account isolation propagates through
+// nested groups.
 func (c *UserConfig) GetGroupClaudeConfigDir(groupPath string) string {
 	if c == nil || groupPath == "" || c.Groups == nil {
 		return ""
 	}
-	groupCfg, ok := c.Groups[groupPath]
-	if !ok || groupCfg.Claude.ConfigDir == "" {
-		return ""
+	for p := groupPath; p != ""; p = getParentPath(p) {
+		if groupCfg, ok := c.Groups[p]; ok && groupCfg.Claude.ConfigDir != "" {
+			return ExpandPath(groupCfg.Claude.ConfigDir)
+		}
 	}
-	return ExpandPath(groupCfg.Claude.ConfigDir)
+	return ""
 }
 
-// GetGroupClaudeEnvFile returns the group-specific Claude env file, if configured.
+// GetGroupClaudeEnvFile returns the group-specific Claude env file, walking
+// ancestor groups when the exact path has no override. Mirrors
+// GetGroupClaudeConfigDir's inheritance semantics so nested groups don't
+// silently drop the parent's env_file.
 func (c *UserConfig) GetGroupClaudeEnvFile(groupPath string) string {
 	if c == nil || groupPath == "" || c.Groups == nil {
 		return ""
 	}
-	groupCfg, ok := c.Groups[groupPath]
-	if !ok || groupCfg.Claude.EnvFile == "" {
-		return ""
+	for p := groupPath; p != ""; p = getParentPath(p) {
+		if groupCfg, ok := c.Groups[p]; ok && groupCfg.Claude.EnvFile != "" {
+			return groupCfg.Claude.EnvFile
+		}
 	}
-	return groupCfg.Claude.EnvFile
+	return ""
 }
 
 // GetConductorClaudeConfigDir returns the conductor-specific Claude config
@@ -786,6 +963,18 @@ func (c *ClaudeSettings) GetHooksEnabled() bool {
 	return *c.HooksEnabled
 }
 
+// GetAutoResumeSummary returns whether the "Resume from summary" picker is
+// auto-confirmed on session restart, defaulting to true. Conductors and any
+// other unattended session runner depend on this — without it, a single
+// claude --resume on a >250k-token session leaves the session frozen on the
+// picker screen forever.
+func (c *ClaudeSettings) GetAutoResumeSummary() bool {
+	if c.AutoResumeSummary == nil {
+		return true
+	}
+	return *c.AutoResumeSummary
+}
+
 // GeminiSettings defines Gemini CLI configuration
 type GeminiSettings struct {
 	// YoloMode enables --yolo flag for Gemini sessions (auto-approve all actions)
@@ -800,6 +989,10 @@ type GeminiSettings struct {
 	// Sourced AFTER global [shell].env_files
 	// Path can be absolute, ~ for home, $HOME/${VAR} for env vars, or relative to session working directory
 	EnvFile string `toml:"env_file"`
+
+	// Command overrides the default binary/invocation for Gemini sessions.
+	// Supports flags (e.g., "gemini --custom-flag"). Default: "gemini"
+	Command string `toml:"command"`
 }
 
 // OpenCodeSettings defines OpenCode CLI configuration
@@ -817,6 +1010,10 @@ type OpenCodeSettings struct {
 	// Sourced AFTER global [shell].env_files
 	// Path can be absolute, ~ for home, $HOME/${VAR} for env vars, or relative to session working directory
 	EnvFile string `toml:"env_file"`
+
+	// Command overrides the default binary/invocation for OpenCode sessions.
+	// Supports flags (e.g., "opencode --custom-flag"). Default: "opencode"
+	Command string `toml:"command"`
 }
 
 // CodexSettings defines Codex CLI configuration
@@ -825,9 +1022,30 @@ type CodexSettings struct {
 	// Default: "codex"
 	Command string `toml:"command"`
 
+	// ConfigDir is the path to Codex home directory.
+	// Default: ~/.codex (or CODEX_HOME env var)
+	ConfigDir string `toml:"config_dir"`
+
 	// YoloMode enables --yolo flag for Codex sessions (bypass approvals and sandbox)
 	// Default: false
 	YoloMode bool `toml:"yolo_mode"`
+
+	// EnvFile is a .env file specific to Codex sessions
+	// Sourced AFTER global [shell].env_files
+	// Path can be absolute, ~ for home, $HOME/${VAR} for env vars, or relative to session working directory
+	EnvFile string `toml:"env_file"`
+}
+
+// GetProfileCodexConfigDir returns the profile-specific Codex config directory, if configured.
+func (c *UserConfig) GetProfileCodexConfigDir(profile string) string {
+	if c == nil || profile == "" || c.Profiles == nil {
+		return ""
+	}
+	profileCfg, ok := c.Profiles[profile]
+	if !ok || profileCfg.Codex.ConfigDir == "" {
+		return ""
+	}
+	return ExpandPath(profileCfg.Codex.ConfigDir)
 }
 
 // CopilotSettings defines GitHub Copilot CLI configuration (Issue #556).
@@ -837,6 +1055,52 @@ type CopilotSettings struct {
 	// EnvFile is a .env file specific to Copilot sessions (sourced before
 	// the `copilot` command runs, like [gemini].env_file). Optional.
 	EnvFile string `toml:"env_file"`
+
+	// Command overrides the default binary/invocation for Copilot sessions.
+	// Supports flags (e.g., "copilot --custom-flag"). Default: "copilot"
+	Command string `toml:"command"`
+
+	// DefaultModel sets the Copilot model for new sessions (e.g., "claude-opus-4.6",
+	// "gpt-5.2"). Passed as --model <value>. Can be overridden per-session.
+	DefaultModel string `toml:"default_model"`
+
+	// AllowAll enables --allow-all by default for new sessions (equivalent to
+	// --allow-all-tools --allow-all-paths --allow-all-urls). Can be overridden
+	// per-session.
+	AllowAll bool `toml:"allow_all"`
+}
+
+// HermesSettings defines Hermes Agent CLI configuration.
+// Binary: `hermes` from github.com/NousResearch/hermes-agent (MIT, v0.13.0+).
+// Status detection: process-alive/dead only (content-sniffing deferred).
+type HermesSettings struct {
+	// Command is the Hermes CLI command or invocation to use.
+	// Supports flags (e.g., "hermes --model gpt-5.5-pro --provider openai").
+	// Default: "hermes"
+	Command string `toml:"command"`
+	// EnvFile is a .env file specific to Hermes sessions (sourced before
+	// the `hermes` command runs). Optional.
+	EnvFile string `toml:"env_file"`
+	// YoloMode enables --yolo flag for Hermes sessions (auto-approve all tool calls).
+	// Default: false
+	YoloMode bool `toml:"yolo_mode"`
+}
+
+// CrushSettings defines charmbracelet/crush CLI configuration (Issue #940).
+// Binary: `crush` from github.com/charmbracelet/crush. Interactive TUI.
+// Key flags: --yolo, --session/-s <id>, --continue/-C, --cwd, --debug.
+type CrushSettings struct {
+	// Command overrides the default binary/invocation for Crush sessions.
+	// Supports flags (e.g., "crush --debug"). Default: "crush"
+	Command string `toml:"command"`
+
+	// EnvFile is a .env file specific to Crush sessions (sourced before
+	// the `crush` command runs, like [gemini].env_file). Optional.
+	EnvFile string `toml:"env_file"`
+
+	// YoloMode enables --yolo flag for Crush sessions (auto-accept all
+	// permission prompts). Default: false
+	YoloMode bool `toml:"yolo_mode"`
 }
 
 // WorktreeSettings contains git worktree preferences.
@@ -1928,9 +2192,45 @@ func GetCustomToolNames() []string {
 	return names
 }
 
+// GetToolCommand returns the configured command override for a builtin tool,
+// falling back to the bare tool name if no override is set.
+func GetToolCommand(toolName string) string {
+	config, _ := LoadUserConfig()
+	if config == nil {
+		return toolName
+	}
+	switch toolName {
+	case "claude":
+		if config.Claude.Command != "" {
+			return config.Claude.Command
+		}
+	case "gemini":
+		if config.Gemini.Command != "" {
+			return config.Gemini.Command
+		}
+	case "opencode":
+		if config.OpenCode.Command != "" {
+			return config.OpenCode.Command
+		}
+	case "codex":
+		if config.Codex.Command != "" {
+			return config.Codex.Command
+		}
+	case "copilot":
+		if config.Copilot.Command != "" {
+			return config.Copilot.Command
+		}
+	case "hermes":
+		if config.Hermes.Command != "" {
+			return config.Hermes.Command
+		}
+	}
+	return toolName
+}
+
 func isBuiltinToolName(toolName string) bool {
 	switch toolName {
-	case "claude", "gemini", "opencode", "codex", "copilot", "pi", "shell", "cursor", "aider":
+	case "claude", "gemini", "opencode", "codex", "copilot", "crush", "cursor", "hermes", "pi", "shell", "aider":
 		return true
 	default:
 		return false
@@ -1956,10 +2256,14 @@ func GetToolIcon(toolName string) string {
 		return "💻"
 	case "copilot":
 		return "🐙"
-	case "pi":
-		return "π"
+	case "crush":
+		return "💘"
 	case "cursor":
 		return "📝"
+	case "hermes":
+		return "☤"
+	case "pi":
+		return "π"
 	case "shell":
 		return "🐚"
 	default:
@@ -2480,6 +2784,8 @@ func CreateExampleConfig() error {
 # dangerous_mode = true
 # Extra Claude CLI flags remembered from the New Session dialog
 # extra_args = ["--agent", "reviewer"]
+# Default model preselected for new sessions (must be a known catalog model)
+# default_model = "claude-opus-4-7"
 # Enable Chrome / teammate mode by default
 # use_chrome = false
 # use_teammate_mode = false
@@ -2500,6 +2806,12 @@ func CreateExampleConfig() error {
 # [codex]
 # Codex CLI command or alias to use (default: "codex")
 # command = "codex"
+# Custom config directory/home for Codex sessions
+# Default: ~/.codex (or CODEX_HOME env var takes priority)
+# config_dir = "~/.codex-work"
+# Optional per-profile override (takes precedence over [codex] when profile matches)
+# [profiles.work.codex]
+# config_dir = "~/.codex-work"
 # Enable --yolo (bypass approvals and sandbox) by default (default: false)
 # yolo_mode = true
 

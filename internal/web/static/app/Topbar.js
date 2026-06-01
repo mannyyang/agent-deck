@@ -39,7 +39,7 @@ export function Topbar() {
     : { background: 'var(--tn-red)', boxShadow: '0 0 6px var(--tn-red)' }
 
   return html`
-    <div class="topbar">
+    <header class="topbar">
       <div class="top-brand">
         <${Logo}/>
         <div class="brand-text">agent-deck<span class="dim">web</span></div>
@@ -94,10 +94,10 @@ export function Topbar() {
             ${rail === 'visible' && html`<line x1="18" y1="8" x2="18" y2="16" opacity="0.5"/>`}
           </svg>
         </button>
-        <button class="icon-btn" onClick=${() => (tweaksOpenSignal.value = !tweaksOpenSignal.value)} title="Tweaks (?)" aria-label="Tweaks">
+        <button class="icon-btn" onClick=${() => (tweaksOpenSignal.value = !tweaksOpenSignal.value)} title="Tweaks" aria-label="Tweaks">
           <${Icon} d=${ICONS.settings}/>
         </button>
       </div>
-    </div>
+    </header>
   `
 }

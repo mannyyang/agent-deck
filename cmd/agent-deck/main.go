@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
@@ -33,10 +34,11 @@ import (
 	"github.com/asheshgoplani/agent-deck/internal/tmux"
 	"github.com/asheshgoplani/agent-deck/internal/ui"
 	"github.com/asheshgoplani/agent-deck/internal/update"
+	"github.com/asheshgoplani/agent-deck/internal/vcs"
 	"github.com/asheshgoplani/agent-deck/internal/web"
 )
 
-var Version = "1.8.3" // overridden at build time via -ldflags "-X main.Version=..."
+var Version = "1.9.44" // overridden at build time via -ldflags "-X main.Version=..."
 
 // Table column widths for list command output
 const (
@@ -224,6 +226,9 @@ func main() {
 
 	var webEnabled bool
 	var webArgs []string
+	// webHeadless: true when --no-tui is passed to the `web` subcommand.
+	// Skips bubbletea boot (the bulk of ~60 MB RSS) and runs HTTP-server only.
+	var webHeadless bool
 
 	// Handle subcommands
 	if len(args) > 0 {
@@ -286,6 +291,9 @@ func main() {
 		case "conductor":
 			handleConductor(profile, args[1:])
 			return
+		case "telegram-doctor":
+			handleTelegramDoctor(profile, args[1:])
+			return
 		case "watcher":
 			handleWatcher(profile, args[1:])
 			return
@@ -303,8 +311,12 @@ func main() {
 			return
 		case "web":
 			webEnabled = true
-			webArgs = append(webArgs, args[1:]...)
-			// fall through to TUI launch below
+			// Extract --no-tui out of webArgs before buildWebServer's flag set
+			// sees it. The TUI-vs-headless decision is made at bootstrap (it
+			// controls whether bubbletea ever boots), so it lives outside the
+			// per-server flag set.
+			webHeadless, webArgs = extractNoTuiFlag(args[1:])
+			// fall through to TUI launch below (or headless server boot if --no-tui)
 		case "uninstall":
 			handleUninstall(args[1:])
 			return
@@ -326,6 +338,9 @@ func main() {
 		case "notify-daemon":
 			handleNotifyDaemon(args[1:])
 			return
+		case "run-task":
+			handleRunTask(args[1:])
+			return
 		case "inbox":
 			handleInbox(args[1:])
 			return
@@ -346,7 +361,8 @@ func main() {
 
 	// Block TUI launch inside a managed session to prevent infinite nesting.
 	// CLI commands (add, session start/stop, mcp attach, etc.) still work fine.
-	if isNestedSession() {
+	// In headless web mode (--no-tui), no TUI launches, so this guard is skipped.
+	if !webHeadless && isNestedSession() {
 		fmt.Fprintln(os.Stderr, "Error: Cannot launch the agent-deck TUI inside an agent-deck session.")
 		fmt.Fprintln(os.Stderr, "This would create a recursive nested session.")
 		fmt.Fprintln(os.Stderr, "")
@@ -363,8 +379,9 @@ func main() {
 	// Block TUI launch inside a *generic* (non-agentdeck) tmux session (#560).
 	// Detach semantics get confusing when nested: Ctrl+Q returns to the outer
 	// tmux instead of a clean shell. CLI subcommands still work inside tmux —
-	// this guard only fires on the interactive TUI path.
-	if isOuterTmuxWithoutOptIn() {
+	// this guard only fires on the interactive TUI path. Headless web mode
+	// (--no-tui) skips it for the same reason: no TUI, no detach surprise.
+	if !webHeadless && isOuterTmuxWithoutOptIn() {
 		fmt.Fprintln(os.Stderr, "Error: The agent-deck TUI is designed to run OUTSIDE of tmux.")
 		fmt.Fprintln(os.Stderr, "You are inside a tmux session, so Ctrl+Q detach and nested")
 		fmt.Fprintln(os.Stderr, "tmux behavior will be surprising. agent-deck manages its own")
@@ -388,10 +405,14 @@ func main() {
 	theme := session.ResolveTheme()
 	ui.InitTheme(theme)
 
-	// Check for updates and prompt user before launching TUI
-	if promptForUpdate() {
-		// Update was performed, exit so user can restart with new version
-		return
+	// Check for updates and prompt user before launching TUI. Headless web
+	// mode (--no-tui) skips this — it's an interactive prompt that would
+	// hang a non-TTY process.
+	if !webHeadless {
+		if promptForUpdate() {
+			// Update was performed, exit so user can restart with new version
+			return
+		}
 	}
 
 	// Check if tmux is available (with fallback path search)
@@ -543,6 +564,9 @@ func main() {
 	// inflate the counter.
 	if fbSt, _ := feedback.LoadState(); fbSt != nil {
 		feedback.RecordLaunch(fbSt, time.Now())
+		// #967: migrate pre-existing forever-opt-outs to per-release-series.
+		// Idempotent — no-op once OptOutVersion is set or feedback is enabled.
+		feedback.MigrateLegacyOptOut(fbSt, Version)
 		_ = feedback.SaveState(fbSt)
 	}
 
@@ -690,7 +714,9 @@ func main() {
 		}
 	}
 
-	// Start web server alongside TUI if "web" subcommand was used
+	// Start web server alongside TUI if "web" subcommand was used.
+	// When --no-tui is also set, run the HTTP server in the foreground and
+	// skip bubbletea entirely — the perf win that motivated this flag.
 	if webEnabled {
 		effectiveProfile := session.GetEffectiveProfile(profile)
 		fallbackMenuData := web.NewSessionDataService(effectiveProfile)
@@ -705,6 +731,28 @@ func main() {
 		if costStore != nil {
 			server.SetCostStore(costStore)
 		}
+
+		if webHeadless {
+			// Headless: block on server.Start() and skip bubbletea. The
+			// HTTP server uses SessionDataService (storage-backed) as a
+			// fallback when MemoryMenuData has no snapshot, so the web UI
+			// reads live data from storage on each request.
+			fmt.Println("Headless mode: TUI disabled")
+			fmt.Printf("Web server: http://%s\n", server.Addr())
+			defer func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				_ = server.Shutdown(ctx)
+			}()
+			if err := server.Start(); err != nil {
+				logging.ForComponent(logging.CompWeb).Error("web_server_error",
+					slog.String("error", err.Error()))
+				fmt.Fprintf(os.Stderr, "Error: web server: %v\n", err)
+				os.Exit(1)
+			}
+			return
+		}
+
 		go func() {
 			if err := server.Start(); err != nil {
 				logging.ForComponent(logging.CompWeb).Error("web_server_error",
@@ -734,6 +782,15 @@ func main() {
 	// sequences even after the disable request (e.g. tmux with extended-keys).
 	ui.DisableKittyKeyboard(os.Stdout)
 	defer ui.RestoreKittyKeyboard(os.Stdout)
+
+	// Issue #1093: also request xterm modifyOtherKeys mode 1 so iTerm2 (and
+	// other xterm-compatible terminals) send Shift+Enter as a distinct
+	// CSI 27;2;13~ sequence instead of plain '\r'. Without this, Bubble Tea
+	// v1.3.10 cannot distinguish Shift+Enter from Enter on a fresh launch,
+	// and the "open in new iTerm window" binding shipped in #1077 falls
+	// through to the in-pane attach handler. Plain Enter is unaffected.
+	ui.EnableModifyOtherKeys(os.Stdout)
+	defer ui.DisableModifyOtherKeys(os.Stdout)
 
 	p := tea.NewProgram(
 		homeModel,
@@ -855,30 +912,41 @@ func extractSelectFlag(args []string) (string, []string) {
 // Go's flag package stops parsing at the first non-flag argument,
 // so "add . -c claude" would fail to parse -c without this fix.
 // This reorders to "add -c claude ." which parses correctly.
+//
+// Issue #974: Go's flag package treats `-parent` and `--parent` as the
+// same flag, but this reorder pass historically only matched the exact
+// double-dash spelling. The result was that `launch -parent <pid>` did
+// not pair `-parent` with `<pid>` — `<pid>` got demoted to a positional
+// and the wrong arg ended up as the parent value. We now match flag
+// names by their normalized form (dashes stripped from the left) so
+// `-parent` and `--parent` behave identically here too.
 func reorderArgsForFlagParsing(args []string) []string {
 	if len(args) == 0 {
 		return args
 	}
 
-	// Known flags that take a value (need to skip their values)
-	// Note: -b/--new-branch are boolean flags (no value), so not included here
-	valueFlags := map[string]bool{
-		"-t": true, "--title": true,
-		"-g": true, "--group": true,
-		"-c": true, "--cmd": true,
-		"-m": true, "--message": true,
-		"-p": true, "--parent": true,
-		"--mcp":       true,
-		"--channel":   true,
-		"--plugin":    true,
-		"--extra-arg": true,
-		"--wrapper":   true,
-		"-w":          true, "--worktree": true,
-		"--location":       true,
-		"--resume-session": true,
-		"--sandbox-image":  true,
-		"--ssh":            true,
-		"--remote-path":    true,
+	// Known flag *names* (no leading dashes) that take a value.
+	// Note: -b/--new-branch are boolean flags (no value), so not included here.
+	valueFlagNames := map[string]bool{
+		"t": true, "title": true,
+		"g": true, "group": true,
+		"c": true, "cmd": true,
+		"m": true, "message": true,
+		"p": true, "parent": true,
+		"mcp":            true,
+		"channel":        true,
+		"plugin":         true,
+		"extra-arg":      true,
+		"wrapper":        true,
+		"model":          true,
+		"w":              true,
+		"worktree":       true,
+		"location":       true,
+		"resume-session": true,
+		"sandbox-image":  true,
+		"ssh":            true,
+		"remote-path":    true,
+		"tmux-socket":    true,
 	}
 
 	var flags []string
@@ -888,12 +956,17 @@ func reorderArgsForFlagParsing(args []string) []string {
 		arg := args[i]
 
 		// Check if it's a flag
-		if strings.HasPrefix(arg, "-") {
+		if strings.HasPrefix(arg, "-") && arg != "-" {
 			flags = append(flags, arg)
 
-			// Check if this flag takes a value (and value is separate)
-			// Handle both "-c value" and "-c=value" formats
-			if !strings.Contains(arg, "=") && valueFlags[arg] && i+1 < len(args) {
+			// `-foo=bar` carries its value in the same token.
+			if strings.Contains(arg, "=") {
+				continue
+			}
+
+			// Normalize "-foo" / "--foo" to "foo" for lookup.
+			name := strings.TrimLeft(arg, "-")
+			if valueFlagNames[name] && i+1 < len(args) {
 				i++
 				flags = append(flags, args[i])
 			}
@@ -1102,6 +1175,7 @@ func handleAdd(profile string, args []string) {
 
 	// Resume session flag
 	resumeSession := fs.String("resume-session", "", "Claude session ID to resume (skips new session creation)")
+	modelID := fs.String("model", "", "Model ID/version to use for this session (claude, codex, gemini, opencode)")
 	yoloMode := fs.Bool("yolo", false, "Enable YOLO mode for Gemini or Codex sessions")
 	geminiYoloMode := fs.Bool("gemini-yolo", false, "Enable YOLO mode (alias for --yolo)")
 
@@ -1110,6 +1184,12 @@ func handleAdd(profile string, args []string) {
 	// config. Captured once at creation and persisted on the Instance —
 	// subsequent start/restart/revive always target the same socket.
 	tmuxSocket := fs.String("tmux-socket", "", "tmux -L socket name for this session (overrides [tmux].socket_name)")
+
+	// Per-session named account slot (#924). Maps to
+	// [profiles.<account>.claude].config_dir in ~/.agent-deck/config.toml
+	// and becomes the most-specific level of CLAUDE_CONFIG_DIR resolution.
+	// Empty = fall through to conductor/group/env/profile/global/default.
+	account := fs.String("account", "", "Named account slot (resolves via [profiles.<account>.claude].config_dir; #924)")
 
 	fs.Usage = func() {
 		fmt.Println("Usage: agent-deck add [path] [options]")
@@ -1127,6 +1207,8 @@ func handleAdd(profile string, args []string) {
 		fmt.Println("  agent-deck add /path/to/project")
 		fmt.Println("  agent-deck add -t \"My Project\" -g \"work\"")
 		fmt.Println("  agent-deck add -c claude .")
+		fmt.Println("  agent-deck add -c codex --model gpt-5.5 .")
+		fmt.Println("  agent-deck add -c gemini --model gemini-3.1-pro-preview .")
 		fmt.Println("  agent-deck -p work add               # Add to 'work' profile")
 		fmt.Println("  agent-deck add -t \"Sub-task\" --parent \"Main Project\"  # Create sub-session")
 		fmt.Println("  agent-deck add -t \"Research\" -c claude --mcp memory --mcp sequential-thinking /tmp/x")
@@ -1221,11 +1303,15 @@ func handleAdd(profile string, args []string) {
 			fmt.Printf("Error: cannot create sub-session of a sub-session (single level only)\n")
 			os.Exit(1)
 		}
-		sessionGroup = resolveGroupSelection(sessionGroup, parentInstance.GroupPath, explicitGroupProvided)
+		// handleAdd resolves `path` AFTER this block (see below), so the
+		// cwd-derived group is not available here. Passing "" preserves
+		// handleAdd's existing behavior; the #972 cwd-over-parent priority
+		// is wired into `launch` where path is already known at this point.
+		sessionGroup = resolveGroupSelection(sessionGroup, "", parentInstance.GroupPath, explicitGroupProvided)
 	} else if !*noParent {
 		parentInstance = resolveAutoParentInstance(instances)
 		if parentInstance != nil && !parentInstance.IsSubSession() {
-			sessionGroup = resolveGroupSelection(sessionGroup, parentInstance.GroupPath, explicitGroupProvided)
+			sessionGroup = resolveGroupSelection(sessionGroup, "", parentInstance.GroupPath, explicitGroupProvided)
 		} else {
 			parentInstance = nil
 		}
@@ -1279,20 +1365,15 @@ func handleAdd(profile string, args []string) {
 	}
 
 	// Handle worktree creation
-	var worktreePath, worktreeRepoRoot string
+	var worktreePath, worktreeRepoRoot, worktreeType string
 	if wtBranch != "" {
-		// Validate path is a git repo (or a bare-repo project root with nested .bare/)
-		if !git.IsGitRepoOrBareProjectRoot(path) {
-			fmt.Fprintf(os.Stderr, "Error: %s is not a git repository\n", path)
-			os.Exit(1)
-		}
-
-		// Get repo root (resolve through worktrees to prevent nesting)
-		repoRoot, err := git.GetWorktreeBaseRoot(path)
+		backend, err := detectAndCreateBackend(path)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: failed to get repo root: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
+		worktreeType = string(backend.Type())
+		repoRoot := backend.RepoDir()
 
 		// Determine worktree settings and apply configured branch prefix
 		// (e.g., "$USER/" -> "dani.fernandez/") before validation/existence checks
@@ -1306,7 +1387,7 @@ func handleAdd(profile string, args []string) {
 		}
 
 		// Check -b flag logic: if -b is passed, branch must NOT exist (user wants new branch)
-		branchExists := git.BranchExists(repoRoot, wtBranch)
+		branchExists := backend.BranchExists(wtBranch)
 		if createNewBranch && branchExists {
 			fmt.Fprintf(
 				os.Stderr,
@@ -1322,16 +1403,15 @@ func handleAdd(profile string, args []string) {
 		}
 
 		// Generate worktree path
-		worktreePath = git.WorktreePath(git.WorktreePathOptions{
+		worktreePath = backend.WorktreePath(vcs.WorktreePathOptions{
 			Branch:    wtBranch,
 			Location:  location,
-			RepoDir:   repoRoot,
 			SessionID: git.GeneratePathID(),
 			Template:  wtSettings.Template(),
 		})
 
 		// Check for an existing worktree for this branch before creating a new one
-		if existingPath, err := git.GetWorktreeForBranch(repoRoot, wtBranch); err == nil && existingPath != "" {
+		if existingPath, err := backend.GetWorktreeForBranch(wtBranch); err == nil && existingPath != "" {
 			fmt.Fprintf(os.Stderr, "Reusing existing worktree at %s for branch %s\n", existingPath, wtBranch)
 			worktreePath = existingPath
 		} else {
@@ -1343,7 +1423,7 @@ func handleAdd(profile string, args []string) {
 
 			// Create worktree atomically (git handles existence checks).
 			// This avoids a TOCTOU race from separate check-then-create steps.
-			setupErr, err := git.CreateWorktreeWithSetup(repoRoot, worktreePath, wtBranch, os.Stdout, os.Stderr, session.GetWorktreeSettings().SetupTimeout())
+			setupErr, err := createWorktreeWithSetup(backend, worktreePath, wtBranch, os.Stdout, os.Stderr, session.GetWorktreeSettings().SetupTimeout())
 			if err != nil {
 				if isWorktreeAlreadyExistsError(err) {
 					fmt.Fprintf(os.Stderr, "Error: worktree already exists at %s\n", worktreePath)
@@ -1471,11 +1551,29 @@ func handleAdd(profile string, args []string) {
 		newInstance.Wrapper = sessionWrapperResolved
 	}
 
+	// #924 per-session named account slot — captured verbatim. The
+	// resolver silently falls through when no matching [profiles.<account>]
+	// block exists, so unknown names are never an error here.
+	if trimmed := strings.TrimSpace(*account); trimmed != "" {
+		newInstance.Account = trimmed
+	}
+
+	// Apply per-session model override after command/tool resolution so the
+	// tool-specific option field is populated correctly.
+	selectedModelID := strings.TrimSpace(*modelID)
+	if selectedModelID != "" {
+		if err := applyCLIModelOverride(newInstance, selectedModelID); err != nil {
+			fmt.Printf("Error: %v\n", err)
+			os.Exit(1)
+		}
+	}
+
 	// Set worktree fields if created
 	if worktreePath != "" {
 		newInstance.WorktreePath = worktreePath
 		newInstance.WorktreeRepoRoot = worktreeRepoRoot
 		newInstance.WorktreeBranch = wtBranch
+		newInstance.WorktreeType = worktreeType
 	}
 
 	// Apply sandbox config if requested.
@@ -1590,6 +1688,11 @@ func handleAdd(profile string, args []string) {
 	if *resumeSession != "" {
 		humanLines = append(humanLines, fmt.Sprintf("  Resume:  %s", *resumeSession))
 	}
+	modelInfo := newInstance.LaunchModelInfo()
+	if modelInfo.ModelID != "" {
+		humanLines = append(humanLines, fmt.Sprintf("  Model:   %s", modelInfo.Display()))
+		humanLines = append(humanLines, fmt.Sprintf("  ModelID: %s", modelInfo.ModelID))
+	}
 	humanLines = append(humanLines, "")
 	humanLines = append(humanLines, "Next steps:")
 	humanLines = append(humanLines, fmt.Sprintf("  agent-deck session start %s   # Start the session", sessionTitle))
@@ -1630,6 +1733,7 @@ func handleAdd(profile string, args []string) {
 	if *resumeSession != "" {
 		jsonData["resume_session"] = *resumeSession
 	}
+	addModelInfoJSON(jsonData, modelInfo)
 	if *sandbox {
 		jsonData["sandbox"] = true
 		humanLines = append(humanLines[:len(humanLines)-3],
@@ -1704,6 +1808,9 @@ func handleList(profile string, args []string) {
 			Group         string    `json:"group"`
 			Tool          string    `json:"tool"`
 			Command       string    `json:"command,omitempty"`
+			ModelID       string    `json:"model_id,omitempty"`
+			Model         string    `json:"model,omitempty"`
+			ModelVersion  string    `json:"model_version,omitempty"`
 			Status        string    `json:"status"`
 			TmuxSession   string    `json:"tmux_session,omitempty"`
 			Profile       string    `json:"profile"`
@@ -1738,6 +1845,11 @@ func handleList(profile string, args []string) {
 			}
 			if tmuxSess := inst.GetTmuxSession(); tmuxSess != nil {
 				sj.TmuxSession = tmuxSess.Name
+			}
+			if modelInfo := inst.LaunchModelInfo(); modelInfo.ModelID != "" {
+				sj.ModelID = modelInfo.ModelID
+				sj.Model = modelInfo.Model
+				sj.ModelVersion = modelInfo.Version
 			}
 			sessions[i] = sj
 		}
@@ -1948,12 +2060,16 @@ func handleRemove(profile string, args []string) {
 
 	// Clean up worktree directory if this is a worktree session
 	if inst.IsWorktree() {
-		if err := git.RemoveWorktree(inst.WorktreeRepoRoot, inst.WorktreePath, false); err != nil {
-			if !*jsonOutput {
-				fmt.Printf("Warning: failed to remove worktree: %v\n", err)
+		if backend, err := detectAndCreateBackend(inst.WorktreeRepoRoot); err == nil {
+			if err := backend.RemoveWorktree(inst.WorktreePath, false); err != nil {
+				if !*jsonOutput {
+					fmt.Printf("Warning: failed to remove worktree: %v\n", err)
+				}
 			}
+			_ = backend.PruneWorktrees()
+		} else if !*jsonOutput {
+			fmt.Printf("Warning: failed to initialize VCS for worktree cleanup: %v\n", err)
 		}
-		_ = git.PruneWorktrees(inst.WorktreeRepoRoot)
 	}
 
 	// Rebuild instance list without the deleted session and persist groups.
@@ -2178,22 +2294,54 @@ func handleStatus(profile string, args []string) {
 
 	// Output based on flags
 	if *jsonOutput {
-		type statusJSON struct {
-			Waiting int `json:"waiting"`
-			Running int `json:"running"`
-			Idle    int `json:"idle"`
-			Error   int `json:"error"`
-			Stopped int `json:"stopped"`
-			Total   int `json:"total"`
+		type statusSessionJSON struct {
+			ID           string `json:"id"`
+			Title        string `json:"title"`
+			Tool         string `json:"tool"`
+			ModelID      string `json:"model_id,omitempty"`
+			Model        string `json:"model,omitempty"`
+			ModelVersion string `json:"model_version,omitempty"`
+			Status       string `json:"status"`
+			Path         string `json:"path"`
 		}
-		output, _ := json.Marshal(statusJSON{
+		type statusJSON struct {
+			Waiting  int                 `json:"waiting"`
+			Running  int                 `json:"running"`
+			Idle     int                 `json:"idle"`
+			Error    int                 `json:"error"`
+			Stopped  int                 `json:"stopped"`
+			Total    int                 `json:"total"`
+			Sessions []statusSessionJSON `json:"sessions,omitempty"`
+		}
+		resp := statusJSON{
 			Waiting: counts.waiting,
 			Running: counts.running,
 			Idle:    counts.idle,
 			Error:   counts.err,
 			Stopped: counts.stopped,
 			Total:   counts.total,
-		})
+		}
+		if *verbose || *verboseShort {
+			session.RefreshInstancesForCLIStatus(instances)
+			resp.Sessions = make([]statusSessionJSON, 0, len(instances))
+			for _, inst := range instances {
+				_ = inst.UpdateStatus()
+				sj := statusSessionJSON{
+					ID:     inst.ID,
+					Title:  inst.Title,
+					Tool:   inst.Tool,
+					Status: StatusString(inst.Status),
+					Path:   inst.ProjectPath,
+				}
+				if modelInfo := inst.LaunchModelInfo(); modelInfo.ModelID != "" {
+					sj.ModelID = modelInfo.ModelID
+					sj.Model = modelInfo.Model
+					sj.ModelVersion = modelInfo.Version
+				}
+				resp.Sessions = append(resp.Sessions, sj)
+			}
+		}
+		output, _ := json.Marshal(resp)
 		fmt.Println(string(output))
 	} else if *quiet || *quietShort {
 		fmt.Println(counts.waiting)
@@ -2216,7 +2364,7 @@ func handleStatus(profile string, args []string) {
 				if strings.HasPrefix(path, home) {
 					path = "~" + path[len(home):]
 				}
-				fmt.Printf("  %s %-16s %-10s %s\n", symbol, inst.Title, inst.Tool, path)
+				fmt.Printf("  %s %-16s %-10s %-22s %s\n", symbol, inst.Title, inst.Tool, truncate(modelStatusDisplay(inst), 22), path)
 			}
 			fmt.Println()
 		}
@@ -2654,30 +2802,79 @@ func handleUpdateToSpecificVersion(requested string, checkOnly bool) {
 	fmt.Println("  Restart agent-deck to use this version.")
 }
 
+// brewRunner abstracts `brew <args...>` so tests can inject canned output
+// without touching the real binary. The contract: return the combined
+// stdout+stderr captured from the invocation, plus the process exit error
+// (nil on exit 0). Implementations may also tee output to the terminal so
+// the user still sees brew's live progress.
+type brewRunner interface {
+	Run(args ...string) ([]byte, error)
+}
+
+// execBrewRunner is the production runner: it invokes the real `brew` binary
+// and tees its output to the user's terminal while capturing a copy for the
+// post-run inspection that #954 requires.
+type execBrewRunner struct{ bin string }
+
+func (e *execBrewRunner) Run(args ...string) ([]byte, error) {
+	// #nosec G204 -- e.bin is an internal path (typically "brew") chosen by
+	// the install path resolver; args are constructed by the brew_cmd.go
+	// runner, not from external input.
+	cmd := exec.Command(e.bin, args...)
+	cmd.Stdin = os.Stdin
+	var buf bytes.Buffer
+	cmd.Stdout = io.MultiWriter(os.Stdout, &buf)
+	cmd.Stderr = io.MultiWriter(os.Stderr, &buf)
+	err := cmd.Run()
+	return buf.Bytes(), err
+}
+
 func runHomebrewUpgradeWithRefresh(homebrewUpgradeCmd string) error {
 	cmdParts := strings.Fields(homebrewUpgradeCmd)
 	if len(cmdParts) == 0 {
 		return fmt.Errorf("empty Homebrew upgrade command")
 	}
+	return runHomebrewUpgradeWith(&execBrewRunner{bin: cmdParts[0]}, homebrewUpgradeCmd)
+}
 
-	brewBin := cmdParts[0]
-	refreshCmd := exec.Command(brewBin, "update")
-	refreshCmd.Stdout = os.Stdout
-	refreshCmd.Stderr = os.Stderr
-	refreshCmd.Stdin = os.Stdin
-	if err := refreshCmd.Run(); err != nil {
+// runHomebrewUpgradeWith executes `brew update` then `brew <upgrade args>` via
+// the supplied runner. It fails loudly when brew exits 0 but its output shows
+// the formula was refused (e.g. "Warning: agent-deck X.Y.Z already installed")
+// — see #954, reported by @alexandergharibian.
+func runHomebrewUpgradeWith(r brewRunner, homebrewUpgradeCmd string) error {
+	cmdParts := strings.Fields(homebrewUpgradeCmd)
+	if len(cmdParts) == 0 {
+		return fmt.Errorf("empty Homebrew upgrade command")
+	}
+
+	if _, err := r.Run("update"); err != nil {
 		return fmt.Errorf("failed to refresh Homebrew metadata: %w", err)
 	}
 
-	upgradeCmd := exec.Command(brewBin, cmdParts[1:]...)
-	upgradeCmd.Stdout = os.Stdout
-	upgradeCmd.Stderr = os.Stderr
-	upgradeCmd.Stdin = os.Stdin
-	if err := upgradeCmd.Run(); err != nil {
+	out, err := r.Run(cmdParts[1:]...)
+	if err != nil {
 		return fmt.Errorf("failed to run `%s`: %w", homebrewUpgradeCmd, err)
 	}
 
+	if brewRefusedUpgrade(string(out)) {
+		return fmt.Errorf(
+			"brew did not upgrade agent-deck; the tap formula may be stale (#954). "+
+				"Try `brew untap asheshgoplani/tap && brew tap asheshgoplani/tap && %s`, "+
+				"or download the latest release directly from GitHub. brew output: %s",
+			homebrewUpgradeCmd,
+			strings.TrimSpace(string(out)),
+		)
+	}
+
 	return nil
+}
+
+// brewRefusedUpgrade reports whether `brew upgrade` output indicates brew
+// declined to install a new version. Brew prints "Warning: <formula> X.Y.Z
+// already installed" and exits 0 in that case — exactly the lying-success
+// path that #954 surfaced.
+func brewRefusedUpgrade(output string) bool {
+	return strings.Contains(strings.ToLower(output), "already installed")
 }
 
 // displayChangelog fetches and displays changelog between versions
@@ -2754,6 +2951,7 @@ func printHelp() {
 	fmt.Println("  web              Start TUI with web UI server running alongside")
 	fmt.Println("  remote           Manage remote agent-deck instances")
 	fmt.Println("  conductor        Manage conductor meta-agent orchestration")
+	fmt.Println("  telegram-doctor  Audit channel-owning sessions for telegram drops (#1138)")
 	fmt.Println("  profile          Manage profiles")
 	fmt.Println("  update           Check for and install updates")
 	fmt.Println("  debug-dump       Dump debug ring buffer to file for sharing")
@@ -2836,9 +3034,9 @@ func printHelp() {
 	fmt.Println("  agent-deck skill attach my-app react  # Attach skill to project")
 	fmt.Println("  agent-deck group move my-app work     # Move session to group")
 	fmt.Println("  agent-deck web                        # TUI + web server on 127.0.0.1:8420")
-	fmt.Println("  agent-deck web --listen :9000         # TUI + web on custom port")
+	fmt.Println("  agent-deck web --listen 127.0.0.1:9000  # TUI + web on a custom loopback port")
 	fmt.Println("  agent-deck web --read-only            # TUI + web in read-only mode")
-	fmt.Println("  agent-deck web --token secret         # TUI + web with auth token")
+	fmt.Println("  agent-deck web --token secret         # auth token (REQUIRED to bind a non-loopback address)")
 	fmt.Println("  agent-deck web --help                 # Show web command flags")
 	fmt.Println()
 	fmt.Println("Environment Variables:")
@@ -2901,8 +3099,12 @@ func detectTool(cmd string) string {
 		return "pi"
 	case strings.Contains(cmd, "copilot"):
 		return "copilot"
+	case strings.Contains(cmd, "crush"):
+		return "crush"
 	case strings.Contains(cmd, "cursor"):
 		return "cursor"
+	case strings.Contains(cmd, "hermes"):
+		return "hermes"
 	default:
 		return "shell"
 	}
@@ -3191,6 +3393,9 @@ func handleUninstall(args []string) {
 		if f, err := os.Create(testFile); err != nil {
 			// Need elevated permissions
 			fmt.Printf("Requires sudo to remove %s\n", item.path)
+			// #nosec G204 -- item.path comes from the local uninstall scan
+			// (binary install paths), not external input. Fixed "sudo rm -f"
+			// args are hardcoded.
 			cmd := exec.Command("sudo", "rm", "-f", item.path)
 			cmd.Stdout = os.Stdout
 			cmd.Stderr = os.Stderr

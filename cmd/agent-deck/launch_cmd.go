@@ -10,6 +10,7 @@ import (
 
 	"github.com/asheshgoplani/agent-deck/internal/git"
 	"github.com/asheshgoplani/agent-deck/internal/session"
+	"github.com/asheshgoplani/agent-deck/internal/vcs"
 )
 
 // handleLaunch combines add + start + optional send into a single command.
@@ -34,6 +35,11 @@ func handleLaunch(profile string, args []string) {
 	// from overwriting the agent-deck title.
 	titleLock := fs.Bool("title-lock", false, "Lock session title so Claude's session name never overrides it (#697)")
 	noTitleSync := fs.Bool("no-title-sync", false, "Alias for --title-lock")
+	// #1133: opt-in to inherit the conductor's TELEGRAM_* env vars in the
+	// child. Off by default — a child inheriting TELEGRAM_STATE_DIR /
+	// TELEGRAM_BOT_TOKEN spawns a duplicate `bun telegram` poller that
+	// races the conductor for the bot lock (Telegram 409, dropped messages).
+	inheritTelegramEnv := fs.Bool("inherit-telegram-env", false, "Keep TELEGRAM_* env vars in the child (#1133); off by default to prevent duplicate plugin pollers")
 	jsonOutput := fs.Bool("json", false, "Output as JSON")
 	quiet := fs.Bool("quiet", false, "Minimal output")
 	quietShort := fs.Bool("q", false, "Minimal output (short)")
@@ -83,11 +89,15 @@ func handleLaunch(profile string, args []string) {
 
 	// Resume session flag
 	resumeSession := fs.String("resume-session", "", "Claude session ID to resume")
+	modelID := fs.String("model", "", "Model ID/version to use for this session (claude, codex, gemini, opencode)")
 
 	// Socket isolation (v1.7.50+, issue #687). Same semantics as
 	// `agent-deck add --tmux-socket`: overrides `[tmux].socket_name` for
 	// this one session, captured once and persisted on the Instance.
 	tmuxSocket := fs.String("tmux-socket", "", "tmux -L socket name for this session (overrides [tmux].socket_name)")
+
+	// Issue #1143: auto-stop dormant child sessions.
+	idleTimeout := fs.String("idle-timeout", "", "Auto-stop session after this duration of no tmux output (Go duration: 30m, 1h, 24h). 0 or unset = disabled")
 
 	fs.Usage = func() {
 		fmt.Println("Usage: agent-deck launch [path] [options]")
@@ -103,6 +113,8 @@ func handleLaunch(profile string, args []string) {
 		fmt.Println()
 		fmt.Println("Examples:")
 		fmt.Println("  agent-deck launch . -c claude")
+		fmt.Println("  agent-deck launch . -c codex --model gpt-5.5")
+		fmt.Println("  agent-deck launch . -c gemini --model gemini-3.1-pro-preview")
 		fmt.Println("  agent-deck launch . -c claude -m \"Explain this codebase\"")
 		fmt.Println("  agent-deck launch /path/to/project -t \"My Agent\" -c claude -g work")
 		fmt.Println("  agent-deck launch . -c claude --mcp memory -m \"Research topic X\"")
@@ -181,18 +193,15 @@ func handleLaunch(profile string, args []string) {
 	}
 
 	// Handle worktree creation
-	var worktreePath, worktreeRepoRoot string
+	var worktreePath, worktreeRepoRoot, worktreeType string
 	if wtBranch != "" {
-		if !git.IsGitRepoOrBareProjectRoot(path) {
-			out.Error(fmt.Sprintf("%s is not a git repository", path), ErrCodeInvalidOperation)
-			os.Exit(1)
-		}
-
-		repoRoot, err := git.GetWorktreeBaseRoot(path)
+		backend, err := detectAndCreateBackend(path)
 		if err != nil {
-			out.Error(fmt.Sprintf("failed to get repo root: %v", err), ErrCodeInvalidOperation)
+			out.Error(fmt.Sprintf("%v", err), ErrCodeInvalidOperation)
 			os.Exit(1)
 		}
+		worktreeType = string(backend.Type())
+		repoRoot := backend.RepoDir()
 
 		// Apply configured branch prefix before validation/existence checks
 		wtSettings := session.GetWorktreeSettings()
@@ -203,7 +212,7 @@ func handleLaunch(profile string, args []string) {
 			os.Exit(1)
 		}
 
-		branchExists := git.BranchExists(repoRoot, wtBranch)
+		branchExists := backend.BranchExists(wtBranch)
 		if createNewBranch && branchExists {
 			out.Error(fmt.Sprintf("branch '%s' already exists (remove -b flag to use existing branch)", wtBranch), ErrCodeInvalidOperation)
 			os.Exit(1)
@@ -214,16 +223,15 @@ func handleLaunch(profile string, args []string) {
 			location = *worktreeLocation
 		}
 
-		worktreePath = git.WorktreePath(git.WorktreePathOptions{
+		worktreePath = backend.WorktreePath(vcs.WorktreePathOptions{
 			Branch:    wtBranch,
 			Location:  location,
-			RepoDir:   repoRoot,
 			SessionID: git.GeneratePathID(),
 			Template:  wtSettings.Template(),
 		})
 
 		// Check for an existing worktree for this branch before creating a new one
-		if existingPath, err := git.GetWorktreeForBranch(repoRoot, wtBranch); err == nil && existingPath != "" {
+		if existingPath, err := backend.GetWorktreeForBranch(wtBranch); err == nil && existingPath != "" {
 			fmt.Fprintf(os.Stderr, "Reusing existing worktree at %s for branch %s\n", existingPath, wtBranch)
 			worktreePath = existingPath
 		} else {
@@ -237,7 +245,7 @@ func handleLaunch(profile string, args []string) {
 				os.Exit(1)
 			}
 
-			setupErr, err := git.CreateWorktreeWithSetup(repoRoot, worktreePath, wtBranch, os.Stdout, os.Stderr, session.GetWorktreeSettings().SetupTimeout())
+			setupErr, err := createWorktreeWithSetup(backend, worktreePath, wtBranch, os.Stdout, os.Stderr, session.GetWorktreeSettings().SetupTimeout())
 			if err != nil {
 				out.Error(fmt.Sprintf("failed to create worktree: %v", err), ErrCodeInvalidOperation)
 				os.Exit(1)
@@ -258,7 +266,13 @@ func handleLaunch(profile string, args []string) {
 		os.Exit(1)
 	}
 
-	// Resolve parent session if specified
+	// Resolve parent session if specified.
+	// Issue #972: when no explicit -g is passed, prefer the cwd-derived
+	// project group over the parent's group, so conductor-spawned children
+	// land in the project group (e.g. `agent-deck`) instead of the
+	// conductor's own group (`conductor`). The parent group is now a
+	// fallback for path mappings that produce no group.
+	cwdDerivedGroup := session.GroupPathForProject(path)
 	var parentInstance *session.Instance
 	if sessionParent != "" {
 		var errMsg string
@@ -271,11 +285,11 @@ func handleLaunch(profile string, args []string) {
 			out.Error("cannot create sub-session of a sub-session (single level only)", ErrCodeInvalidOperation)
 			os.Exit(1)
 		}
-		sessionGroup = resolveGroupSelection(sessionGroup, parentInstance.GroupPath, explicitGroupProvided)
+		sessionGroup = resolveGroupSelection(sessionGroup, cwdDerivedGroup, parentInstance.GroupPath, explicitGroupProvided)
 	} else if !*noParent {
 		parentInstance = resolveAutoParentInstance(instances)
 		if parentInstance != nil && !parentInstance.IsSubSession() {
-			sessionGroup = resolveGroupSelection(sessionGroup, parentInstance.GroupPath, explicitGroupProvided)
+			sessionGroup = resolveGroupSelection(sessionGroup, cwdDerivedGroup, parentInstance.GroupPath, explicitGroupProvided)
 		} else {
 			parentInstance = nil
 		}
@@ -331,6 +345,11 @@ func handleLaunch(profile string, args []string) {
 		newInstance.TitleLocked = true
 	}
 
+	// #1133: explicit opt-in for inheriting the conductor's telegram env.
+	if *inheritTelegramEnv {
+		newInstance.InheritTelegramEnv = true
+	}
+
 	if sessionCommandInput != "" {
 		newInstance.Tool = firstNonEmpty(sessionCommandTool, detectTool(sessionCommandInput))
 		newInstance.Command = sessionCommandResolved
@@ -375,10 +394,28 @@ func handleLaunch(profile string, args []string) {
 		newInstance.Wrapper = sessionWrapperResolved
 	}
 
+	selectedModelID := strings.TrimSpace(*modelID)
+	if selectedModelID != "" {
+		if err := applyCLIModelOverride(newInstance, selectedModelID); err != nil {
+			out.Error(err.Error(), ErrCodeInvalidOperation)
+			os.Exit(1)
+		}
+	}
+
 	if worktreePath != "" {
 		newInstance.WorktreePath = worktreePath
 		newInstance.WorktreeRepoRoot = worktreeRepoRoot
 		newInstance.WorktreeBranch = wtBranch
+		newInstance.WorktreeType = worktreeType
+	}
+
+	// Issue #1143: --idle-timeout 30m → 1800s on the Instance, picked up by
+	// the central watcher on its next tick.
+	if idleSecs, err := session.ParseIdleTimeoutFlag(strings.TrimSpace(*idleTimeout)); err != nil {
+		out.Error(err.Error(), ErrCodeInvalidOperation)
+		os.Exit(1)
+	} else {
+		newInstance.IdleTimeoutSecs = idleSecs
 	}
 
 	if *resumeSession != "" {
@@ -395,7 +432,8 @@ func handleLaunch(profile string, args []string) {
 		_ = newInstance.SetClaudeOptions(opts)
 	}
 
-	// Add to instances and save
+	// Add to instances list (in-memory only — used for downstream
+	// group cap math and the second SaveWithGroups after PostStartSync).
 	instances = append(instances, newInstance)
 
 	groupTree := session.NewGroupTreeWithGroups(instances, groups)
@@ -403,7 +441,13 @@ func handleLaunch(profile string, args []string) {
 		groupTree.CreateGroup(newInstance.GroupPath)
 	}
 
-	if err := storage.SaveWithGroups(instances, groupTree); err != nil {
+	// v1.9.x issue #1031: targeted single-row insert + verify, NOT the
+	// load-modify-write SaveWithGroups rewrite. SaveWithGroups under
+	// concurrent launches loses sibling rows via the DELETE-NOT-IN
+	// sweep inside SaveInstances; InsertSessionAndVerify uses
+	// SaveInstance (single-row INSERT OR REPLACE) + verify-with-backoff
+	// to guarantee persistence. Mirror of RemoveSessionAndVerify (#909).
+	if err := storage.InsertSessionAndVerify(newInstance, groupTree); err != nil {
 		out.Error(fmt.Sprintf("failed to save session: %v", err), ErrCodeInvalidOperation)
 		os.Exit(1)
 	}
@@ -430,27 +474,48 @@ func handleLaunch(profile string, args []string) {
 	maxC := session.GroupMaxConcurrent(tree, newInstance.GroupPath)
 	if session.ShouldQueue(instances, newInstance.GroupPath, maxC) {
 		newInstance.Status = session.StatusQueued
-		if err := saveSessionData(storage, instances, groups); err != nil {
+		// v1.9.x issue #1031: same targeted single-row pattern as the
+		// initial insert above — saveSessionData → SaveWithGroups is
+		// the load-modify-write rewrite that loses sibling launches'
+		// rows under concurrency.
+		if err := storage.InsertSessionAndVerify(newInstance, tree); err != nil {
 			out.Error(fmt.Sprintf("failed to save queued state: %v", err), ErrCodeInvalidOperation)
 			os.Exit(1)
 		}
-		out.Success(
-			fmt.Sprintf("Queued session: %s (group at cap %d)", newInstance.Title, maxC),
-			map[string]interface{}{
-				"success":        true,
-				"id":             newInstance.ID,
-				"title":          newInstance.Title,
-				"status":         "queued",
-				"group":          newInstance.GroupPath,
-				"max_concurrent": maxC,
-			},
-		)
+		queuedJSON := map[string]interface{}{
+			"success":        true,
+			"id":             newInstance.ID,
+			"title":          newInstance.Title,
+			"status":         "queued",
+			"group":          newInstance.GroupPath,
+			"max_concurrent": maxC,
+		}
+		addModelInfoJSON(queuedJSON, newInstance.LaunchModelInfo())
+		out.Success(fmt.Sprintf("Queued session: %s (group at cap %d)", newInstance.Title, maxC), queuedJSON)
 		return
 	}
+
+	// Issue #955: strip TELEGRAM_STATE_DIR from the agent-deck CLI
+	// process env before the tmux server inherits it on the first
+	// `new-session`. No-op for conductors and explicit telegram
+	// channel owners — they legitimately own the bot token. Sits
+	// above the S8 exec-layer (env -u TELEGRAM_STATE_DIR claude …)
+	// so even non-claude descendants of the pane (Bash-tool spawns,
+	// fork claudes, restart respawn) start with a clean env.
+	session.ScrubProcessEnvForChildLaunch(newInstance)
 
 	// Start the session.
 	// - default: StartWithMessage waits for readiness and delivers initial prompt
 	// - --no-wait: start immediately, then fire-and-forget send below
+	//
+	// Issue #964: gate the spawn through a process-wide semaphore so a burst
+	// of parallel `agent-deck launch` calls cannot cascade into swap thrash +
+	// fork:ENOMEM. Cap defaults to defaultMaxParallelLaunch (3) and honours
+	// AGENT_DECK_MAX_PARALLEL_LAUNCH.
+	throttle := defaultLaunchThrottle()
+	throttle.Acquire()
+	defer throttle.Release()
+
 	if initialMessage != "" && !*noWait {
 		if err := newInstance.StartWithMessage(initialMessage); err != nil {
 			out.Error(fmt.Sprintf("failed to start session: %v", err), ErrCodeInvalidOperation)
@@ -466,8 +531,18 @@ func handleLaunch(profile string, args []string) {
 	// Capture session ID from tmux
 	newInstance.PostStartSync(3 * time.Second)
 
-	// Save again with updated state (session ID, tmux name)
-	if err := saveSessionData(storage, instances, groups); err != nil {
+	// v1.9.x issue #1031: third save point — fields populated by
+	// PostStartSync (tmux session name, ClaudeSessionID once detected)
+	// land on `newInstance`. Same targeted single-row insert/upsert
+	// pattern as the two saves above; the load-modify-write
+	// saveSessionData → SaveWithGroups path would let a sibling
+	// launch's row be silently DELETE'd by this rewrite's
+	// `DELETE FROM instances WHERE id NOT IN (...)` step.
+	postStartTree := session.NewGroupTreeWithGroups(instances, groups)
+	if newInstance.GroupPath != "" {
+		postStartTree.CreateGroup(newInstance.GroupPath)
+	}
+	if err := storage.InsertSessionAndVerify(newInstance, postStartTree); err != nil {
 		out.Error(fmt.Sprintf("failed to save session state: %v", err), ErrCodeInvalidOperation)
 		os.Exit(1)
 	}
@@ -499,15 +574,21 @@ func handleLaunch(profile string, args []string) {
 		}
 	}
 
-	// Build output
+	// Build output. v1.9.x issue #1031: surface the new session ID
+	// under an explicit `session_id` key so callers (conductor fleet
+	// spawn loops, shell scripts) don't have to fall back to diffing
+	// `agent-deck list --json` before/after — that diff was unsafe
+	// under the launch-race the structural fix above also closes.
+	// The legacy `id` key is kept for backward compatibility.
 	jsonData := map[string]interface{}{
-		"success": true,
-		"id":      newInstance.ID,
-		"title":   newInstance.Title,
-		"path":    path,
-		"tool":    newInstance.Tool,
-		"group":   newInstance.GroupPath,
-		"profile": storage.Profile(),
+		"success":    true,
+		"id":         newInstance.ID,
+		"session_id": newInstance.ID,
+		"title":      newInstance.Title,
+		"path":       path,
+		"tool":       newInstance.Tool,
+		"group":      newInstance.GroupPath,
+		"profile":    storage.Profile(),
 	}
 	if sessionCommandInput != "" {
 		jsonData["command"] = sessionCommandInput
@@ -533,6 +614,7 @@ func handleLaunch(profile string, args []string) {
 		jsonData["worktree_path"] = worktreePath
 		jsonData["worktree_branch"] = wtBranch
 	}
+	addModelInfoJSON(jsonData, newInstance.LaunchModelInfo())
 
 	msg := fmt.Sprintf("Launched session: %s", newInstance.Title)
 	if initialMessage != "" {

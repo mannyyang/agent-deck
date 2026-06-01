@@ -20,6 +20,7 @@ import { CostsPane } from './panes/CostsPane.js'
 import { FleetPane } from './panes/FleetPane.js'
 import { StubPane } from './panes/StubPane.js'
 import { SearchPane } from './panes/SearchPane.js'
+import { McpPane } from './panes/McpPane.js'
 import { Icon, ICONS } from './icons.js'
 import { menuModelSignal } from './dataModel.js'
 import {
@@ -34,10 +35,12 @@ import {
 import { CreateSessionDialog } from './CreateSessionDialog.js'
 import { ConfirmDialog } from './ConfirmDialog.js'
 import { GroupNameDialog } from './GroupNameDialog.js'
-import { ToastContainer } from './Toast.js'
+import { ToastContainer, addToast } from './Toast.js'
 import { ToastHistoryDrawer } from './ToastHistoryDrawer.js'
 import { SettingsPanel } from './SettingsPanel.js'
+import { KeyboardShortcuts } from './KeyboardShortcuts.js'
 import { apiFetch } from './api.js'
+import { shortcutsOverlaySignal } from './state.js'
 
 function WorkHead() {
   const { sessions } = menuModelSignal.value
@@ -48,6 +51,9 @@ function WorkHead() {
   const kindLabel = (session.kind || 'agent').toUpperCase()
   const profile = profileSignal.value || ''
   const canMutate = mutationsEnabledSignal.value
+  const modelLabel = session.model
+    ? `${session.model}${session.modelVersion ? ` ${session.modelVersion}` : ''}`
+    : ''
 
   const action = (verb) => {
     if (!canMutate) return
@@ -64,6 +70,7 @@ function WorkHead() {
         <span class="cur">${session.title}</span>
       </div>
       <span class=${`status-chip ${session.status}`}><span class="d"/>${session.status}</span>
+      ${modelLabel && html`<span class="status-chip model" title=${session.modelId || modelLabel}>${modelLabel}</span>`}
       <span class="spacer"/>
       ${canMutate && html`
         <div class="actions">
@@ -93,9 +100,7 @@ function Panes({ tab }) {
     ${tab === 'fleet'     && html`<${FleetPane}/>`}
     ${tab === 'costs'     && html`<${CostsPane}/>`}
     ${tab === 'search'    && html`<${SearchPane}/>`}
-    ${tab === 'mcp'       && html`<${StubPane} title="MCP Manager"
-                              message="MCP attachments are managed in the TUI today. The web API does not expose attach / detach / pool toggles yet."
-                              hotkey="m"/>`}
+    ${tab === 'mcp'       && html`<${McpPane}/>`}
     ${tab === 'skills'    && html`<${StubPane} title="Skills"
                               message="Skill attachments are managed in the TUI today. The web API does not expose skill management yet."
                               hotkey="s"/>`}
@@ -164,28 +169,127 @@ export function AppShell() {
     return () => { cancelled = true; clearInterval(id) }
   }, [])
 
-  // Global keyboard shortcuts.
+  // Global keyboard shortcuts — TUI parity, issue #780.
+  // Top-10 bindings combined with the existing Web-only ones (Ctrl+K, ]).
+  // Guard: any key that isn't a modal-bound modifier combo must NOT fire
+  // while the user is typing in an input/textarea/select/contenteditable.
   useEffect(() => {
+    // Navigate selectedIdSignal by `delta` (+1 or -1) through the flat
+    // session list from menuModelSignal. Stable across SSE updates because
+    // we resolve by ID, not by array index in a possibly-stale snapshot.
+    const moveFocus = (delta) => {
+      const sessions = (menuModelSignal.value?.sessions) || []
+      if (sessions.length === 0) return
+      const curId = selectedIdSignal.value
+      let idx = sessions.findIndex(s => s.id === curId)
+      if (idx === -1) idx = delta > 0 ? -1 : sessions.length
+      const next = sessions[Math.max(0, Math.min(sessions.length - 1, idx + delta))]
+      if (next) {
+        // Only change the selected id; do NOT switch to the terminal tab on
+        // j/k navigation. Activating the terminal hands focus to xterm.js,
+        // which swallows subsequent keypresses (issue #780 review).
+        // The TUI's `enter` key is what opens; j/k just moves focus.
+        selectedIdSignal.value = next.id
+      }
+    }
+    const focusedSession = () => {
+      const sessions = (menuModelSignal.value?.sessions) || []
+      const id = selectedIdSignal.value
+      return sessions.find(s => s.id === id) || sessions[0] || null
+    }
+    const closeAllModals = () => {
+      paletteOpenSignal.value = false
+      tweaksOpenSignal.value = false
+      shortcutsOverlaySignal.value = false
+      createSessionDialogSignal.value = false
+      confirmDialogSignal.value = null
+      groupNameDialogSignal.value = null
+      infoDrawerOpenSignal.value = false
+    }
     const onKey = (e) => {
       const t = e.target
       const inField = t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable)
-      // Cmd+K / Ctrl+K opens palette anywhere.
+      // Cmd+K / Ctrl+K opens palette anywhere (also works inside inputs).
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
         e.preventDefault()
         paletteOpenSignal.value = true
         return
       }
+      // Esc unfocuses inputs and closes overlays — fires even while typing.
+      if (e.key === 'Escape') {
+        if (inField && typeof t.blur === 'function') t.blur()
+        closeAllModals()
+        return
+      }
       if (inField) return
-      if (e.key === '?') { e.preventDefault(); tweaksOpenSignal.value = !tweaksOpenSignal.value }
-      else if (e.key === '/') {
+
+      // Shift+Enter: open focused session in new browser tab (web equivalent
+      // of the TUI's iTerm "new tab" affordance, issue #1077). Check this
+      // BEFORE bare Enter so the shift modifier is honored.
+      if (e.key === 'Enter' && e.shiftKey) {
+        const s = focusedSession()
+        if (s) {
+          e.preventDefault()
+          const url = `${window.location.pathname}#session=${encodeURIComponent(s.id)}`
+          window.open(url, '_blank', 'noopener')
+        }
+        return
+      }
+      if (e.key === '?') {
+        e.preventDefault()
+        shortcutsOverlaySignal.value = !shortcutsOverlaySignal.value
+      } else if (e.key === '/') {
         e.preventDefault()
         document.querySelector('.side-filter input')?.focus()
-      }
-      else if (e.key === 'n' && mutationsEnabledSignal.value) { createSessionDialogSignal.value = true }
-      else if (e.key === ']') { railSignal.value = railSignal.value === 'visible' ? 'hidden' : 'visible' }
-      else if (e.key === 'Escape') {
-        paletteOpenSignal.value = false
-        tweaksOpenSignal.value = false
+      } else if (e.key === 'j') {
+        e.preventDefault(); moveFocus(+1)
+      } else if (e.key === 'k') {
+        e.preventDefault(); moveFocus(-1)
+      } else if (e.key === 'Enter') {
+        const s = focusedSession()
+        if (s) {
+          e.preventDefault()
+          selectedIdSignal.value = s.id
+          activeTabSignal.value = 'terminal'
+        }
+      } else if (e.key === 'n' && mutationsEnabledSignal.value) {
+        createSessionDialogSignal.value = true
+      } else if (e.key === 'r') {
+        // Web has no session-rename API yet (matrix gap); surface the gap
+        // honestly instead of silently no-op'ing.
+        const s = focusedSession()
+        if (s) addToast(`Rename "${s.title}": use the TUI (web rename API not implemented yet)`, 'info')
+      } else if (e.key === 'D') {
+        // Shift+D — non-destructive close of focused session. Mirrors
+        // TUI's `D` (closeSession): kills the tmux process but keeps the
+        // session record so a later start/restart can resurrect it.
+        if (!mutationsEnabledSignal.value) return
+        const s = focusedSession()
+        if (!s) return
+        confirmDialogSignal.value = {
+          message: `Close session "${s.title}"? The tmux process will be killed; metadata is preserved.`,
+          onConfirm: () => apiFetch('POST', `/api/sessions/${s.id}/close`).catch(() => {}),
+        }
+      } else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'z') {
+        // Ctrl/Cmd+Z — Chrome-style undo of the most recent delete.
+        // Mirrors TUI's ctrl+z (Home.undoStack). The server enforces the
+        // configurable undo window (default 30s) and returns 404 once
+        // the entry expires; surface the result as a toast either way.
+        if (!mutationsEnabledSignal.value) return
+        e.preventDefault()
+        apiFetch('POST', '/api/sessions/undelete')
+          .then(resp => {
+            if (resp && resp.sessionId) addToast(`Restored session ${resp.sessionId}`, 'success')
+            else addToast('Restored last deleted session', 'success')
+          })
+          .catch(() => addToast('Nothing to undo', 'info'))
+      } else if (e.key === 'q') {
+        // Mirrors TUI's `q`: dismiss the current modal/overlay. Only fires
+        // when no input is focused (guarded above), so it never blocks
+        // typing the letter `q` in the search box.
+        closeAllModals()
+      } else if (e.key === ']') {
+        railSignal.value = railSignal.value === 'visible' ? 'hidden' : 'visible'
       }
     }
     window.addEventListener('keydown', onKey)
@@ -237,6 +341,7 @@ export function AppShell() {
 
       <${CommandPalette}/>
       <${TweaksPanel}/>
+      <${KeyboardShortcuts}/>
       <${ToastContainer}/>
       <${ToastHistoryDrawer}/>
     </div>

@@ -2,8 +2,16 @@ package ui
 
 import (
 	"fmt"
+	"os"
+	"os/exec"
+	"strings"
+	"sync"
+	"time"
 
+	"github.com/asheshgoplani/agent-deck/internal/git"
 	"github.com/asheshgoplani/agent-deck/internal/session"
+	"github.com/asheshgoplani/agent-deck/internal/vcs"
+	"github.com/asheshgoplani/agent-deck/internal/vcsbackend"
 	"github.com/asheshgoplani/agent-deck/internal/web"
 )
 
@@ -12,18 +20,53 @@ var _ web.SessionMutator = (*WebMutator)(nil)
 
 // WebMutator bridges the web HTTP handlers to the TUI session/group management
 // methods. It wraps the Home model and implements web.SessionMutator.
-type WebMutator struct{ h *Home }
+//
+// The undoStack/undoWindow fields support the web's Chrome-style undo of
+// deletes (POST /api/sessions/undelete). The TUI maintains its own
+// in-memory stack in Home; the web stack is kept here so that web
+// deletes/undos don't race with the Tea Update goroutine.
+type WebMutator struct {
+	h *Home
 
-// NewWebMutator returns a WebMutator backed by the given Home.
-func NewWebMutator(h *Home) *WebMutator { return &WebMutator{h: h} }
+	undoMu     sync.Mutex
+	undoStack  []webDeletedEntry
+	undoWindow time.Duration
+}
+
+type webDeletedEntry struct {
+	instance  *session.Instance
+	deletedAt time.Time
+}
+
+// NewWebMutator returns a WebMutator backed by the given Home. The undo
+// window defaults to web.DefaultUndoWindow (30s).
+func NewWebMutator(h *Home) *WebMutator {
+	return &WebMutator{h: h, undoWindow: web.DefaultUndoWindow}
+}
+
+// WithUndoWindow overrides the undo grace period (useful for tests that
+// need to force expiry without sleeping).
+func (m *WebMutator) WithUndoWindow(d time.Duration) *WebMutator {
+	m.undoWindow = d
+	return m
+}
 
 // CreateSession creates and starts a new session, persisting it to storage.
-func (m *WebMutator) CreateSession(title, tool, projectPath, groupPath string) (string, error) {
+func (m *WebMutator) CreateSession(title, tool, projectPath, groupPath, modelID string) (string, error) {
 	var inst *session.Instance
 	if groupPath != "" {
 		inst = session.NewInstanceWithGroupAndTool(title, projectPath, groupPath, tool)
 	} else {
 		inst = session.NewInstanceWithTool(title, projectPath, tool)
+	}
+	if tool != "" && tool != "shell" {
+		inst.Command = tool
+	}
+
+	if modelID = strings.TrimSpace(modelID); modelID != "" {
+		if err := inst.ApplyLaunchModel(modelID); err != nil {
+			return "", err
+		}
 	}
 
 	if err := inst.Start(); err != nil {
@@ -82,6 +125,8 @@ func (m *WebMutator) RestartSession(id string) error {
 }
 
 // DeleteSession kills a session and removes it from persistent storage.
+// Before removal, the instance is pushed onto the web undo stack so a
+// subsequent UndoDelete (POST /api/sessions/undelete) can restore it.
 func (m *WebMutator) DeleteSession(id string) error {
 	m.h.instancesMu.RLock()
 	inst := m.h.instanceByID[id]
@@ -99,7 +144,89 @@ func (m *WebMutator) DeleteSession(id string) error {
 	}
 	defer storage.Close()
 
-	return storage.DeleteInstance(id)
+	if err := storage.DeleteInstance(id); err != nil {
+		return err
+	}
+	m.pushUndo(inst)
+	return nil
+}
+
+// CloseSession stops the session process but keeps its metadata in
+// storage. Mirrors the TUI's Shift+D handler (internal/ui/home.go
+// closeSession). Identical to StopSession at the session.Instance level
+// — both call Kill() — but is kept distinct so the parity matrix and
+// the front-end can express the user-visible intent ("close, but don't
+// delete").
+func (m *WebMutator) CloseSession(id string) error {
+	m.h.instancesMu.RLock()
+	inst := m.h.instanceByID[id]
+	m.h.instancesMu.RUnlock()
+	if inst == nil {
+		return fmt.Errorf("session not found: %s", id)
+	}
+	return inst.Kill()
+}
+
+// UndoDelete restores the most-recently deleted session if its delete
+// timestamp is within the configured undo window. Returns the restored
+// session id. Returns web.ErrUndoNothing if the stack is empty, or
+// web.ErrUndoExpired if the most recent entry is older than the window.
+func (m *WebMutator) UndoDelete() (string, error) {
+	m.undoMu.Lock()
+	if len(m.undoStack) == 0 {
+		m.undoMu.Unlock()
+		return "", web.ErrUndoNothing
+	}
+	entry := m.undoStack[len(m.undoStack)-1]
+	m.undoStack = m.undoStack[:len(m.undoStack)-1]
+	window := m.undoWindow
+	m.undoMu.Unlock()
+
+	if window == 0 {
+		window = web.DefaultUndoWindow
+	}
+	if time.Since(entry.deletedAt) > window {
+		return "", web.ErrUndoExpired
+	}
+
+	// Restart the session and re-persist alongside the rest of the
+	// current in-memory list. Note: Restart() may not succeed for every
+	// tool (e.g. a tool the user has since uninstalled). Bubble the
+	// error up so the handler returns 500; the entry has already been
+	// popped, mirroring the TUI's ctrl+z semantics.
+	if err := entry.instance.Restart(); err != nil {
+		return "", fmt.Errorf("restart session: %w", err)
+	}
+
+	storage, err := session.NewStorageWithProfile(m.h.profile)
+	if err != nil {
+		return "", fmt.Errorf("open storage: %w", err)
+	}
+	defer storage.Close()
+
+	m.h.instancesMu.RLock()
+	existing := make([]*session.Instance, len(m.h.instances))
+	copy(existing, m.h.instances)
+	m.h.instancesMu.RUnlock()
+	allInstances := append(existing, entry.instance) //nolint:gocritic
+	if err := storage.SaveWithGroups(allInstances, m.h.groupTree); err != nil {
+		return "", fmt.Errorf("save session: %w", err)
+	}
+	return entry.instance.ID, nil
+}
+
+// pushUndo records a freshly-deleted instance onto the web undo stack,
+// capped at 10 entries (FIFO eviction) to bound memory.
+func (m *WebMutator) pushUndo(inst *session.Instance) {
+	m.undoMu.Lock()
+	defer m.undoMu.Unlock()
+	m.undoStack = append(m.undoStack, webDeletedEntry{
+		instance:  inst,
+		deletedAt: time.Now(),
+	})
+	if len(m.undoStack) > 10 {
+		m.undoStack = m.undoStack[len(m.undoStack)-10:]
+	}
 }
 
 // ForkSession forks an existing session using the proper Claude resume command.
@@ -188,6 +315,121 @@ func (m *WebMutator) RenameGroup(groupPath, newName string) error {
 	m.h.instancesMu.RUnlock()
 
 	return storage.SaveWithGroups(instances, m.h.groupTree)
+}
+
+// FinishWorktree merges (or skips), removes the worktree, optionally
+// deletes the source branch, kills the tmux session, and removes the
+// session from storage. Mirrors `agent-deck worktree finish` (see
+// cmd/agent-deck/worktree_cmd.go handleWorktreeFinish) — the
+// orchestration is duplicated rather than refactored to keep the
+// fix minimally invasive (issue #1126).
+func (m *WebMutator) FinishWorktree(id string, opts web.WorktreeFinishOptions) (web.WorktreeFinishResult, error) {
+	m.h.instancesMu.RLock()
+	inst := m.h.instanceByID[id]
+	m.h.instancesMu.RUnlock()
+	if inst == nil {
+		return web.WorktreeFinishResult{}, web.ErrSessionNotFound
+	}
+	if !inst.IsWorktree() {
+		return web.WorktreeFinishResult{}, web.ErrNotAWorktree
+	}
+
+	repoRoot := inst.WorktreeRepoRoot
+	worktreePath := inst.WorktreePath
+	worktreeBranch := inst.WorktreeBranch
+
+	backend, err := vcsbackend.Detect(repoRoot)
+	if err != nil {
+		return web.WorktreeFinishResult{}, fmt.Errorf("initialize VCS: %w", err)
+	}
+
+	if !opts.Force {
+		dirty, dErr := git.HasUncommittedChanges(worktreePath)
+		if dErr != nil {
+			if _, statErr := os.Stat(worktreePath); os.IsNotExist(statErr) {
+				dirty = false
+			} else {
+				return web.WorktreeFinishResult{}, fmt.Errorf("check worktree status: %w", dErr)
+			}
+		}
+		if dirty {
+			return web.WorktreeFinishResult{}, fmt.Errorf("worktree has uncommitted changes (set force=true to override)")
+		}
+	}
+
+	targetBranch := opts.Into
+	if targetBranch == "" && !opts.NoMerge {
+		targetBranch, err = backend.GetDefaultBranch()
+		if err != nil {
+			return web.WorktreeFinishResult{}, fmt.Errorf("determine target branch: %w (set into=<branch>)", err)
+		}
+	}
+	if !opts.NoMerge && targetBranch == worktreeBranch {
+		return web.WorktreeFinishResult{}, fmt.Errorf("cannot merge branch %q into itself", worktreeBranch)
+	}
+
+	if !opts.NoMerge {
+		// Checkout target in main repo, then merge.
+		checkout := exec.Command("git", "-C", repoRoot, "checkout", targetBranch)
+		if out, cErr := checkout.CombinedOutput(); cErr != nil {
+			return web.WorktreeFinishResult{}, fmt.Errorf("checkout %s: %s", targetBranch, strings.TrimSpace(string(out)))
+		}
+		if mErr := backend.MergeBranch(worktreeBranch); mErr != nil {
+			if backend.Type() == vcs.TypeGit {
+				_ = exec.Command("git", "-C", repoRoot, "merge", "--abort").Run()
+			}
+			return web.WorktreeFinishResult{}, fmt.Errorf("merge failed (aborted): %w", mErr)
+		}
+	}
+
+	if _, statErr := os.Stat(worktreePath); !os.IsNotExist(statErr) {
+		// Best-effort: log via error wrapping only if it bubbles. CLI
+		// treats this as a warning; we mirror that by swallowing here so
+		// the rest of cleanup proceeds.
+		_ = backend.RemoveWorktree(worktreePath, opts.Force)
+	}
+	_ = backend.PruneWorktrees()
+
+	branchDeleted := false
+	if !opts.KeepBranch {
+		if dErr := backend.DeleteBranch(worktreeBranch, opts.Force); dErr == nil {
+			branchDeleted = true
+		}
+	}
+
+	if inst.Exists() {
+		_ = inst.Kill()
+	}
+
+	storage, err := session.NewStorageWithProfile(m.h.profile)
+	if err != nil {
+		return web.WorktreeFinishResult{}, fmt.Errorf("open storage: %w", err)
+	}
+	defer storage.Close()
+
+	m.h.instancesMu.RLock()
+	existing := make([]*session.Instance, 0, len(m.h.instances))
+	for _, x := range m.h.instances {
+		if x.ID != id {
+			existing = append(existing, x)
+		}
+	}
+	m.h.instancesMu.RUnlock()
+	if sErr := storage.SaveWithGroups(existing, m.h.groupTree); sErr != nil {
+		return web.WorktreeFinishResult{}, fmt.Errorf("save session data: %w", sErr)
+	}
+
+	mergedInto := targetBranch
+	if opts.NoMerge {
+		mergedInto = ""
+	}
+	return web.WorktreeFinishResult{
+		SessionID:     id,
+		Branch:        worktreeBranch,
+		MergedInto:    mergedInto,
+		Merged:        !opts.NoMerge,
+		BranchDeleted: branchDeleted,
+	}, nil
 }
 
 // DeleteGroup deletes a group (and its subgroups), moving sessions to the default

@@ -20,6 +20,10 @@ type ClaudeOptions struct {
 	SessionMode string `json:"session_mode,omitempty"`
 	// ResumeSessionID is the session ID for -r flag (only when SessionMode="resume")
 	ResumeSessionID string `json:"resume_session_id,omitempty"`
+	// Model overrides the Claude model for this session. Aliases like "sonnet",
+	// "opus", and "haiku" let Claude Code resolve the latest version; full
+	// model IDs pin a specific version.
+	Model string `json:"model,omitempty"`
 	// SkipPermissions adds --dangerously-skip-permissions flag
 	SkipPermissions bool `json:"skip_permissions,omitempty"`
 	// AllowSkipPermissions adds --allow-dangerously-skip-permissions flag
@@ -61,6 +65,10 @@ func (o *ClaudeOptions) ToArgs() []string {
 	}
 	// "new" or empty = default behavior, no special flag
 
+	if o.Model != "" {
+		args = append(args, "--model", o.Model)
+	}
+
 	// Permission flags (mutually exclusive, SkipPermissions takes precedence)
 	if o.SkipPermissions {
 		args = append(args, "--dangerously-skip-permissions")
@@ -84,6 +92,9 @@ func (o *ClaudeOptions) ToArgs() []string {
 func (o *ClaudeOptions) ToArgsForFork() []string {
 	var args []string
 
+	if o.Model != "" {
+		args = append(args, "--model", o.Model)
+	}
 	if o.SkipPermissions {
 		args = append(args, "--dangerously-skip-permissions")
 	} else if o.AutoMode {
@@ -118,6 +129,8 @@ func NewClaudeOptions(config *UserConfig) *ClaudeOptions {
 
 // CodexOptions holds launch options for Codex CLI sessions
 type CodexOptions struct {
+	// Model overrides the Codex model for this session (for example, "gpt-5").
+	Model string `json:"model,omitempty"`
 	// YoloMode enables --yolo flag (bypass approvals and sandbox)
 	// nil = inherit from global config, true/false = explicit override
 	YoloMode *bool `json:"yolo_mode,omitempty"`
@@ -131,6 +144,9 @@ func (o *CodexOptions) ToolName() string {
 // ToArgs returns command-line arguments based on options
 func (o *CodexOptions) ToArgs() []string {
 	var args []string
+	if o.Model != "" {
+		args = append(args, "--model", o.Model)
+	}
 	if o.YoloMode != nil && *o.YoloMode {
 		args = append(args, "--yolo")
 	}
@@ -296,6 +312,13 @@ type CopilotOptions struct {
 	// ResumeSessionID is the Copilot session ID for --resume (only used
 	// when SessionMode == "resume").
 	ResumeSessionID string `json:"resume_session_id,omitempty"`
+	// Model overrides the default Copilot model (e.g., "claude-opus-4.6",
+	// "gpt-5.2"). Passed as --model <value>.
+	Model string `json:"model,omitempty"`
+	// AllowAll enables --allow-all (equivalent to --allow-all-tools
+	// --allow-all-paths --allow-all-urls). Required for non-interactive
+	// scripting scenarios.
+	AllowAll bool `json:"allow_all,omitempty"`
 }
 
 // ToolName returns "copilot"
@@ -312,15 +335,26 @@ func (o *CopilotOptions) ToArgs() []string {
 			args = append(args, o.ResumeSessionID)
 		}
 	}
+	if o.Model != "" {
+		args = append(args, "--model", o.Model)
+	}
+	if o.AllowAll {
+		args = append(args, "--allow-all")
+	}
 	return args
 }
 
 // NewCopilotOptions creates CopilotOptions with defaults from config
 func NewCopilotOptions(config *UserConfig) *CopilotOptions {
 	opts := &CopilotOptions{SessionMode: "new"}
-	// No config-sourced defaults today; the struct exists so future
-	// settings (e.g., default model, auto-approve) have a home.
-	_ = config
+	if config != nil {
+		if config.Copilot.DefaultModel != "" {
+			opts.Model = config.Copilot.DefaultModel
+		}
+		if config.Copilot.AllowAll {
+			opts.AllowAll = true
+		}
+	}
 	return opts
 }
 
@@ -340,6 +374,75 @@ func UnmarshalCopilotOptions(data json.RawMessage) (*CopilotOptions, error) {
 	}
 
 	var opts CopilotOptions
+	if err := json.Unmarshal(wrapper.Options, &opts); err != nil {
+		return nil, err
+	}
+
+	return &opts, nil
+}
+
+// CrushOptions holds launch options for charmbracelet/crush CLI sessions
+// (Issue #940). Binary: `crush` from github.com/charmbracelet/crush.
+type CrushOptions struct {
+	// YoloMode enables --yolo flag (auto-accept all permission prompts).
+	// nil = inherit from config, true/false = explicit override.
+	YoloMode *bool `json:"yolo_mode,omitempty"`
+	// ResumeSessionID is the crush session ID for --session/-s flag.
+	// Empty means start a fresh session.
+	ResumeSessionID string `json:"resume_session_id,omitempty"`
+	// ContinueLast maps to --continue/-C (resume the most recent session).
+	// Mutually exclusive with ResumeSessionID at the crush CLI level; if
+	// both are set, ResumeSessionID wins (it is the more specific signal).
+	ContinueLast bool `json:"continue_last,omitempty"`
+}
+
+// ToolName returns "crush"
+func (o *CrushOptions) ToolName() string {
+	return "crush"
+}
+
+// ToArgs returns command-line arguments based on options.
+// Ordering matches the crush CLI flag groups (session first, then yolo).
+func (o *CrushOptions) ToArgs() []string {
+	var args []string
+	switch {
+	case o.ResumeSessionID != "":
+		args = append(args, "--session", o.ResumeSessionID)
+	case o.ContinueLast:
+		args = append(args, "--continue")
+	}
+	if o.YoloMode != nil && *o.YoloMode {
+		args = append(args, "--yolo")
+	}
+	return args
+}
+
+// NewCrushOptions creates CrushOptions with defaults from global config.
+func NewCrushOptions(config *UserConfig) *CrushOptions {
+	opts := &CrushOptions{}
+	if config != nil && config.Crush.YoloMode {
+		yolo := true
+		opts.YoloMode = &yolo
+	}
+	return opts
+}
+
+// UnmarshalCrushOptions deserializes CrushOptions from JSON wrapper.
+func UnmarshalCrushOptions(data json.RawMessage) (*CrushOptions, error) {
+	if len(data) == 0 {
+		return nil, nil
+	}
+
+	var wrapper ToolOptionsWrapper
+	if err := json.Unmarshal(data, &wrapper); err != nil {
+		return nil, err
+	}
+
+	if wrapper.Tool != "crush" {
+		return nil, nil
+	}
+
+	var opts CrushOptions
 	if err := json.Unmarshal(wrapper.Options, &opts); err != nil {
 		return nil, err
 	}

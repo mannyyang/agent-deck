@@ -64,6 +64,12 @@ func main() {
 		MenuData:     store,
 	})
 	server.SetMutator(store)
+	server.SetMCPManager(newFixtureMCPManager())
+	// Without this, GET /api/skills falls back to defaultSkillsService, which
+	// scans the host's real ~/.agent-deck/skills + ~/.claude/skills via
+	// session.ListAvailableSkills() — so the seeded alpha/beta/gamma catalog is
+	// never served and skills.spec.js fails (empty/host-dependent catalog).
+	server.SetSkillsService(store)
 
 	// Wrap the server's handler with the fixture admin endpoints so tests can
 	// reset and inspect state without going through the real Go test harness.
@@ -116,6 +122,18 @@ type fixtureStore struct {
 	order        []string // session id order
 	nextID       int
 	startupToken string // echoed at /__fixture/whoami for spawn verification
+	catalog      []session.SkillCandidate
+	attached     map[string][]session.ProjectSkillAttachment // by projectPath
+
+	// undoStack tracks recently-deleted sessions for ctrl+z undo. Capped
+	// at 10 entries (FIFO eviction) to match the TUI Home.undoStack.
+	undoStack  []fixtureDeletedEntry
+	undoWindow time.Duration // 0 → web.DefaultUndoWindow
+}
+
+type fixtureDeletedEntry struct {
+	session   *web.MenuSession
+	deletedAt time.Time
 }
 
 func newFixtureStore() *fixtureStore {
@@ -124,6 +142,7 @@ func newFixtureStore() *fixtureStore {
 		profile:  "fixture",
 		groups:   make(map[string]*web.MenuGroup),
 		sessions: make(map[string]*web.MenuSession),
+		attached: make(map[string][]session.ProjectSkillAttachment),
 	}
 }
 
@@ -139,11 +158,53 @@ func (s *fixtureStore) seed() {
 		"personal":       {Name: "personal", Path: "personal", Expanded: false, Order: 2, SessionCount: 1},
 	}
 	now := time.Date(2026, 4, 29, 10, 0, 0, 0, time.UTC)
+	yoloTrue := true
+	sandboxCPU := "2.0"
 	s.sessions = map[string]*web.MenuSession{
 		"sess-001": {
 			ID: "sess-001", Title: "agent-deck", Tool: "claude",
 			Status: session.StatusIdle, GroupPath: "work", ProjectPath: "/srv/agent-deck",
 			Order: 0, CreatedAt: now,
+			// Populate every promoted MenuSession field on a single session so
+			// parity-state's "at least one session carries this key" assertion
+			// passes for every row promoted out of MISSING in PARITY_MATRIX.md.
+			// Not rendered by the UI; no screenshot impact.
+			IsConductor:       true,
+			ClaudeSessionID:   "fixture-claude-sess-001",
+			GeminiSessionID:   "fixture-gemini-sess-001",
+			GeminiModel:       "gemini-2.5-pro",
+			GeminiYoloMode:    &yoloTrue,
+			CodexSessionID:    "fixture-codex-sess-001",
+			OpenCodeSessionID: "fixture-opencode-sess-001",
+			LatestPrompt:      "what's the next step?",
+			Notes:             "fixture notes for parity tests",
+			Color:             "#ff8800",
+			Command:           "claude --resume fixture-claude-sess-001",
+			Wrapper:           "env FOO=bar {command}",
+			Channels:          []string{"plugin:telegram@user/repo"},
+			ExtraArgs:         []string{"--agent", "reviewer"},
+			ToolOptionsJSON:   json.RawMessage(`{"tool":"claude","options":{"agent":"reviewer"}}`),
+			Sandbox: &session.SandboxConfig{
+				Enabled:  true,
+				Image:    "ghcr.io/asheshgoplani/agent-deck-sandbox:latest",
+				CPULimit: &sandboxCPU,
+			},
+			SandboxContainer:   "agent-deck-sbx-sess-001",
+			SSHHost:            "remote.example",
+			SSHRemotePath:      "/srv/remote-agent-deck",
+			MultiRepoEnabled:   true,
+			AdditionalPaths:    []string{"/srv/lib", "/srv/api"},
+			MultiRepoTempDir:   "/tmp/multi-repo-sess-001",
+			MultiRepoWorktrees: []session.MultiRepoWorktree{{OriginalPath: "/srv/agent-deck", WorktreePath: "/tmp/wt/sess-001", RepoRoot: "/srv/agent-deck", Branch: "feat/fixture"}},
+			WorktreePath:       "/tmp/worktrees/sess-001",
+			WorktreeRepoRoot:   "/srv/agent-deck",
+			WorktreeBranch:     "feat/fixture",
+			TitleLocked:        true,
+			NoTransitionNotify: true,
+			LoadedMCPNames:     []string{"exa", "filesystem"},
+			GeminiAnalytics: &session.GeminiSessionAnalytics{
+				InputTokens: 100, OutputTokens: 200, Model: "gemini-2.5-pro",
+			},
 		},
 		"sess-002": {
 			ID: "sess-002", Title: "frontend", Tool: "claude",
@@ -168,6 +229,17 @@ func (s *fixtureStore) seed() {
 	}
 	s.order = []string{"sess-001", "sess-002", "sess-003", "sess-004"}
 	s.nextID = 5
+	s.catalog = []session.SkillCandidate{
+		{ID: "pool/alpha", Name: "alpha", Source: "pool", EntryName: "alpha", Kind: "dir", Description: "Alpha test skill"},
+		{ID: "pool/beta", Name: "beta", Source: "pool", EntryName: "beta", Kind: "dir", Description: "Beta test skill"},
+		{ID: "pool/gamma", Name: "gamma", Source: "pool", EntryName: "gamma", Kind: "dir", Description: "Gamma test skill"},
+	}
+	s.attached = map[string][]session.ProjectSkillAttachment{
+		"/srv/agent-deck": {
+			{ID: "pool/alpha", Name: "alpha", Source: "pool", EntryName: "alpha", TargetPath: ".claude/skills/alpha"},
+		},
+	}
+	s.undoStack = nil
 }
 
 // LoadMenuSnapshot implements web.MenuDataLoader.
@@ -204,7 +276,7 @@ func (s *fixtureStore) LoadMenuSnapshot() (*web.MenuSnapshot, error) {
 }
 
 // CreateSession implements web.SessionMutator.
-func (s *fixtureStore) CreateSession(title, tool, projectPath, groupPath string) (string, error) {
+func (s *fixtureStore) CreateSession(title, tool, projectPath, groupPath, modelID string) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	id := fmt.Sprintf("sess-%03d", s.nextID)
@@ -233,8 +305,17 @@ func (s *fixtureStore) RestartSession(id string) error {
 func (s *fixtureStore) DeleteSession(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.sessions[id]; !ok {
+	sess, ok := s.sessions[id]
+	if !ok {
 		return fmt.Errorf("session %q not found", id)
+	}
+	// Snapshot the session for undo BEFORE removing from primary state.
+	s.undoStack = append(s.undoStack, fixtureDeletedEntry{
+		session:   sess,
+		deletedAt: s.now(),
+	})
+	if len(s.undoStack) > 10 {
+		s.undoStack = s.undoStack[len(s.undoStack)-10:]
 	}
 	delete(s.sessions, id)
 	for i, oid := range s.order {
@@ -244,6 +325,36 @@ func (s *fixtureStore) DeleteSession(id string) error {
 		}
 	}
 	return nil
+}
+
+// CloseSession mirrors the TUI's Shift+D handler: stop the session but
+// keep its metadata in storage (web parity row "Close session").
+func (s *fixtureStore) CloseSession(id string) error {
+	return s.transition(id, session.StatusStopped)
+}
+
+// UndoDelete restores the most-recently deleted session if its delete
+// was within s.undoWindow (default web.DefaultUndoWindow).
+func (s *fixtureStore) UndoDelete() (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.undoStack) == 0 {
+		return "", web.ErrUndoNothing
+	}
+	entry := s.undoStack[len(s.undoStack)-1]
+	s.undoStack = s.undoStack[:len(s.undoStack)-1]
+	window := s.undoWindow
+	if window == 0 {
+		window = web.DefaultUndoWindow
+	}
+	if s.now().Sub(entry.deletedAt) > window {
+		return "", web.ErrUndoExpired
+	}
+	restored := *entry.session
+	restored.Status = session.StatusStopped
+	s.sessions[restored.ID] = &restored
+	s.order = append(s.order, restored.ID)
+	return restored.ID, nil
 }
 
 func (s *fixtureStore) ForkSession(parentID string) (string, error) {
@@ -298,6 +409,46 @@ func (s *fixtureStore) DeleteGroup(groupPath string) error {
 	}
 	delete(s.groups, groupPath)
 	return nil
+}
+
+// FinishWorktree implements web.SessionMutator for issue #1126. Without a
+// real git backend the fixture validates inputs the same way the live
+// path does (session exists, worktree fields populated) and then removes
+// the session deterministically so e2e tests can verify the menu refresh.
+func (s *fixtureStore) FinishWorktree(id string, opts web.WorktreeFinishOptions) (web.WorktreeFinishResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sess, ok := s.sessions[id]
+	if !ok {
+		return web.WorktreeFinishResult{}, web.ErrSessionNotFound
+	}
+	if sess.WorktreeBranch == "" || sess.WorktreeRepoRoot == "" {
+		return web.WorktreeFinishResult{}, web.ErrNotAWorktree
+	}
+	branch := sess.WorktreeBranch
+	merged := !opts.NoMerge
+	mergedInto := opts.Into
+	if merged && mergedInto == "" {
+		mergedInto = "main"
+	}
+	if !merged {
+		mergedInto = ""
+	}
+	branchDeleted := !opts.KeepBranch
+	delete(s.sessions, id)
+	for i, x := range s.order {
+		if x == id {
+			s.order = append(s.order[:i], s.order[i+1:]...)
+			break
+		}
+	}
+	return web.WorktreeFinishResult{
+		SessionID:     id,
+		Branch:        branch,
+		MergedInto:    mergedInto,
+		Merged:        merged,
+		BranchDeleted: branchDeleted,
+	}, nil
 }
 
 func (s *fixtureStore) transition(id string, to session.Status) error {
@@ -388,4 +539,67 @@ func indexOf(s string, c byte) int {
 		}
 	}
 	return -1
+}
+
+// --- web.SkillsService -----------------------------------------------------
+
+// ListCatalog implements web.SkillsService.
+func (s *fixtureStore) ListCatalog() ([]session.SkillCandidate, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]session.SkillCandidate, len(s.catalog))
+	copy(out, s.catalog)
+	return out, nil
+}
+
+// ListAttached implements web.SkillsService.
+func (s *fixtureStore) ListAttached(projectPath string) ([]session.ProjectSkillAttachment, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]session.ProjectSkillAttachment, len(s.attached[projectPath]))
+	copy(out, s.attached[projectPath])
+	return out, nil
+}
+
+// Attach implements web.SkillsService.
+func (s *fixtureStore) Attach(projectPath, tool, skillRef, source string) (*session.ProjectSkillAttachment, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var match *session.SkillCandidate
+	for i := range s.catalog {
+		c := s.catalog[i]
+		if (source == "" || c.Source == source) && (c.Name == skillRef || c.ID == skillRef || c.EntryName == skillRef) {
+			match = &c
+			break
+		}
+	}
+	if match == nil {
+		return nil, fmt.Errorf("%w: %s", session.ErrSkillNotFound, skillRef)
+	}
+	for _, a := range s.attached[projectPath] {
+		if a.ID == match.ID {
+			return nil, session.ErrSkillAlreadyAttached
+		}
+	}
+	att := session.ProjectSkillAttachment{
+		ID: match.ID, Name: match.Name, Source: match.Source,
+		EntryName: match.EntryName, TargetPath: ".claude/skills/" + match.EntryName,
+	}
+	s.attached[projectPath] = append(s.attached[projectPath], att)
+	return &att, nil
+}
+
+// Detach implements web.SkillsService.
+func (s *fixtureStore) Detach(projectPath, skillRef, source string) (*session.ProjectSkillAttachment, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	list := s.attached[projectPath]
+	for i, a := range list {
+		if (source == "" || a.Source == source) && (a.Name == skillRef || a.ID == skillRef || a.EntryName == skillRef) {
+			removed := a
+			s.attached[projectPath] = append(list[:i], list[i+1:]...)
+			return &removed, nil
+		}
+	}
+	return nil, fmt.Errorf("%w: %s", session.ErrSkillNotAttached, skillRef)
 }
