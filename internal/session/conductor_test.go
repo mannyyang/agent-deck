@@ -498,20 +498,9 @@ func TestDiscordSettings_TOML(t *testing.T) {
 
 // --- Python bridge template tests ---
 
-// allBridgeSource concatenates all bridge package sources for content checks.
-func allBridgeSource() string {
-	var sb strings.Builder
-	sb.WriteString(conductorBridgePy)
-	for _, content := range conductorBridgePackage {
-		sb.WriteString("\n")
-		sb.WriteString(content)
-	}
-	return sb.String()
-}
-
 func TestBridgeTemplate_ContainsSlackAuthorization(t *testing.T) {
 	// Verify that the Python bridge template contains the Slack authorization code
-	template := allBridgeSource()
+	template := conductorBridgePy
 
 	// Check for authorization function definition
 	if !strings.Contains(template, "def is_slack_authorized(user_id: str) -> bool:") {
@@ -553,7 +542,7 @@ func TestBridgeTemplate_ContainsSlackAuthorization(t *testing.T) {
 
 func TestBridgeTemplate_SlackHandlersHaveAuthorization(t *testing.T) {
 	// Verify all Slack handlers have authorization checks
-	template := allBridgeSource()
+	template := conductorBridgePy
 
 	handlers := []struct {
 		name    string
@@ -576,7 +565,7 @@ func TestBridgeTemplate_SlackHandlersHaveAuthorization(t *testing.T) {
 
 func TestBridgeTemplate_ConfigLoadsAllowedUserIDs(t *testing.T) {
 	// Verify the config loading includes allowed_user_ids
-	template := allBridgeSource()
+	template := conductorBridgePy
 
 	configPatterns := []string{
 		`sl_allowed_users = sl.get("allowed_user_ids", [])`,
@@ -591,7 +580,7 @@ func TestBridgeTemplate_ConfigLoadsAllowedUserIDs(t *testing.T) {
 }
 
 func TestBridgeTemplate_HeartbeatScopesToConductorGroups(t *testing.T) {
-	template := allBridgeSource()
+	template := conductorBridgePy
 
 	patterns := []string{
 		"def select_heartbeat_conductors(conductors: list[dict]) -> list[dict]:",
@@ -609,7 +598,7 @@ func TestBridgeTemplate_HeartbeatScopesToConductorGroups(t *testing.T) {
 }
 
 func TestBridgeTemplate_SendToConductorSupportsSingleCallWait(t *testing.T) {
-	template := allBridgeSource()
+	template := conductorBridgePy
 	waitPattern := `"--wait", "--timeout", f"{response_timeout}s", "-q",`
 	noWaitPattern := `"session", "send", session, message, "--no-wait",`
 	oldPattern := `"session", "send", session, message, profile=profile, timeout=120`
@@ -2073,7 +2062,7 @@ func TestConductorMeta_GetClearOnCompact(t *testing.T) {
 // --- Discord bridge template tests ---
 
 func TestBridgeTemplate_ContainsDiscordBot(t *testing.T) {
-	template := allBridgeSource()
+	template := conductorBridgePy
 	patterns := []string{
 		"HAS_DISCORD",
 		"create_discord_bot",
@@ -2088,7 +2077,7 @@ func TestBridgeTemplate_ContainsDiscordBot(t *testing.T) {
 }
 
 func TestBridgeTemplate_ContainsDiscordAuthorization(t *testing.T) {
-	template := allBridgeSource()
+	template := conductorBridgePy
 
 	// Check for authorization function
 	if !strings.Contains(template, "def is_authorized(user_id: int) -> bool:") {
@@ -2102,7 +2091,7 @@ func TestBridgeTemplate_ContainsDiscordAuthorization(t *testing.T) {
 }
 
 func TestBridgeTemplate_DiscordConfigLoading(t *testing.T) {
-	template := allBridgeSource()
+	template := conductorBridgePy
 	patterns := []string{
 		`dc = conductor_cfg.get("discord", {})`,
 		`dc_bot_token = _resolve_secret(dc.get("bot_token", ""))`,
@@ -2203,7 +2192,7 @@ print(resolve_user_id({"user_id": "$NOPE_UNSET"}))          # unset env ref -> 0
 }
 
 func TestBridgeTemplate_DiscordSlashCommands(t *testing.T) {
-	template := allBridgeSource()
+	template := conductorBridgePy
 	commands := []string{
 		`name="ad-status"`,
 		`name="ad-sessions"`,
@@ -2218,7 +2207,7 @@ func TestBridgeTemplate_DiscordSlashCommands(t *testing.T) {
 }
 
 func TestBridgeTemplate_DiscordSlashCommandsChannelRestriction(t *testing.T) {
-	template := allBridgeSource()
+	template := conductorBridgePy
 	patterns := []string{
 		"async def ensure_discord_channel(interaction: discord.Interaction) -> bool:",
 		`if interaction.channel_id != channel_id:`,
@@ -2233,7 +2222,7 @@ func TestBridgeTemplate_DiscordSlashCommandsChannelRestriction(t *testing.T) {
 }
 
 func TestBridgeTemplate_DiscordListenModeSupport(t *testing.T) {
-	template := allBridgeSource()
+	template := conductorBridgePy
 	patterns := []string{
 		`listen_mode = str(config["discord"].get("listen_mode", "all") or "all").strip().lower()`,
 		`if listen_mode not in {"all", "mentions"}:`,
@@ -2250,7 +2239,7 @@ func TestBridgeTemplate_DiscordListenModeSupport(t *testing.T) {
 }
 
 func TestBridgeTemplate_DiscordReplyFilterSupport(t *testing.T) {
-	template := allBridgeSource()
+	template := conductorBridgePy
 	patterns := []string{
 		`ignore_replies_to_others = bool(`,
 		`config["discord"].get("ignore_replies_to_others", False)`,
@@ -2267,7 +2256,7 @@ func TestBridgeTemplate_DiscordReplyFilterSupport(t *testing.T) {
 }
 
 func TestBridgeTemplate_DiscordHeartbeatNotification(t *testing.T) {
-	template := allBridgeSource()
+	template := conductorBridgePy
 	if !strings.Contains(template, "discord_bot=None, discord_channel_id=None") {
 		t.Error("heartbeat_loop should accept discord_bot and discord_channel_id params")
 	}
@@ -2280,7 +2269,7 @@ func TestBridgeTemplate_DiscordHeartbeatNotification(t *testing.T) {
 }
 
 func TestBridgeTemplate_DiscordInMain(t *testing.T) {
-	template := allBridgeSource()
+	template := conductorBridgePy
 	patterns := []string{
 		`dc_ok = config["discord"]["configured"] and HAS_DISCORD`,
 		"create_discord_bot(config)",
@@ -2295,7 +2284,7 @@ func TestBridgeTemplate_DiscordInMain(t *testing.T) {
 }
 
 func TestBridgeTemplate_DiscordTypingIndicator(t *testing.T) {
-	template := allBridgeSource()
+	template := conductorBridgePy
 	if !strings.Contains(template, "async with message.channel.typing():") {
 		t.Error("Discord on_message should show typing indicator while waiting for conductor response")
 	}
@@ -2305,7 +2294,7 @@ func TestBridgeTemplate_DiscordTypingIndicator(t *testing.T) {
 }
 
 func TestBridgeTemplate_DiscordImageUploadSupport(t *testing.T) {
-	template := allBridgeSource()
+	template := conductorBridgePy
 	patterns := []string{
 		`IMAGE_MARKER_RE = re.compile(r"\[IMAGE:(?P<path>[^\]]+)\]")`,
 		`def parse_discord_message_parts(text: str) -> list[tuple[str, str]]:`,
@@ -2431,19 +2420,16 @@ func TestGetHeartbeatInterval_ZeroMeansDisabled(t *testing.T) {
 // --- Slack markdown-to-mrkdwn converter tests ---
 
 func TestBridgeTemplate_ContainsMarkdownToSlackConverter(t *testing.T) {
-	template := allBridgeSource()
+	template := conductorBridgePy
 
 	// Function definition must exist.
-	if !strings.Contains(template, "def markdown_to_slack(text: str) -> str:") {
-		t.Error("template should contain markdown_to_slack function definition")
+	if !strings.Contains(template, "def _markdown_to_slack(text: str) -> str:") {
+		t.Error("template should contain _markdown_to_slack function definition")
 	}
 
-	// Header conversion regexes (split into h1-h2 and h3-h6).
-	if !strings.Contains(template, `^#{1,2}\s+(.+)$`) {
-		t.Error("template should contain GFM h1-h2 header regex ^#{1,2}\\s+(.+)$")
-	}
-	if !strings.Contains(template, `^#{3,6}\s+(.+)$`) {
-		t.Error("template should contain GFM h3-h6 header regex ^#{3,6}\\s+(.+)$")
+	// Header conversion regex.
+	if !strings.Contains(template, `^#{1,6}\s+`) {
+		t.Error("template should contain GFM header regex ^#{1,6}\\s+")
 	}
 
 	// Bold conversion: **text** -> *text*.
@@ -2485,16 +2471,16 @@ func TestBridgeTemplate_ContainsMarkdownToSlackConverter(t *testing.T) {
 }
 
 func TestBridgeTemplate_SafeSayConvertsMarkdown(t *testing.T) {
-	template := allBridgeSource()
+	template := conductorBridgePy
 
-	// _safe_say must call markdown_to_slack.
-	if !strings.Contains(template, "markdown_to_slack(kwargs[\"text\"])") {
-		t.Error("_safe_say should apply markdown_to_slack to kwargs[\"text\"]")
+	// _safe_say must call _markdown_to_slack.
+	if !strings.Contains(template, "_markdown_to_slack(kwargs[\"text\"])") {
+		t.Error("_safe_say should apply _markdown_to_slack to kwargs[\"text\"]")
 	}
 
 	// The conversion must be conditional on "text" being in kwargs.
 	if !strings.Contains(template, `if "text" in kwargs:`) {
-		t.Error("_safe_say should guard markdown_to_slack call with 'if \"text\" in kwargs:'")
+		t.Error("_safe_say should guard _markdown_to_slack call with 'if \"text\" in kwargs:'")
 	}
 }
 

@@ -229,6 +229,7 @@ def load_config() -> dict:
     sl_channel_id = sl.get("channel_id", "")
     sl_listen_mode = sl.get("listen_mode", "mentions")  # "mentions" or "all"
     sl_allowed_users = sl.get("allowed_user_ids", [])  # List of authorized Slack user IDs
+    sl_conductors = sl.get("conductors", [])  # Explicit conductor names Slack routes to (empty = all)
     sl_configured = bool(sl_bot_token and sl_app_token and sl_channel_id)
 
     # Discord config
@@ -262,6 +263,7 @@ def load_config() -> dict:
             "channel_id": sl_channel_id,
             "listen_mode": sl_listen_mode,
             "allowed_user_ids": sl_allowed_users,
+            "conductors": sl_conductors,
             "configured": sl_configured,
         },
         "discord": {
@@ -360,6 +362,7 @@ def run_cli(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            errors="replace",  # tolerate non-UTF-8 bytes in CLI output (ANSI escapes etc.)
             start_new_session=True,  # own process group -> killpg kills grandchildren too
         )
         try:
@@ -1272,6 +1275,371 @@ async def send_discord_output(channel, text: str, name_tag: str = ""):
 
 
 # ---------------------------------------------------------------------------
+# Ported customizations: Slack terminal mirror + voice STT (fork-local)
+# ---------------------------------------------------------------------------
+
+# Tool icons for the Slack mirror's assistant tool-use rendering.
+TOOL_LABELS = {
+    "Bash": "\U0001f4bb", "Read": "\U0001f4d6", "Write": "✍️",
+    "Edit": "✍️", "Grep": "\U0001f50d", "Glob": "\U0001f50d",
+    "Agent": "\U0001f916", "WebSearch": "\U0001f310", "WebFetch": "\U0001f310",
+    "TaskCreate": "\U0001f4cb", "TaskUpdate": "\U0001f4cb",
+    "Skill": "⚙️", "SendMessage": "\U0001f4e8",
+}
+
+# Strip [from:...] [channel:...] or [dm] prefixes from bridge-enriched messages.
+_FROM_PREFIX_RE = re.compile(r"^\[from:[^\]]+\]\s*(?:\[(?:channel:[^\]]+|dm)\]\s*)?")
+
+# Tool-result messages to suppress in the mirror (noise).
+_SKIP_RESULTS = frozenset({
+    "The file has been updated successfully.",
+    "The file has been updated. All occurrences were successfully replaced.",
+    "File created successfully",
+})
+
+
+def markdown_to_slack(text: str) -> str:
+    """Convert GitHub-flavored markdown to Slack mrkdwn (module-level, used by the mirror)."""
+    code_blocks = []
+    def _save_code_block(m):
+        code_blocks.append(m.group(0))
+        return f"__CODE_BLOCK_{len(code_blocks) - 1}__"
+    text = re.sub(r"```[\s\S]*?```", _save_code_block, text)
+
+    inline_codes = []
+    def _save_inline_code(m):
+        inline_codes.append(m.group(0))
+        return f"__INLINE_CODE_{len(inline_codes) - 1}__"
+    text = re.sub(r"`[^`\n]+`", _save_inline_code, text)
+
+    def _convert_table(m):
+        return "```\n" + m.group(0).strip() + "\n```"
+    text = re.sub(r"(?:^\|.+\|$\n?){2,}", _convert_table, text, flags=re.MULTILINE)
+
+    text = re.sub(r"^-{3,}$", "─" * 20, text, flags=re.MULTILINE)
+    text = re.sub(r"^#{1,2}\s+(.+)$", r"*\1*", text, flags=re.MULTILINE)
+    text = re.sub(r"^#{3,6}\s+(.+)$", r"*\1*", text, flags=re.MULTILINE)
+    text = re.sub(r"\*\*(.+?)\*\*", r"*\1*", text)
+    text = re.sub(r"~~(.+?)~~", r"~\1~", text)
+    text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"<\2|\1>", text)
+    text = re.sub(r"^(\s*)[-*]\s+", "\\1• ", text, flags=re.MULTILINE)
+
+    slack_links = []
+    def _save_slack_link(m):
+        slack_links.append(m.group(0))
+        return f"__SLACK_LINK_{len(slack_links) - 1}__"
+    text = re.sub(r"<(?:[a-z]+://[^>]+|[@#!][^>]+)>", _save_slack_link, text)
+    text = text.replace("<", "&lt;").replace(">", "&gt;")
+    for i, link in enumerate(slack_links):
+        text = text.replace(f"__SLACK_LINK_{i}__", link)
+
+    for i, code in enumerate(inline_codes):
+        text = text.replace(f"__INLINE_CODE_{i}__", code)
+    for i, block in enumerate(code_blocks):
+        text = text.replace(f"__CODE_BLOCK_{i}__", block)
+
+    return text
+
+
+def get_session_data(session: str, profile: str | None = None) -> dict:
+    """Full session metadata as a dict (used by the mirror to resolve the JSONL path)."""
+    result = run_cli("session", "show", "--json", session, profile=profile, timeout=10)
+    if result.returncode != 0:
+        return {}
+    try:
+        return json.loads(result.stdout)
+    except (json.JSONDecodeError, KeyError):
+        return {}
+
+
+# --- Voice STT (opt-in via BRIDGE_STT_ENABLED=true) --------------------------
+# Folded from the modular bridge's stt.py + stt_worker.py into one function: the
+# single-file embedded bridge has no sibling worker script to invoke, so we drive
+# the parakeet-mlx CLI directly as an async subprocess (still off the event loop).
+BRIDGE_STT_ENABLED = os.environ.get("BRIDGE_STT_ENABLED", "").lower() in ("true", "1", "yes")
+
+
+async def transcribe_voice_file(audio_bytes: bytes, suffix: str = ".ogg") -> str | None:
+    """Transcribe raw audio bytes via the parakeet-mlx CLI. Returns text or None."""
+    import shutil
+    import tempfile
+
+    cli = os.environ.get("PARAKEET_CLI_PATH", "") or shutil.which("parakeet-mlx")
+    if not cli:
+        log.error("STT: parakeet-mlx not found (set PARAKEET_CLI_PATH or install it)")
+        return None
+
+    tmp_path = None
+    out_dir = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=suffix, prefix="voice_", delete=False) as tmp:
+            tmp.write(audio_bytes)
+            tmp_path = tmp.name
+        out_dir = tempfile.mkdtemp(prefix="stt_")
+        proc = await asyncio.create_subprocess_exec(
+            cli, tmp_path, "--output-format", "txt", "--output-dir", out_dir,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            log.error("STT: parakeet-mlx timed out (60s)")
+            return None
+        if proc.returncode != 0:
+            log.error("STT: parakeet-mlx failed: %s", stderr.decode(errors="replace").strip())
+            return None
+        txt_files = list(Path(out_dir).glob("*.txt"))
+        if not txt_files:
+            log.error("STT: no transcription output produced")
+            return None
+        text = txt_files[0].read_text().strip()
+        return text or None
+    except Exception as e:
+        log.error("STT: voice transcription error: %s", e)
+        return None
+    finally:
+        if tmp_path:
+            Path(tmp_path).unlink(missing_ok=True)
+        if out_dir:
+            shutil.rmtree(out_dir, ignore_errors=True)
+
+
+async def _transcribe_telegram_voice(voice, bot) -> str | None:
+    """Download a Telegram voice message and transcribe it."""
+    try:
+        file = await bot.get_file(voice.file_id)
+        bio = await bot.download_file(file.file_path)
+        return await transcribe_voice_file(bio.read(), suffix=".ogg")
+    except Exception as e:
+        log.error("STT: voice download error: %s", e)
+        return None
+
+
+# --- Slack terminal mirror (continuous JSONL tail -> Slack) ------------------
+_INTERNAL_XML_RE = re.compile(
+    r"</?(?:system-reminder|task-notification|local-command-caveat|command-name"
+    r"|command-message|command-args|local-command-stdout|fast_mode_info"
+    r"|antml_\w+)(?:\s[^>]*)?>",
+)
+
+
+def _contains_internal_xml(text: str) -> bool:
+    return bool(_INTERNAL_XML_RE.search(text))
+
+
+def _strip_internal_xml(text: str) -> str:
+    text = re.sub(
+        r"<(?:system-reminder|task-notification|local-command-caveat|command-name"
+        r"|command-message|command-args|local-command-stdout|fast_mode_info)"
+        r"(?:\s[^>]*)?>.*?</(?:system-reminder|task-notification|local-command-caveat"
+        r"|command-name|command-message|command-args|local-command-stdout|fast_mode_info)>",
+        "", text, flags=re.DOTALL,
+    )
+    text = _INTERNAL_XML_RE.sub("", text)
+    return text.strip()
+
+
+def resolve_jsonl_path(session_title: str, profile: str | None = None) -> str:
+    """Resolve the Claude JSONL transcript path for a conductor session."""
+    data = get_session_data(session_title, profile=profile)
+    claude_id = data.get("claude_session_id", "")
+    if not claude_id:
+        return ""
+    claude_dir = Path.home() / ".claude" / "projects"
+    if not claude_dir.exists():
+        return ""
+    for d in claude_dir.iterdir():
+        if d.is_dir():
+            jsonl = d / f"{claude_id}.jsonl"
+            if jsonl.exists():
+                return str(jsonl)
+    return ""
+
+
+def format_jsonl_event(entry: dict) -> str | None:
+    """Format a single JSONL transcript entry for the Slack mirror (None = skip)."""
+    if entry.get("type", "") == "progress":
+        return None
+    msg = entry.get("message", {})
+    if not msg:
+        return None
+    role = msg.get("role", "")
+    content = msg.get("content", "")
+
+    if role == "user":
+        if isinstance(content, str):
+            if not content.strip() or _contains_internal_xml(content):
+                return None
+            text = _FROM_PREFIX_RE.sub("", content).strip()
+            return f"> {text[:500]}" if text else None
+        elif isinstance(content, list):
+            parts = []
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("type") == "text":
+                    text = item.get("text", "").strip()
+                    if text and not _contains_internal_xml(text):
+                        text = _FROM_PREFIX_RE.sub("", text).strip()
+                        if text:
+                            parts.append(f"> {text[:500]}")
+                elif item.get("type") == "tool_result":
+                    result_content = item.get("content", "")
+                    if isinstance(result_content, str):
+                        stripped = result_content.strip()
+                        if not stripped or any(stripped.startswith(s) for s in _SKIP_RESULTS):
+                            continue
+                        if _contains_internal_xml(stripped):
+                            stripped = _strip_internal_xml(stripped)
+                            if not stripped:
+                                continue
+                        preview = stripped[:2000]
+                        if len(stripped) > 2000:
+                            preview += "\n... (truncated)"
+                        parts.append(f"```\n{preview}\n```")
+            return "\n".join(parts) if parts else None
+
+    elif role == "assistant":
+        if isinstance(content, list):
+            parts = []
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("type") == "text":
+                    text = item.get("text", "").strip()
+                    if text:
+                        if _contains_internal_xml(text):
+                            text = _strip_internal_xml(text)
+                        if text:
+                            parts.append(text)
+                elif item.get("type") == "tool_use":
+                    tool_name = item.get("name", "unknown")
+                    tool_input = item.get("input", {})
+                    icon = TOOL_LABELS.get(tool_name, "\U0001f527")
+                    if not isinstance(tool_input, dict):
+                        parts.append(f"{icon} `{tool_name}`")
+                        continue
+                    if tool_name == "Bash":
+                        cmd = tool_input.get("command", "")
+                        desc = tool_input.get("description", "")
+                        if desc:
+                            parts.append(f"{icon} *{desc}*")
+                        if cmd:
+                            parts.append(f"```\n$ {cmd[:500]}\n```")
+                        elif not desc:
+                            parts.append(f"{icon} `Bash`")
+                    elif tool_name == "Edit":
+                        fp = tool_input.get("file_path", "")
+                        old = tool_input.get("old_string", "")
+                        new = tool_input.get("new_string", "")
+                        old_count = len(old.splitlines()) if old else 0
+                        new_count = len(new.splitlines()) if new else 0
+                        desc = f"Edit({fp})"
+                        if tool_input.get("replace_all", False):
+                            desc += " [replace all]"
+                        if old_count or new_count:
+                            desc += f" (-{old_count}/+{new_count} lines)"
+                        parts.append(f"{icon} `{desc}`")
+                    elif tool_name == "Write":
+                        parts.append(f"{icon} `Write({tool_input.get('file_path', '')})`")
+                    elif tool_name == "Read":
+                        parts.append(f"\U0001f4d6 `Read({tool_input.get('file_path', '')})`")
+                    elif tool_name in ("Grep", "Glob"):
+                        parts.append(f"\U0001f50d `{tool_name}({tool_input.get('pattern', '')})`")
+                    else:
+                        if "file_path" in tool_input:
+                            parts.append(f"{icon} `{tool_name}({tool_input['file_path']})`")
+                        elif "query" in tool_input:
+                            parts.append(f"{icon} `{tool_name}({tool_input['query'][:80]})`")
+                        elif "prompt" in tool_input:
+                            parts.append(f"{icon} `{tool_name}({tool_input['prompt'][:80]})`")
+                        else:
+                            parts.append(f"{icon} `{tool_name}`")
+            return "\n".join(parts) if parts else None
+        elif isinstance(content, str) and content.strip():
+            return content.strip()
+
+    return None
+
+
+async def mirror_loop(slack_app, channel_id: str, conductor_name: str, profile: str):
+    """Continuously mirror a conductor's output to Slack by tailing its JSONL transcript."""
+    POLL_INTERVAL = 2
+    BATCH_INTERVAL = 2
+    session_title = conductor_session_title(conductor_name)
+
+    jsonl_path = resolve_jsonl_path(session_title, profile=profile)
+    if not jsonl_path:
+        log.warning("Mirror: could not resolve JSONL path for %s, retrying in 30s", conductor_name)
+        await asyncio.sleep(30)
+        jsonl_path = resolve_jsonl_path(session_title, profile=profile)
+        if not jsonl_path:
+            log.error("Mirror: giving up on JSONL resolution for %s", conductor_name)
+            return
+
+    log.info("Mirror: tailing JSONL %s for conductor %s", jsonl_path, conductor_name)
+    file_path = Path(jsonl_path)
+    file_pos = file_path.stat().st_size if file_path.exists() else 0
+    last_inode = file_path.stat().st_ino if file_path.exists() else 0
+    pending_messages: list[str] = []
+    last_post_time = time.monotonic()
+
+    async def flush_pending():
+        nonlocal last_post_time
+        if not pending_messages:
+            return
+        batch = markdown_to_slack("\n".join(pending_messages))
+        pending_messages.clear()
+        for chunk in split_message(batch, max_len=SLACK_MAX_LENGTH):
+            try:
+                await slack_app.client.chat_postMessage(channel=channel_id, text=chunk)
+            except Exception as e:
+                log.debug("Mirror: failed to post: %s", e)
+        last_post_time = time.monotonic()
+
+    while True:
+        try:
+            await asyncio.sleep(POLL_INTERVAL)
+            if not file_path.exists():
+                continue
+            current_stat = file_path.stat()
+            if current_stat.st_ino != last_inode or current_stat.st_size < file_pos:
+                log.info("Mirror: JSONL file rotated, reseeking")
+                file_pos = current_stat.st_size
+                last_inode = current_stat.st_ino
+                continue
+            if current_stat.st_size <= file_pos:
+                if (time.monotonic() - last_post_time) >= BATCH_INTERVAL:
+                    await flush_pending()
+                continue
+            with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+                f.seek(file_pos)
+                new_data = f.read()
+                file_pos = f.tell()
+            for line in new_data.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                formatted = format_jsonl_event(entry)
+                if formatted:
+                    pending_messages.append(formatted)
+            if (time.monotonic() - last_post_time) >= BATCH_INTERVAL:
+                await flush_pending()
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            log.error("Mirror: unexpected error: %s", e)
+            await asyncio.sleep(10)
+
+
+# ---------------------------------------------------------------------------
 # Telegram bot setup
 # ---------------------------------------------------------------------------
 
@@ -1484,17 +1852,31 @@ def create_telegram_bot(config: dict):
 
     @dp.message()
     async def handle_message(message: types.Message):
-        """Forward any text message to the conductor and return its response."""
+        """Forward any text (or transcribed voice) message to the conductor."""
         if not is_authorized(message):
             return
-        if not message.text:
+
+        text = message.text
+
+        # Transcribe voice messages when STT is enabled (opt-in).
+        if message.voice and not text and BRIDGE_STT_ENABLED:
+            await ensure_bot_info(message.bot)
+            if not is_bot_addressed(message):
+                return
+            await message.answer("Transcribing...")
+            text = await _transcribe_telegram_voice(message.voice, message.bot)
+            if not text:
+                await message.answer("[Could not transcribe voice message.]")
+                return
+
+        if not text:
             return
         await ensure_bot_info(message.bot)
         if not is_bot_addressed(message):
             return
 
         # Strip @botname mention from group messages
-        text = strip_bot_mention(message.text)
+        text = strip_bot_mention(text)
         if not text:
             return
 
@@ -2159,6 +2541,119 @@ def create_slack_app(config: dict):
             f"Route: <name>: <message>\n"
             f"Default: messages go to first conductor"
         )
+
+    # --- Ported slash commands (/ad-compact /ad-clear /ad-check /ad-send) -------------
+    def _resolve_conductor(name: str) -> dict | None:
+        """Resolve a conductor by name, falling back to the default."""
+        if name:
+            for c in discover_conductors():
+                if c["name"] == name:
+                    return c
+        return get_default_conductor()
+
+    @app.command("/ad-compact")
+    async def slack_cmd_compact(ack, respond, command):
+        """Compact a conductor (restart; state recovers from state.json)."""
+        await ack()
+        if not is_slack_authorized(command.get("user_id", "")):
+            await respond("⛔ Unauthorized. Contact your administrator.")
+            return
+        target = _resolve_conductor(command.get("text", "").strip())
+        if target is None:
+            await respond("No conductors found.")
+            return
+        session_title = conductor_session_title(target["name"])
+        await respond(f'Compacting `{target["name"]}`...')
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(
+            None,
+            lambda t=target: run_cli("session", "restart", session_title, profile=t["profile"], timeout=60),
+        )
+        if result.returncode == 0:
+            await respond(f'`{target["name"]}` compacted. State recovers from state.json on startup.')
+        else:
+            await respond(f"Compact failed: {result.stderr.strip()}")
+
+    @app.command("/ad-clear")
+    async def slack_cmd_clear(ack, respond, command):
+        """Full reset: wipe state.json then restart the conductor."""
+        await ack()
+        if not is_slack_authorized(command.get("user_id", "")):
+            await respond("⛔ Unauthorized. Contact your administrator.")
+            return
+        target = _resolve_conductor(command.get("text", "").strip())
+        if target is None:
+            await respond("No conductors found.")
+            return
+        state_path = CONDUCTOR_DIR / target["name"] / "state.json"
+        try:
+            state_path.write_text("{}")
+        except Exception:
+            pass
+        session_title = conductor_session_title(target["name"])
+        await respond(f'Clearing `{target["name"]}`...')
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(
+            None,
+            lambda t=target: run_cli("session", "restart", session_title, profile=t["profile"], timeout=60),
+        )
+        if result.returncode == 0:
+            await respond(f'`{target["name"]}` cleared and restarted fresh.')
+        else:
+            await respond(f"Clear failed: {result.stderr.strip()}")
+
+    @app.command("/ad-check")
+    async def slack_cmd_check(ack, respond, command):
+        """Show the last output from a named session (searches all profiles)."""
+        await ack()
+        if not is_slack_authorized(command.get("user_id", "")):
+            await respond("⛔ Unauthorized. Contact your administrator.")
+            return
+        session_name = command.get("text", "").strip()
+        if not session_name:
+            await respond("Usage: `/ad-check <session-name>`")
+            return
+        output = None
+        for profile in get_unique_profiles():
+            result = run_cli("session", "output", session_name, "-q", profile=profile, timeout=30)
+            if result.returncode == 0 and result.stdout.strip():
+                output = result.stdout.strip()
+                break
+        if output is None:
+            await respond(f"Session `{session_name}` not found or has no output.")
+            return
+        max_len = 3000
+        if len(output) > max_len:
+            output = "...(truncated)\n" + output[-max_len:]
+        await respond(f"*{session_name}* last output:\n```\n{output}\n```")
+
+    @app.command("/ad-send")
+    async def slack_cmd_send(ack, respond, command):
+        """Send a message directly to a named session (searches all profiles)."""
+        await ack()
+        if not is_slack_authorized(command.get("user_id", "")):
+            await respond("⛔ Unauthorized. Contact your administrator.")
+            return
+        parts = command.get("text", "").strip().split(None, 1)
+        if len(parts) < 2:
+            await respond("Usage: `/ad-send <session-name> <message>`")
+            return
+        session_name, message = parts[0], parts[1]
+        sent = False
+        loop = asyncio.get_running_loop()
+        for profile in get_unique_profiles():
+            result = await loop.run_in_executor(
+                None,
+                lambda p=profile: run_cli("session", "send", session_name, message, "--no-wait", profile=p, timeout=30),
+            )
+            if result.returncode == 0:
+                sent = True
+                break
+        if sent:
+            preview = message[:100] + ("..." if len(message) > 100 else "")
+            await respond(f"Sent to `{session_name}`: {preview}")
+        else:
+            await respond(f"Failed to send to `{session_name}`. Session may not exist or is not running.")
 
     log.info("Slack app initialized (Socket Mode, channel=%s)", channel_id)
     return app, channel_id
@@ -2922,8 +3417,67 @@ async def main():
         tasks.append(asyncio.create_task(telegram_dp.start_polling(telegram_bot)))
         log.info("Telegram bot polling started")
     if slack_handler:
+        # --- Slack liveness watchdog (ported) -------------------------------
+        # Track last socket activity; exit if stale so launchd/systemd restarts
+        # us. Tracks user messages AND Socket Mode connection/ping-pong frames so
+        # a quiet-but-healthy connection isn't killed.
+        _slack_last_activity = {"ts": asyncio.get_event_loop().time()}
+        _SLACK_STALE_TIMEOUT = 1800  # 30 minutes
+
+        _original_handle = slack_handler.handle
+
+        async def _tracked_handle(*args, **kwargs):
+            _slack_last_activity["ts"] = asyncio.get_event_loop().time()
+            return await _original_handle(*args, **kwargs)
+
+        slack_handler.handle = _tracked_handle
+
+        _original_connect = getattr(slack_handler, "connect_async", None)
+        if _original_connect:
+            async def _tracked_connect(*args, **kwargs):
+                _slack_last_activity["ts"] = asyncio.get_event_loop().time()
+                return await _original_connect(*args, **kwargs)
+            slack_handler.connect_async = _tracked_connect
+
+        if getattr(slack_handler, "client", None):
+            _sm_client = slack_handler.client
+            _original_recv = getattr(_sm_client, "receive_messages", None)
+            if _original_recv:
+                async def _tracked_recv(*args, **kwargs):
+                    _slack_last_activity["ts"] = asyncio.get_event_loop().time()
+                    return await _original_recv(*args, **kwargs)
+                _sm_client.receive_messages = _tracked_recv
+
+        async def slack_liveness_watchdog():
+            while True:
+                await asyncio.sleep(60)
+                elapsed = asyncio.get_event_loop().time() - _slack_last_activity["ts"]
+                if elapsed > _SLACK_STALE_TIMEOUT:
+                    log.error(
+                        "Slack socket stale for %.0fs (threshold %ds), exiting for restart",
+                        elapsed, _SLACK_STALE_TIMEOUT,
+                    )
+                    os._exit(1)
+
         tasks.append(asyncio.create_task(slack_handler.start_async()))
+        tasks.append(asyncio.create_task(slack_liveness_watchdog()))
         log.info("Slack Socket Mode handler started")
+
+        # --- Slack terminal mirror (ported) ---------------------------------
+        # Mirror the first configured Slack conductor (or first discovered).
+        slack_conductors = config["slack"].get("conductors", [])
+        mirror_conductor = None
+        if slack_conductors:
+            mirror_conductor = next(
+                (c for c in conductors if c["name"] == slack_conductors[0]), None
+            )
+        else:
+            mirror_conductor = conductors[0] if conductors else None
+        if mirror_conductor and slack_channel_id:
+            tasks.append(asyncio.create_task(
+                mirror_loop(slack_app, slack_channel_id, mirror_conductor["name"], mirror_conductor["profile"])
+            ))
+            log.info("Mirror started for conductor %s", mirror_conductor["name"])
     if discord_bot:
         tasks.append(asyncio.create_task(discord_bot.start(config["discord"]["bot_token"])))
         log.info("Discord bot started")
