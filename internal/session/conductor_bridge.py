@@ -1565,6 +1565,18 @@ def format_jsonl_event(entry: dict) -> str | None:
     return None
 
 
+def select_mirror_conductor(slack_conductors: list, conductors: list) -> dict | None:
+    """Pick the conductor the Slack mirror should follow.
+
+    If config's per-platform `conductors` list is set, mirror the first name in
+    it; otherwise fall back to the first discovered conductor. A configured name
+    that doesn't match any discovered conductor selects nothing (filtered out).
+    """
+    if slack_conductors:
+        return next((c for c in conductors if c["name"] == slack_conductors[0]), None)
+    return conductors[0] if conductors else None
+
+
 async def mirror_loop(slack_app, channel_id: str, conductor_name: str, profile: str):
     """Continuously mirror a conductor's output to Slack by tailing its JSONL transcript."""
     POLL_INTERVAL = 2
@@ -3466,13 +3478,7 @@ async def main():
         # --- Slack terminal mirror (ported) ---------------------------------
         # Mirror the first configured Slack conductor (or first discovered).
         slack_conductors = config["slack"].get("conductors", [])
-        mirror_conductor = None
-        if slack_conductors:
-            mirror_conductor = next(
-                (c for c in conductors if c["name"] == slack_conductors[0]), None
-            )
-        else:
-            mirror_conductor = conductors[0] if conductors else None
+        mirror_conductor = select_mirror_conductor(slack_conductors, conductors)
         if mirror_conductor and slack_channel_id:
             tasks.append(asyncio.create_task(
                 mirror_loop(slack_app, slack_channel_id, mirror_conductor["name"], mirror_conductor["profile"])

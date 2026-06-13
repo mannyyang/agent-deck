@@ -1,4 +1,4 @@
-.PHONY: build run install clean dev release-local test test-perf bench fmt lint ci css tools css-verify test-web test-web-unit test-web-e2e test-web-install
+.PHONY: build run install clean dev release-local test test-bridge test-perf bench fmt lint ci css tools css-verify test-web test-web-unit test-web-e2e test-web-install
 
 BINARY_NAME=agent-deck
 BUILD_DIR=./build
@@ -139,6 +139,17 @@ dev:
 # Run tests (with race detector)
 test:
 	go test -race -v ./...
+
+# Conductor bridge customization regression gate.
+# Runs the Go embed-marker test (fails fast if a merge overwrote the embedded
+# bridge) AND the behavioral pytest suite. RUN THIS AFTER EVERY UPSTREAM MERGE,
+# BEFORE INSTALLING. Requires pytest (CI's python-compat job installs it;
+# locally: `python3 -m pip install pytest`).
+test-bridge:
+	@echo "==> Go embed-marker test (customization markers present in embedded bridge)"
+	go test ./internal/session/ -run Embed -count=1
+	@echo "==> Python bridge customization regression suite"
+	python3 -m pytest conductor/tests/test_bridge_customizations.py -v
 
 # Run hard-gated walltime regression tests (Track B). Honors PERF_BUDGET_MULTIPLIER
 # (default 1.0 locally; CI sets 2.0). See docs/perf-budget-suite.md.
