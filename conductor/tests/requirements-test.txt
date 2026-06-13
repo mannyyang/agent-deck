@@ -1,0 +1,11 @@
+# Minimal deps to load + behaviorally test the conductor bridge.
+#
+# The canonical bridge (internal/session/conductor_bridge.py) is imported at
+# collection time by conftest.py. `toml` is the ONLY non-stdlib module-level
+# import it has; every heavy integration dep (slack_bolt, aiogram, discord, the
+# STT backend) is imported lazily and is stubbed by test_bridge_customizations.py,
+# so they are deliberately NOT listed here.
+#
+# Pinned for reproducible `make test-bridge` runs.
+pytest==8.3.4
+toml==0.10.2

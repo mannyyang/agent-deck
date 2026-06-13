@@ -62,6 +62,7 @@ internal/web/static/.brute-tw.src.css
 __pycache__/
 *.pyc
 .venv/
+.venv-bridge-test/
 
 /dist
 

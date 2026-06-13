@@ -141,15 +141,23 @@ test:
 	go test -race -v ./...
 
 # Conductor bridge customization regression gate.
-# Runs the Go embed-marker test (fails fast if a merge overwrote the embedded
-# bridge) AND the behavioral pytest suite. RUN THIS AFTER EVERY UPSTREAM MERGE,
-# BEFORE INSTALLING. Requires pytest (CI's python-compat job installs it;
-# locally: `python3 -m pip install pytest`).
+# Self-bootstrapping: creates an isolated venv, installs the minimal test deps
+# (pytest + toml — see conductor/tests/requirements-test.txt), then runs the Go
+# embed-marker test (fails fast if a merge overwrote the embedded bridge) AND the
+# behavioral pytest suite. No system pytest required.
+# RUN THIS AFTER EVERY UPSTREAM MERGE, BEFORE INSTALLING.
+BRIDGE_TEST_VENV=.venv-bridge-test
 test-bridge:
+	@echo "==> Bootstrapping bridge test venv ($(BRIDGE_TEST_VENV))"
+	@if [ ! -x "$(BRIDGE_TEST_VENV)/bin/python" ]; then \
+		python3 -m venv "$(BRIDGE_TEST_VENV)"; \
+	fi
+	@"$(BRIDGE_TEST_VENV)/bin/python" -m pip install -q --disable-pip-version-check \
+		-r conductor/tests/requirements-test.txt
 	@echo "==> Go embed-marker test (customization markers present in embedded bridge)"
 	go test ./internal/session/ -run Embed -count=1
 	@echo "==> Python bridge customization regression suite"
-	python3 -m pytest conductor/tests/test_bridge_customizations.py -v
+	@"$(BRIDGE_TEST_VENV)/bin/python" -m pytest conductor/tests/test_bridge_customizations.py -v
 
 # Run hard-gated walltime regression tests (Track B). Honors PERF_BUDGET_MULTIPLIER
 # (default 1.0 locally; CI sets 2.0). See docs/perf-budget-suite.md.
