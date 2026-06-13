@@ -27,7 +27,7 @@
 //
 // Cleanup. `CleanupWorkerScratchConfigDir` removes the dir on
 // session stop/remove — best-effort, no-op on first-time misses. The
-// scratch dir lives under `~/.agent-deck/worker-scratch/<instance-id>/`.
+// scratch dir lives under the effective worker-scratch data directory.
 
 package session
 
@@ -254,16 +254,104 @@ func computeAllowList(i *Instance) []string {
 	return out
 }
 
-// WorkerScratchDirRoot returns the path that holds every worker's
-// scratch config dir. Callers with a valid home should prefer
-// workerScratchDirFor below which derives this from the effective
-// HOME at call time.
-func workerScratchDirRoot(home string) string {
-	return filepath.Join(home, ".agent-deck", "worker-scratch")
+// WorkerScratchDirRoot returns the worker-scratch root resolved through the XDG
+// data path (~/.local/share/agent-deck/worker-scratch, or the legacy
+// ~/.agent-deck/worker-scratch fallback). It is the exported entry point used by
+// the S5 path-safety guard test so the guard can confirm this sink does not
+// resolve under the real home when un-sandboxed.
+func WorkerScratchDirRoot() (string, error) {
+	return workerScratchDirRoot(), nil
 }
 
-func workerScratchDirFor(home, instanceID string) string {
-	return filepath.Join(workerScratchDirRoot(home), instanceID)
+// workerScratchDirRoot returns the path that holds every worker's scratch config
+// dir. It resolves purely through the XDG data path (dataPath), so it does NOT
+// require HOME to be set: an XDG-only environment with an absolute
+// XDG_DATA_HOME and no HOME still resolves correctly.
+func workerScratchDirRoot() string {
+	dir, err := dataPath("worker-scratch", "worker-scratch")
+	if err != nil {
+		return filepath.Join(os.TempDir(), "agent-deck", "worker-scratch")
+	}
+	return dir
+}
+
+func workerScratchDirFor(instanceID string) string {
+	return filepath.Join(workerScratchDirRoot(), instanceID)
+}
+
+// pathUnderWorkerScratch reports whether p resolves inside the worker-scratch
+// root. Both p and the root are resolved through symlinks first so a /tmp →
+// /private/tmp style indirection (or a symlinked HOME) does not defeat the
+// prefix check. Used to detect (a) a leaked worker-scratch CLAUDE_CONFIG_DIR
+// masquerading as a profile source and (b) a nested-scratch credential chain
+// that would otherwise propagate a forked, non-canonical token.
+func pathUnderWorkerScratch(p string) bool {
+	if p == "" {
+		return false
+	}
+	root := workerScratchDirRoot()
+	if resolved, err := filepath.EvalSymlinks(root); err == nil {
+		root = resolved
+	}
+	if resolved, err := filepath.EvalSymlinks(p); err == nil {
+		p = resolved
+	}
+	root = filepath.Clean(root)
+	p = filepath.Clean(p)
+	return p == root || strings.HasPrefix(p, root+string(os.PathSeparator))
+}
+
+// profileCanonicalFromNestedScratch recovers the real profile's credentials
+// path from a worker-scratch dir that was (wrongly) used as a credential
+// source. A scratch dir is a shallow mirror: every entry except settings.json
+// and .credentials.json is a symlink into the profile it was seeded from, so
+// the parent directory of any sibling symlink's target IS the source profile.
+// Follows nested chains (scratch seeded from scratch) up to a small depth
+// bound; returns "" when no non-scratch profile holding a regular
+// .credentials.json can be found. Read-only — never creates or writes.
+func profileCanonicalFromNestedScratch(scratchDir string) string {
+	dir := scratchDir
+	for depth := 0; depth < 5; depth++ {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			return ""
+		}
+		next := ""
+		for _, e := range entries {
+			name := e.Name()
+			if name == "settings.json" || name == credentialsFileName {
+				continue
+			}
+			p := filepath.Join(dir, name)
+			fi, lerr := os.Lstat(p)
+			if lerr != nil || fi.Mode()&os.ModeSymlink == 0 {
+				continue
+			}
+			tgt, rerr := os.Readlink(p)
+			if rerr != nil {
+				continue
+			}
+			if !filepath.IsAbs(tgt) {
+				tgt = filepath.Join(dir, tgt)
+			}
+			candidate := filepath.Dir(tgt)
+			if pathUnderWorkerScratch(candidate) {
+				// Deeper nesting — remember the next scratch hop and keep
+				// scanning this level for a direct profile link first.
+				next = candidate
+				continue
+			}
+			canon := filepath.Join(candidate, credentialsFileName)
+			if cfi, serr := os.Stat(canon); serr == nil && cfi.Mode().IsRegular() {
+				return canon
+			}
+		}
+		if next == "" {
+			return ""
+		}
+		dir = next
+	}
+	return ""
 }
 
 // EnsureWorkerScratchConfigDir idempotently prepares the scratch
@@ -280,11 +368,7 @@ func (i *Instance) EnsureWorkerScratchConfigDir(sourceProfileDir string) (string
 		return "", fmt.Errorf("EnsureWorkerScratchConfigDir: instance has no ID")
 	}
 
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", fmt.Errorf("resolve home: %w", err)
-	}
-	scratch := workerScratchDirFor(home, i.ID)
+	scratch := workerScratchDirFor(i.ID)
 
 	// 0o700: scratch settings.json holds plugin topology that shouldn't
 	// be world-readable on a multi-user host.
@@ -363,12 +447,82 @@ func (i *Instance) EnsureWorkerScratchConfigDir(sourceProfileDir string) (string
 	}
 
 	if sourceProfileDir != "" {
+		resetScratchOnSourceChange(scratch, sourceProfileDir)
 		if err := mirrorProfileEntries(scratch, sourceProfileDir); err != nil {
 			return "", err
 		}
 	}
 
 	return scratch, nil
+}
+
+// scratchSourceMarker records which profile the scratch was last seeded
+// from, so a source change (account switch, #924) is detectable even for
+// entries claude has clobbered into real files.
+const scratchSourceMarker = ".agentdeck-scratch-source"
+
+// resetScratchOnSourceChange detects that the scratch was previously seeded
+// from a DIFFERENT profile and removes real-file entries that shadow the new
+// source's entries — most importantly .claude.json, which claude rewrites
+// via rename-on-write (turning the mirror symlink into a real file holding
+// the old account's oauthAccount/MCP state). Symlinked entries are handled
+// by mirrorProfileEntries/sweepForeignSymlinks; settings.json and
+// .credentials.json keep their dedicated handling. Best-effort: a failure
+// leaves the old behavior (stale state) rather than blocking the spawn.
+//
+// Pre-marker scratches infer the previous source from an existing symlink's
+// target (it must run BEFORE mirrorProfileEntries repoints them).
+func resetScratchOnSourceChange(scratch, source string) {
+	markerPath := filepath.Join(scratch, scratchSourceMarker)
+	prevData, _ := os.ReadFile(markerPath)
+	prevSource := strings.TrimSpace(string(prevData))
+	if prevSource == "" {
+		prevSource = inferScratchSource(scratch)
+	}
+	defer func() {
+		_ = os.WriteFile(markerPath, []byte(source+"\n"), 0o600)
+	}()
+	if prevSource == "" || filepath.Clean(prevSource) == filepath.Clean(source) {
+		return
+	}
+
+	sourceEntries, err := os.ReadDir(source)
+	if err != nil {
+		return
+	}
+	for _, entry := range sourceEntries {
+		name := entry.Name()
+		if name == "settings.json" || name == credentialsFileName {
+			continue
+		}
+		scratchPath := filepath.Join(scratch, name)
+		li, lerr := os.Lstat(scratchPath)
+		if lerr != nil || li.Mode()&os.ModeSymlink != 0 || li.IsDir() {
+			// Absent (mirror will link it), symlink (mirror repoints it),
+			// or a real DIR (scratch-local state, e.g. logs) — leave alone.
+			continue
+		}
+		// Real file shadowing a new-source entry: stale old-account state.
+		_ = os.Remove(scratchPath)
+	}
+}
+
+// inferScratchSource derives the profile a pre-marker scratch was seeded
+// from by reading an existing mirror symlink's target directory.
+func inferScratchSource(scratch string) string {
+	entries, err := os.ReadDir(scratch)
+	if err != nil {
+		return ""
+	}
+	for _, entry := range entries {
+		if entry.Type()&os.ModeSymlink == 0 {
+			continue
+		}
+		if target, err := os.Readlink(filepath.Join(scratch, entry.Name())); err == nil {
+			return filepath.Dir(target)
+		}
+	}
+	return ""
 }
 
 // credentialsFileName is the profile's OAuth credentials file. It is the one
@@ -407,10 +561,21 @@ func mirrorProfileEntries(dest, source string) error {
 			continue
 		}
 		linkPath := filepath.Join(dest, name)
-		if _, statErr := os.Lstat(linkPath); statErr == nil {
+		target := filepath.Join(source, name)
+		if li, statErr := os.Lstat(linkPath); statErr == nil {
+			// Existing symlink pointing elsewhere — e.g. the previous
+			// account's profile after `session switch-account` (#924
+			// follow-up): repoint it. Real files/dirs are scratch-local
+			// state and are left alone.
+			if li.Mode()&os.ModeSymlink != 0 {
+				if cur, rerr := os.Readlink(linkPath); rerr == nil && cur != target {
+					if err := symlinkReplace(target, linkPath); err != nil {
+						return fmt.Errorf("repoint %s: %w", name, err)
+					}
+				}
+			}
 			continue
 		}
-		target := filepath.Join(source, name)
 		if err := os.Symlink(target, linkPath); err != nil {
 			if os.IsExist(err) {
 				continue
@@ -418,31 +583,102 @@ func mirrorProfileEntries(dest, source string) error {
 			return fmt.Errorf("symlink %s: %w", name, err)
 		}
 	}
+	if err := sweepForeignSymlinks(dest, source); err != nil {
+		return err
+	}
 	return reassertCredentialSymlink(dest, source)
 }
 
-// reassertCredentialSymlink guarantees dest/.credentials.json is a symlink to
-// source/.credentials.json (the canonical profile credentials), healing the
-// in-session `/login` clobber described in issue #1222.
+// sweepForeignSymlinks removes scratch symlinks that point outside the
+// current source profile. After an account switch the old profile may have
+// entries the new one lacks; the loop above never visits those names, so a
+// stale-but-resolvable symlink into the OLD profile would silently expose
+// the previous account's state (#924 follow-up). Only symlinks are touched —
+// real files/dirs in scratch are local state and stay. settings.json and
+// .credentials.json keep their dedicated handling.
+func sweepForeignSymlinks(dest, source string) error {
+	destEntries, err := os.ReadDir(dest)
+	if err != nil {
+		return fmt.Errorf("read scratch dir: %w", err)
+	}
+	for _, entry := range destEntries {
+		name := entry.Name()
+		if name == "settings.json" || name == credentialsFileName {
+			continue
+		}
+		if entry.Type()&os.ModeSymlink == 0 {
+			continue
+		}
+		linkPath := filepath.Join(dest, name)
+		cur, rerr := os.Readlink(linkPath)
+		if rerr != nil {
+			continue
+		}
+		if filepath.Dir(cur) != filepath.Clean(source) {
+			if err := os.Remove(linkPath); err != nil && !os.IsNotExist(err) {
+				return fmt.Errorf("remove foreign symlink %s: %w", name, err)
+			}
+		}
+	}
+	return nil
+}
+
+// reassertCredentialSymlink guarantees dest/.credentials.json is a clean symlink
+// to source/.credentials.json (the single canonical profile credentials),
+// healing the in-session `/login` clobber described in issue #1222.
 //
 //   - dest entry is the correct symlink → left untouched (idempotent).
 //   - dest entry is absent → symlinked to canonical (when canonical exists).
 //   - dest entry is a symlink to the WRONG target → repointed to canonical.
-//   - dest entry is a real file STALE relative to canonical → replaced with
-//     the symlink; canonical is the source of truth and is left unchanged.
-//   - dest entry is a real file NEWER than canonical (a fresh in-session
-//     `/login`) → its contents are atomically promoted to canonical FIRST
-//     (temp+rename, 0600 token perms preserved, canonical never torn), THEN
-//     dest is replaced with the symlink — so the fresh token propagates to
-//     every symlinked session instead of being stranded in this scratch.
+//   - dest entry is a REAL FILE (the `/login` clobber, or any diverged copy) →
+//     force-replaced with a symlink to canonical, regardless of mtime.
+//     Canonical is NEVER overwritten.
+//   - dest entry is a real file but canonical is ABSENT → left intact, so the
+//     only token copy is not stranded behind a dangling symlink. The next
+//     start, once canonical exists, replaces it with the symlink.
+//
+// Why no mtime-promote (removed; see the OAuth root-cause memo and the
+// disassembly of Claude v2.1.159 in /tmp/oauth-fix/SUBSCRIPTION-FIX.md):
+// Anthropic OAuth uses single-use ROTATING refresh tokens, so a scratch copy's
+// mtime is NOT a "this token is newer/valid" signal. The previous code promoted
+// a strictly-newer scratch real-file to canonical, which could overwrite a good
+// canonical with a stale (or already-rotated-out) scratch token and fork a
+// second rotation chain — re-introducing the `invalid_grant` /login race for
+// every session sharing that profile. Claude re-reads .credentials.json on
+// expiry and serializes refreshes on a cross-process lock keyed by
+// realpath(); collapsing every scratch to ONE canonical symlink is what makes
+// that lock actually serialize the workers. The load-bearing invariant is
+// therefore "the scratch credentials must always be a symlink to the one
+// canonical file, never a real file", and we enforce it on every
+// spawn/start/restart here.
 //
 // WARNING for operators: do NOT run `/login` inside a managed agent-deck
-// session. Log in once in the canonical profile and every session inherits it
-// through this symlink. An in-session login is recovered here on the next
-// start, but only after a restart.
+// session — it writes a real file that diverges from canonical until the next
+// restart relinks it (the in-session token is dropped, NOT promoted). Log in
+// once in the canonical profile (e.g. `CLAUDE_CONFIG_DIR=~/.claude claude` →
+// /login) and every session inherits it through this symlink.
 func reassertCredentialSymlink(dest, source string) error {
 	target := filepath.Join(source, credentialsFileName)
 	linkPath := filepath.Join(dest, credentialsFileName)
+
+	// Nested-scratch collapse (successor to #1222): when source is ITSELF a
+	// worker-scratch dir (a parent worker's scratch leaked into this child's
+	// source resolution), target would be another worker's scratch credentials
+	// — possibly a forked real-file copy that this child's reassert could
+	// never heal (it re-links to the same forked copy on every restart, the
+	// "401 persists across restarts" signature). Recover the TRUE profile
+	// canonical from the nested scratch's own mirrored symlinks and collapse
+	// to it. If no canonical is recoverable, refuse to link into the scratch
+	// tree at all: leave any existing entry intact and create nothing — a
+	// clean login prompt beats inheriting a forked rotation chain. Canonical
+	// is never written either way (the no-promote invariant).
+	if pathUnderWorkerScratch(target) {
+		canon := profileCanonicalFromNestedScratch(source)
+		if canon == "" {
+			return nil
+		}
+		target = canon
+	}
 
 	li, lerr := os.Lstat(linkPath)
 	switch {
@@ -468,32 +704,18 @@ func reassertCredentialSymlink(dest, source string) error {
 		return symlinkReplace(target, linkPath)
 	}
 
-	// dest is a REAL FILE (the `/login` clobber). Decide promote vs relink.
-	promote := false
-	ti, terr := os.Stat(target)
-	switch {
-	case terr != nil && os.IsNotExist(terr):
-		promote = true // canonical missing → scratch is the only copy
-	case terr != nil:
+	// dest is a REAL FILE — the `/login` clobber, or a diverged copy. Always
+	// force-replace it with a clean symlink to canonical; NEVER promote its
+	// contents (mtime is not a valid-token signal for rotating tokens).
+	if _, terr := os.Stat(target); terr != nil {
+		if os.IsNotExist(terr) {
+			// No canonical to point at — leave the only token copy intact
+			// rather than stranding it behind a dangling symlink. Once the
+			// user logs in to canonical, the next start relinks this.
+			return nil
+		}
 		return fmt.Errorf("stat canonical credentials: %w", terr)
-	default:
-		// Promote only when the scratch copy is strictly newer — a fresh
-		// in-session login. Equal/older is treated as stale (relink only).
-		promote = li.ModTime().After(ti.ModTime())
 	}
-
-	if promote {
-		data, rerr := os.ReadFile(linkPath)
-		if rerr != nil {
-			return fmt.Errorf("read scratch credentials for promote: %w", rerr)
-		}
-		// Atomic temp+rename into canonical: 0600 token perms preserved,
-		// canonical never torn even under a concurrent reader (G5/G1).
-		if err := atomicWriteFile(target, data, 0o600); err != nil {
-			return fmt.Errorf("promote scratch credentials to canonical: %w", err)
-		}
-	}
-
 	return symlinkReplace(target, linkPath)
 }
 
@@ -558,6 +780,11 @@ func (i *Instance) applyWorkerScratchOverride(resolvedConfigDir string) string {
 // claude would start with enabledPlugins[<id>]=true but without the
 // plugin code reachable, until the next restart rebuilt scratch.
 func (i *Instance) prepareWorkerScratchConfigDirForSpawn() {
+	// Heal lost channel wiring BEFORE evaluating the scratch gates: a
+	// conductor whose persisted Channels lost the telegram entry must
+	// re-arm needsScratchForTelegramChannelOwner on this very spawn
+	// (telegram_reliability.go, telegram-channel-restore).
+	reconcileConductorTelegramChannel(i)
 	if !i.NeedsWorkerScratchConfigDir() {
 		return
 	}
@@ -625,9 +852,8 @@ var macOSScratchWarningEmitter func(sourceProfileDir string) = emitMacOSScratchW
 
 // maybeEmitMacOSScratchWarning is a no-op on non-darwin and a one-shot
 // per-(host, sourceProfileDir) pair on darwin. Cache lives in
-// `~/.agent-deck/state.json` under the key
-// `macos_plugin_scratch_warning_shown[<sourceProfileDir>]` so a second
-// session re-using the same source profile silently skips the warning.
+// the effective data directory so a second session re-using the same
+// source profile silently skips the warning.
 //
 // Best-effort: state-file errors (read or write) do NOT block the
 // session. Worst case: warning is shown twice.
@@ -654,18 +880,14 @@ func goosNative() string { return runtime.GOOS }
 
 // macOSWarningStateFile is the single-flag JSON state file recording
 // which source profile dirs already showed the macOS plugin-scratch
-// warning. Lives at `~/.agent-deck/macos-plugin-warning-state.json`.
+// warning. Lives in the effective data directory.
 //
 // Schema: { "shown": { "<source-profile-dir>": true, ... } }
 //
 // Best-effort everywhere — read errors degrade to "not yet shown",
 // write errors degrade to "may show twice". No mandate-level guard.
 func macOSWarningStateFile() (string, error) {
-	dir, err := GetAgentDeckDir()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(dir, "macos-plugin-warning-state.json"), nil
+	return dataPath("macos-plugin-warning-state.json", "macos-plugin-warning-state.json")
 }
 
 type macosWarningState struct {

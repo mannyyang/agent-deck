@@ -18,21 +18,26 @@ import { TweaksPanel } from './TweaksPanel.js'
 import { TerminalPane } from './panes/TerminalPane.js'
 import { CostsPane } from './panes/CostsPane.js'
 import { FleetPane } from './panes/FleetPane.js'
+import { ArchivedPane } from './panes/ArchivedPane.js'
 import { StubPane } from './panes/StubPane.js'
 import { SearchPane } from './panes/SearchPane.js'
 import { McpPane } from './panes/McpPane.js'
+import { SkillsPane } from './panes/SkillsPane.js'
 import { Icon, ICONS } from './icons.js'
 import { menuModelSignal } from './dataModel.js'
 import {
   selectedIdSignal, createSessionDialogSignal, confirmDialogSignal,
   groupNameDialogSignal, mutationsEnabledSignal, infoDrawerOpenSignal,
   profilesSignal, systemStatsSignal,
+  toolFilterSignal, visibleToolsSignal, toolFilterFallbackSignal,
+  hiddenToolsSignal, pickerToolsSignal,
 } from './state.js'
 import {
   activeTabSignal, paletteOpenSignal, tweaksOpenSignal,
   railSignal, profileSignal,
 } from './uiState.js'
 import { CreateSessionDialog } from './CreateSessionDialog.js'
+import { EditSessionDialog } from './EditSessionDialog.js'
 import { ConfirmDialog } from './ConfirmDialog.js'
 import { GroupNameDialog } from './GroupNameDialog.js'
 import { ToastContainer, addToast } from './Toast.js'
@@ -78,7 +83,7 @@ function WorkHead() {
             ? html`<button class="btn ghost" onClick=${() => action('stop')}><${Icon} d=${ICONS.stop} size=${12}/>Stop</button>`
             : html`<button class="btn ghost" onClick=${() => action('start')}><${Icon} d=${ICONS.play} size=${12}/>Start</button>`}
           <button class="btn ghost" onClick=${() => action('restart')}><${Icon} d=${ICONS.restart} size=${12}/>Restart</button>
-          ${session.tool === 'claude' && html`<button class="btn" onClick=${() => action('fork')}><${Icon} d=${ICONS.fork} size=${12}/>Fork</button>`}
+          ${session.canFork && html`<button class="btn" onClick=${() => action('fork')}><${Icon} d=${ICONS.fork} size=${12}/>Fork</button>`}
           <button class="btn primary" onClick=${() => (createSessionDialogSignal.value = true)}>
             <${Icon} d=${ICONS.plus} size=${12}/>New <span class="kbd">n</span>
           </button>
@@ -100,10 +105,9 @@ function Panes({ tab }) {
     ${tab === 'fleet'     && html`<${FleetPane}/>`}
     ${tab === 'costs'     && html`<${CostsPane}/>`}
     ${tab === 'search'    && html`<${SearchPane}/>`}
+    ${tab === 'archived'  && html`<${ArchivedPane}/>`}
     ${tab === 'mcp'       && html`<${McpPane}/>`}
-    ${tab === 'skills'    && html`<${StubPane} title="Skills"
-                              message="Skill attachments are managed in the TUI today. The web API does not expose skill management yet."
-                              hotkey="s"/>`}
+    ${tab === 'skills'    && html`<${SkillsPane}/>`}
     ${tab === 'conductor' && html`<${StubPane} title="Conductor"
                               message="Conductor orchestration view is TUI-only. The web API does not expose child topology, bridges, or NEED escalation."/>`}
     ${tab === 'watchers'  && html`<${StubPane} title="Watchers"
@@ -127,12 +131,30 @@ export function AppShell() {
   }, [])
 
   // WEB-P0-4 prevention layer: hydrate webMutations gate from /api/settings.
+  // Also hydrates the show_only_installed_tools filter (issue #1259) so the
+  // new-session dialog can hide tools whose command is not on PATH.
   useEffect(() => {
     fetch('/api/settings')
       .then(r => r.ok ? r.json() : null)
       .then(data => {
-        if (data && typeof data.webMutations === 'boolean') {
+        if (!data) return
+        if (typeof data.webMutations === 'boolean') {
           mutationsEnabledSignal.value = data.webMutations
+        }
+        if (typeof data.toolFilter === 'boolean') {
+          toolFilterSignal.value = data.toolFilter
+        }
+        if (Array.isArray(data.visibleTools)) {
+          visibleToolsSignal.value = data.visibleTools
+        }
+        if (typeof data.toolFilterFallback === 'boolean') {
+          toolFilterFallbackSignal.value = data.toolFilterFallback
+        }
+        if (Array.isArray(data.hiddenTools)) {
+          hiddenToolsSignal.value = data.hiddenTools
+        }
+        if (Array.isArray(data.pickerTools) && data.pickerTools.length > 0) {
+          pickerToolsSignal.value = data.pickerTools
         }
       })
       .catch(() => {})
@@ -319,6 +341,7 @@ export function AppShell() {
       <${MobileTabs}/>
 
       ${showCreateSession && html`<${CreateSessionDialog}/>`}
+      <${EditSessionDialog}/>
       ${confirmData && html`<${ConfirmDialog} ...${confirmData}/>`}
       ${groupNameData && html`<${GroupNameDialog} ...${groupNameData}/>`}
 

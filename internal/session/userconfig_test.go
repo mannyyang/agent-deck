@@ -10,13 +10,63 @@ import (
 	"github.com/BurntSushi/toml"
 )
 
+// isolateConfigHomeXDG redirects XDG_CONFIG_HOME at the test's already-set HOME
+// so XDG-aware config writes stay inside the same temp tree as HOME. Package
+// TestMain clears XDG by default so ordinary HOME-only tests track HOME; this
+// helper is for tests that write config through SaveUserConfig/CreateExampleConfig
+// and should make that scope explicit. Call it AFTER setting HOME.
+func isolateConfigHomeXDG(t *testing.T) {
+	t.Helper()
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(os.Getenv("HOME"), ".config"))
+	ClearUserConfigCache()
+	t.Cleanup(ClearUserConfigCache)
+}
+
+func TestDisplaySettings_GetIncludeCwdPrefix(t *testing.T) {
+	var d DisplaySettings
+	if !d.GetIncludeCwdPrefix() {
+		t.Fatal("default GetIncludeCwdPrefix() = false, want true (preserve historical prefix)")
+	}
+
+	f := false
+	d.IncludeCwdPrefix = &f
+	if d.GetIncludeCwdPrefix() {
+		t.Fatal("GetIncludeCwdPrefix() with explicit false = true, want false")
+	}
+
+	tr := true
+	d.IncludeCwdPrefix = &tr
+	if !d.GetIncludeCwdPrefix() {
+		t.Fatal("GetIncludeCwdPrefix() with explicit true = false, want true")
+	}
+}
+
+func TestDisplaySettings_IncludeCwdPrefix_TOML(t *testing.T) {
+	var cfg UserConfig
+	if _, err := toml.Decode("[display]\ninclude_cwd_prefix = false\n", &cfg); err != nil {
+		t.Fatalf("toml decode: %v", err)
+	}
+	if cfg.Display.GetIncludeCwdPrefix() {
+		t.Fatal("include_cwd_prefix=false in TOML did not disable the prefix")
+	}
+}
+
+func TestUserConfig_DefaultPathTOML(t *testing.T) {
+	var cfg UserConfig
+	if _, err := toml.Decode(`default_path = "~/workspace"`+"\n", &cfg); err != nil {
+		t.Fatalf("toml decode: %v", err)
+	}
+	if got, want := cfg.DefaultPath, "~/workspace"; got != want {
+		t.Fatalf("DefaultPath = %q, want %q", got, want)
+	}
+}
+
 func TestGetCodexCommand_DefaultAndConfig(t *testing.T) {
 	tempDir := t.TempDir()
 	originalHome := os.Getenv("HOME")
 	os.Setenv("HOME", tempDir)
 	defer os.Setenv("HOME", originalHome)
-	ClearUserConfigCache()
-	defer ClearUserConfigCache()
+	isolateConfigHomeXDG(t)
 
 	if got := GetCodexCommand(); got != "codex" {
 		t.Fatalf("GetCodexCommand() without config = %q, want codex", got)
@@ -257,7 +307,7 @@ func TestIsClaudeCompatible_CustomToolCommands(t *testing.T) {
 	originalHome := os.Getenv("HOME")
 	os.Setenv("HOME", tmpDir)
 	defer os.Setenv("HOME", originalHome)
-	ClearUserConfigCache()
+	isolateConfigHomeXDG(t)
 
 	agentDeckDir := filepath.Join(tmpDir, ".agent-deck")
 	if err := os.MkdirAll(agentDeckDir, 0o700); err != nil {
@@ -309,7 +359,7 @@ func TestIsCodexCompatible_CustomToolCommands(t *testing.T) {
 	originalHome := os.Getenv("HOME")
 	os.Setenv("HOME", tmpDir)
 	defer os.Setenv("HOME", originalHome)
-	ClearUserConfigCache()
+	isolateConfigHomeXDG(t)
 
 	agentDeckDir := filepath.Join(tmpDir, ".agent-deck")
 	if err := os.MkdirAll(agentDeckDir, 0o700); err != nil {
@@ -355,12 +405,18 @@ func TestCreateExampleConfigDocumentsCompatibleWith(t *testing.T) {
 	originalHome := os.Getenv("HOME")
 	os.Setenv("HOME", tmpDir)
 	defer os.Setenv("HOME", originalHome)
+	isolateConfigHomeXDG(t)
 
 	if err := CreateExampleConfig(); err != nil {
 		t.Fatalf("CreateExampleConfig: %v", err)
 	}
 
-	configPath := filepath.Join(tmpDir, ".agent-deck", "config.toml")
+	// Read back from wherever CreateExampleConfig actually wrote (XDG-aware;
+	// hardcoding the legacy ~/.agent-deck path breaks post-#1294 resolution).
+	configPath, err := GetUserConfigPath()
+	if err != nil {
+		t.Fatalf("GetUserConfigPath: %v", err)
+	}
 	data, err := os.ReadFile(configPath)
 	if err != nil {
 		t.Fatalf("ReadFile(%s): %v", configPath, err)
@@ -475,9 +531,7 @@ func TestSaveUserConfig(t *testing.T) {
 	originalHome := os.Getenv("HOME")
 	os.Setenv("HOME", tempDir)
 	defer os.Setenv("HOME", originalHome)
-
-	// Clear cache
-	ClearUserConfigCache()
+	isolateConfigHomeXDG(t)
 
 	// Create agent-deck directory
 	agentDeckDir := filepath.Join(tempDir, ".agent-deck")
@@ -531,8 +585,7 @@ func TestClaudeExtraArgsConfigRoundTrip(t *testing.T) {
 	originalHome := os.Getenv("HOME")
 	os.Setenv("HOME", tempDir)
 	defer os.Setenv("HOME", originalHome)
-	ClearUserConfigCache()
-	defer ClearUserConfigCache()
+	isolateConfigHomeXDG(t)
 
 	config := &UserConfig{
 		Claude: ClaudeSettings{
@@ -585,7 +638,7 @@ func TestGetTheme_Light(t *testing.T) {
 	originalHome := os.Getenv("HOME")
 	os.Setenv("HOME", tempDir)
 	defer os.Setenv("HOME", originalHome)
-	ClearUserConfigCache()
+	isolateConfigHomeXDG(t)
 
 	// Create config with light theme
 	agentDeckDir := filepath.Join(tempDir, ".agent-deck")
@@ -605,7 +658,7 @@ func TestResolveTheme_COLORFGBGOverridesOS(t *testing.T) {
 	// auto-detection where COLORFGBG should be checked.
 	tempDir := t.TempDir()
 	t.Setenv("HOME", tempDir)
-	ClearUserConfigCache()
+	isolateConfigHomeXDG(t)
 
 	agentDeckDir := filepath.Join(tempDir, ".agent-deck")
 	_ = os.MkdirAll(agentDeckDir, 0700)
@@ -717,7 +770,7 @@ func TestGetWorktreeSettings_FromConfig(t *testing.T) {
 	originalHome := os.Getenv("HOME")
 	os.Setenv("HOME", tempDir)
 	defer os.Setenv("HOME", originalHome)
-	ClearUserConfigCache()
+	isolateConfigHomeXDG(t)
 
 	// Create config with custom worktree settings
 	agentDeckDir := filepath.Join(tempDir, ".agent-deck")
@@ -772,7 +825,7 @@ func TestGetWorktreeSettings_BranchPrefix(t *testing.T) {
 	originalHome := os.Getenv("HOME")
 	os.Setenv("HOME", tempDir)
 	defer os.Setenv("HOME", originalHome)
-	ClearUserConfigCache()
+	isolateConfigHomeXDG(t)
 
 	// Create config with custom branch_prefix
 	agentDeckDir := filepath.Join(tempDir, ".agent-deck")
@@ -1092,6 +1145,61 @@ func TestPreviewSettingsNotesOutputSplitDefaultsAndClamp(t *testing.T) {
 	settings.NotesOutputSplit = 0.4
 	if got := settings.GetNotesOutputSplit(); got != 0.4 {
 		t.Fatalf("GetNotesOutputSplit configured = %v, want 0.4", got)
+	}
+}
+
+// TestInstanceSettingsAllowMultipleDefault is the #1246 regression guard.
+// allow_multiple previously defaulted to TRUE, so two agent-deck instances
+// could run against one profile and their reviver/restart loops tore down
+// each other's live sessions. The safe default is single-instance per
+// profile: GetAllowMultiple() must default to FALSE so the primary-election
+// gate in main.go engages unless the user explicitly opts in.
+func TestInstanceSettingsAllowMultipleDefault(t *testing.T) {
+	settings := InstanceSettings{}
+	if settings.GetAllowMultiple() {
+		t.Fatal("GetAllowMultiple should default to false (single-instance per profile)")
+	}
+}
+
+// TestInstanceSettingsAllowMultipleExplicit verifies that multi-instance
+// remains available as an explicit opt-in (and that explicit false is
+// honored), so existing users who rely on multi-pane workflows are not
+// silently broken — they only need to set allow_multiple = true.
+func TestInstanceSettingsAllowMultipleExplicit(t *testing.T) {
+	enabled := true
+	settings := InstanceSettings{AllowMultiple: &enabled}
+	if !settings.GetAllowMultiple() {
+		t.Fatal("GetAllowMultiple should return explicit true (opt-in to multi-instance)")
+	}
+
+	disabled := false
+	settings.AllowMultiple = &disabled
+	if settings.GetAllowMultiple() {
+		t.Fatal("GetAllowMultiple should return explicit false")
+	}
+}
+
+// TestUserConfigParseAllowMultiple verifies that an existing config with an
+// explicit allow_multiple = true continues to parse and grant multi-instance,
+// so the default flip does not break users who set the flag deliberately.
+func TestUserConfigParseAllowMultiple(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.toml")
+	content := `
+[instances]
+allow_multiple = true
+`
+	if err := os.WriteFile(configPath, []byte(content), 0644); err != nil {
+		t.Fatalf("Failed to write config file: %v", err)
+	}
+
+	var config UserConfig
+	if _, err := toml.DecodeFile(configPath, &config); err != nil {
+		t.Fatalf("Failed to decode: %v", err)
+	}
+
+	if !config.Instances.GetAllowMultiple() {
+		t.Fatal("instances.allow_multiple = true should parse as true (opt-in preserved)")
 	}
 }
 
@@ -2032,5 +2140,60 @@ active_filter_excludes = ["error", "stopped"]
 	}
 	if got[StatusRunning] {
 		t.Errorf("running should not be excluded, got %v", got)
+	}
+}
+
+// TestUISettings_GetFooter covers the [ui] footer style knob (TUI UX
+// initiative, item 1). Unset/unknown values fall back to the "full" default
+// (today's verbose bar — default-preserving); curated/compact/minimal are
+// opt-in. Known values are normalized case-insensitively.
+func TestUISettings_GetFooter(t *testing.T) {
+	cases := []struct {
+		name string
+		ui   UISettings
+		want string
+	}{
+		{"unset uses full default (preserve today's look)", UISettings{}, FooterFull},
+		{"explicit curated (opt-in)", UISettings{Footer: "curated"}, FooterCurated},
+		{"full", UISettings{Footer: "full"}, FooterFull},
+		{"compact", UISettings{Footer: "compact"}, FooterCompact},
+		{"minimal", UISettings{Footer: "minimal"}, FooterMinimal},
+		{"case-insensitive", UISettings{Footer: "FULL"}, FooterFull},
+		{"trimmed", UISettings{Footer: "  minimal  "}, FooterMinimal},
+		{"unknown falls back to full", UISettings{Footer: "bogus"}, FooterFull},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.ui.GetFooter(); got != tc.want {
+				t.Fatalf("GetFooter() on %+v = %q, want %q", tc.ui, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestUISettings_GetFooter_DefaultIsFull is the focused default-preserving
+// guarantee for PR #1289: with no config, the footer is the historic verbose
+// "full" bar, so nobody's UI changes without an explicit opt-in.
+func TestUISettings_GetFooter_DefaultIsFull(t *testing.T) {
+	if got := (UISettings{}).GetFooter(); got != FooterFull {
+		t.Fatalf("default GetFooter() = %q, want %q (must preserve today's verbose bar)", got, FooterFull)
+	}
+	if DefaultFooter != FooterFull {
+		t.Fatalf("DefaultFooter = %q, want %q", DefaultFooter, FooterFull)
+	}
+}
+
+// TestUISettings_GetFooter_TomlRoundtrip verifies the toml tag wires up.
+func TestUISettings_GetFooter_TomlRoundtrip(t *testing.T) {
+	const cfg = `
+[ui]
+footer = "full"
+`
+	var c UserConfig
+	if _, err := toml.Decode(cfg, &c); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got := c.UI.GetFooter(); got != FooterFull {
+		t.Errorf("GetFooter() = %q, want %q", got, FooterFull)
 	}
 }

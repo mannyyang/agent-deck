@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"regexp"
 	"strings"
 	"sync"
 	"syscall"
@@ -472,12 +473,30 @@ func (r *SSHRunner) remoteExec(ctx context.Context, remoteCmd string, stdin []by
 	return stdout.Bytes(), nil
 }
 
-// parseRemoteVersion extracts the version from `agent-deck version` output,
-// e.g. "Agent Deck v0.20.2" -> "0.20.2".
+// remoteVersionRe matches the first semver-looking token (with optional
+// dotted/pre-release tail) in `agent-deck version` output. The leading "v" is
+// optional and not captured.
+var remoteVersionRe = regexp.MustCompile(`v?(\d+\.\d+\.\d+(?:[.\-+][0-9A-Za-z.\-]+)?)`)
+
+// parseRemoteVersion extracts the binary's ACTUAL current version from
+// `agent-deck version` output, e.g. "Agent Deck v0.20.2" -> "0.20.2".
+//
+// It returns the FIRST semver token, which is the real current version right
+// after "Agent Deck v". This matters because a binary one release behind prints
+// its version with an "(update available: vNEWER)" suffix, e.g.
+// "Agent Deck v1.9.49 (update available: v1.9.55)". A naive
+// strings.LastIndex(out, "v") landed on the advertised newer version and
+// returned "1.9.55)" (trailing paren and all), so callers mis-read the remote
+// as already up to date and skipped the update — a catch-22 where a remote
+// could never be updated while it advertised one. Anchoring on the first
+// semver token fixes that and is robust to trailing punctuation/whitespace.
+//
+// Falls back to the trimmed raw input when no semver token is found so callers
+// still behave.
 func parseRemoteVersion(raw string) string {
 	out := strings.TrimSpace(raw)
-	if idx := strings.LastIndex(out, "v"); idx >= 0 {
-		return strings.TrimSpace(out[idx+1:])
+	if m := remoteVersionRe.FindStringSubmatch(out); m != nil {
+		return m[1]
 	}
 	return out
 }
@@ -573,8 +592,17 @@ func (r *SSHRunner) DeployBinary(ctx context.Context, binaryData []byte, remoteP
 		dir = remotePath[:idx]
 	}
 
-	cmd := fmt.Sprintf("mkdir -p %s && cat > %s && chmod +x %s",
-		shellQuote(dir), shellQuote(remotePath), shellQuote(remotePath))
+	// Stage to a sibling temp file and atomically rename it into place rather
+	// than redirecting onto remotePath directly. agent-deck keeps a long-lived
+	// `session attach` process running from remotePath, so truncating it in
+	// place (`cat > remotePath`) makes the kernel reject the write with ETXTBSY
+	// ("text file busy"). rename(2) only repoints the directory entry, so it
+	// succeeds while the old binary is still executing (the running process
+	// keeps the now-unlinked inode); the next launch picks up the new binary.
+	tmpPath := remotePath + ".new"
+	cmd := fmt.Sprintf("mkdir -p %s && cat > %s && chmod +x %s && mv -f %s %s",
+		shellQuote(dir), shellQuote(tmpPath), shellQuote(tmpPath),
+		shellQuote(tmpPath), shellQuote(remotePath))
 
 	deployCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
 	defer cancel()
@@ -675,12 +703,40 @@ func (r *SSHRunner) buildAttachArgs(sessionID string) []string {
 	return append(args, r.Host, remoteCmd)
 }
 
-// CreateSession creates and starts a new session on the remote, returning its ID.
-// It runs "add --quick --json" to create the session, then "session start" to
-// launch the tmux process, so the session is ready to attach.
+// CreateSession creates and starts a quick new session on the remote, returning its ID.
 func (r *SSHRunner) CreateSession(ctx context.Context) (string, error) {
+	return r.CreateSessionWithOptions(ctx, "", "", "", "")
+}
+
+// remoteAddArgs builds the `agent-deck add` argument list for creating a
+// session on a remote with explicit dialog values (#1353). Empty values fall
+// back to remote defaults: no -c means shell, no -t means --quick
+// (auto-generated name), and an empty or "." path means remote CWD.
+func remoteAddArgs(tool, title, path, group string) []string {
+	args := []string{"add", "--json"}
+	if t := strings.TrimSpace(title); t != "" {
+		args = append(args, "-t", t)
+	} else {
+		args = append(args, "--quick")
+	}
+	if g := strings.TrimSpace(group); g != "" {
+		args = append(args, "-g", g)
+	}
+	if c := strings.TrimSpace(tool); c != "" {
+		args = append(args, "-c", c)
+	}
+	if p := strings.TrimSpace(path); p != "" && p != "." {
+		args = append(args, p)
+	}
+	return args
+}
+
+// CreateSessionWithOptions creates and starts a new session on the remote with
+// an explicit tool/title/path/group from the new-session dialog (#1353),
+// returning its ID. Empty values fall back to remote defaults (see remoteAddArgs).
+func (r *SSHRunner) CreateSessionWithOptions(ctx context.Context, tool, title, path, group string) (string, error) {
 	// Step 1: Create the session
-	output, err := r.Run(ctx, "add", "--quick", "--json")
+	output, err := r.Run(ctx, remoteAddArgs(tool, title, path, group)...)
 	if err != nil {
 		return "", fmt.Errorf("failed to create remote session: %w", err)
 	}
@@ -700,7 +756,8 @@ func (r *SSHRunner) CreateSession(ctx context.Context) (string, error) {
 	// Use ID to avoid ambiguity when titles are duplicated.
 	startCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
-	if _, err := r.run(startCtx, "session", "start", result.ID); err != nil {
+	startOutput, err := r.run(startCtx, "session", "start", "--json", result.ID)
+	if err != nil {
 		// Compensate: the remote DB has the row but no tmux process. Best-effort
 		// delete with a fresh context so an upstream cancellation doesn't skip
 		// the cleanup. Surface the original start failure.
@@ -708,6 +765,12 @@ func (r *SSHRunner) CreateSession(ctx context.Context) (string, error) {
 		defer cleanupCancel()
 		_ = r.DeleteSession(cleanupCtx, result.ID)
 		return "", fmt.Errorf("failed to start remote session: %w", err)
+	}
+	var startResult struct {
+		Status string `json:"status"`
+	}
+	if err := json.Unmarshal(bytes.TrimSpace(startOutput), &startResult); err == nil && startResult.Status == string(StatusQueued) {
+		return "", fmt.Errorf("remote session %q was queued and is not ready to attach", result.Title)
 	}
 
 	return result.ID, nil

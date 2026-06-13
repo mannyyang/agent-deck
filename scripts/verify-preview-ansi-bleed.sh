@@ -48,7 +48,7 @@ echo "=== Issue #699 preview-bleed verification ==="
 # 1. Seam A + Seam B: run the Go tests that encode the invariant.
 echo
 echo "--- Seam A + Seam B (Go tests) ---"
-if GOTOOLCHAIN=go1.25.10 go test -run 'Issue699' ./internal/ui/ -count=1 -race >/tmp/adeck-699-gotest.log 2>&1; then
+if GOTOOLCHAIN=go1.25.11 go test -run 'Issue699' ./internal/ui/ -count=1 -race >/tmp/adeck-699-gotest.log 2>&1; then
   pass "Go tests pass (Seam A unit + Seam B eval)"
   log "$(grep -E 'PASS|FAIL' /tmp/adeck-699-gotest.log | head -10)"
 else
@@ -62,7 +62,7 @@ echo
 echo "--- Build ---"
 if [[ ! -x "$BIN" ]]; then
   log "building agent-deck..."
-  GOTOOLCHAIN=go1.25.10 go build -o ./agent-deck ./cmd/agent-deck >/tmp/adeck-699-build.log 2>&1 || {
+  GOTOOLCHAIN=go1.25.11 go build -o ./agent-deck ./cmd/agent-deck >/tmp/adeck-699-build.log 2>&1 || {
     fail "go build failed"
     cat /tmp/adeck-699-build.log | tail -20 | sed 's/^/      /'
     exit 1
@@ -76,8 +76,9 @@ echo
 echo "--- Seam C (tmux) ---"
 command -v tmux >/dev/null || { skip "tmux not installed — Seam C skipped"; exit 0; }
 
-mkdir -p "$TMPHOME/.agent-deck"
-cat > "$TMPHOME/.agent-deck/config.toml" <<'EOF'
+export XDG_CONFIG_HOME="$TMPHOME/.config"
+mkdir -p "$XDG_CONFIG_HOME/agent-deck"
+cat > "$XDG_CONFIG_HOME/agent-deck/config.toml" <<'EOF'
 [tmux]
 inject_status_line = false
 EOF

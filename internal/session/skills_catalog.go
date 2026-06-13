@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/BurntSushi/toml"
+
+	"github.com/asheshgoplani/agent-deck/internal/agentpaths"
 )
 
 const (
@@ -21,6 +23,7 @@ const (
 	projectSkillsManifest    = "skills.toml"
 	projectClaudeSkillsDir   = ".claude/skills"
 	projectAgentsSkillsDir   = ".agents/skills"
+	projectHermesSkillsDir   = ".hermes/skills"
 	defaultSkillSourcePool   = "pool"
 	defaultSkillSourceClaude = "claude-global"
 )
@@ -122,7 +125,7 @@ func skillIDForAttachment(a ProjectSkillAttachment) string {
 }
 
 func knownProjectSkillsDirs() []string {
-	return []string{projectClaudeSkillsDir, projectAgentsSkillsDir}
+	return []string{projectClaudeSkillsDir, projectAgentsSkillsDir, projectHermesSkillsDir}
 }
 
 // SupportsProjectSkills reports whether the runtime supports project skill materialization.
@@ -134,7 +137,7 @@ func SupportsProjectSkills(tool string) bool {
 // ShouldRestartProjectSkills reports whether agent-deck should auto-restart the session
 // after project skill changes for this runtime.
 func ShouldRestartProjectSkills(tool string) bool {
-	return IsClaudeCompatible(tool) || tool == "gemini" || tool == "codex"
+	return IsClaudeCompatible(tool) || tool == "gemini" || tool == "codex" || tool == "hermes"
 }
 
 // GetProjectSkillsDir returns the runtime-managed project skill directory.
@@ -144,6 +147,8 @@ func GetProjectSkillsDir(tool string) (string, bool) {
 		return projectClaudeSkillsDir, true
 	case tool == "gemini" || tool == "codex" || tool == "pi":
 		return projectAgentsSkillsDir, true
+	case tool == "hermes":
+		return projectHermesSkillsDir, true
 	default:
 		return "", false
 	}
@@ -235,16 +240,34 @@ func isContainedIn(basePath, targetPath string) bool {
 	return strings.HasPrefix(normalizedTarget, normalizedBase+string(os.PathSeparator))
 }
 
-// GetSkillsRootPath returns ~/.agent-deck/skills.
+// GetSkillsRootPath returns the Agent Deck skills config directory, falling back
+// to the legacy ~/.agent-deck/skills tree when it already exists.
 func GetSkillsRootPath() (string, error) {
-	base, err := GetAgentDeckDir()
+	configDir, err := agentpaths.ConfigDir()
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(base, skillsDirName), nil
+	xdgPath := filepath.Join(configDir, skillsDirName)
+	if _, err := os.Stat(xdgPath); err == nil {
+		return xdgPath, nil
+	} else if err != nil && !os.IsNotExist(err) {
+		return "", err
+	}
+
+	legacyDir, err := agentpaths.LegacyDir()
+	if err != nil {
+		return xdgPath, nil
+	}
+	legacyPath := filepath.Join(legacyDir, skillsDirName)
+	if _, err := os.Stat(legacyPath); err == nil {
+		return legacyPath, nil
+	} else if err != nil && !os.IsNotExist(err) {
+		return "", err
+	}
+	return xdgPath, nil
 }
 
-// GetSkillSourcesPath returns ~/.agent-deck/skills/sources.toml.
+// GetSkillSourcesPath returns the skill source registry path.
 func GetSkillSourcesPath() (string, error) {
 	root, err := GetSkillsRootPath()
 	if err != nil {
@@ -253,7 +276,7 @@ func GetSkillSourcesPath() (string, error) {
 	return filepath.Join(root, skillSourcesFileName), nil
 }
 
-// GetSkillPoolPath returns ~/.agent-deck/skills/pool.
+// GetSkillPoolPath returns the managed skill pool path.
 func GetSkillPoolPath() (string, error) {
 	root, err := GetSkillsRootPath()
 	if err != nil {

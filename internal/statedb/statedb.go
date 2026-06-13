@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -12,10 +13,59 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	_ "modernc.org/sqlite"
 )
+
+// ErrRefusingEmptySweep is returned by SaveInstances when it is asked to
+// persist an EMPTY instance set while the instances table still holds rows.
+//
+// S1 data-loss safeguard (added after the 2026-06-04 incident, the third of
+// its class): SaveInstances' DELETE+re-insert sweep used to run an
+// unconditional `DELETE FROM instances` for an empty payload, so a stray
+// SaveInstances([]) wiped the live profile index. Refusing the destructive
+// empty sweep turns silent data loss into a loud, recoverable error. Callers
+// that genuinely intend to empty the table must use ClearAllInstances.
+var ErrRefusingEmptySweep = errors.New("statedb: refusing to wipe populated instances table with an empty SaveInstances payload (use ClearAllInstances to intentionally clear)")
+
+// backupDBFile copies the live SQLite database file to "<path>.bak" so a
+// destructive sweep is recoverable (S2 data-loss safeguard, 2026-06-04
+// incident). It is best-effort: a failed backup must NOT abort the save (the
+// save is the operation the caller actually asked for; the backup is an
+// insurance copy). To capture a consistent snapshot we checkpoint the WAL into
+// the main file first, then copy. Errors are returned so callers can log them,
+// but the only current caller intentionally ignores the error.
+//
+// No-op (nil) when path is empty (in-memory DB) — there is no file to copy.
+func (s *StateDB) backupDBFile() error {
+	if s.path == "" {
+		return nil
+	}
+	// Fold the WAL back into the main db file so the .bak is self-contained and
+	// doesn't depend on a sidecar -wal that the next write will overwrite.
+	_, _ = s.db.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
+
+	src, err := os.ReadFile(s.path)
+	if err != nil {
+		// Nothing to back up (file not created yet) or unreadable; either way,
+		// don't block the save.
+		return err
+	}
+	bak := s.path + ".bak"
+	// 0600: the db may carry session metadata; keep the backup as private as
+	// the original. Write+rename to avoid leaving a torn .bak.
+	tmp := bak + ".tmp"
+	if err := os.WriteFile(tmp, src, 0o600); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, bak); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
+}
 
 // withBusyRetry runs op with linear backoff (10ms, 20ms, 30ms, 40ms, 50ms;
 // ~150ms total) when op fails with SQLITE_BUSY. Non-BUSY errors are returned
@@ -54,7 +104,7 @@ func withBusyRetry(op func() error) error {
 
 // SchemaVersion tracks the current database schema version.
 // Bump this when adding migrations.
-const SchemaVersion = 9
+const SchemaVersion = 11
 
 // StateDB wraps a SQLite database for session/group persistence.
 // Thread-safe for concurrent use from multiple goroutines within one process.
@@ -62,7 +112,21 @@ const SchemaVersion = 9
 type StateDB struct {
 	db  *sql.DB
 	pid int
+	// path is the on-disk path of the SQLite database file. Retained so
+	// destructive write paths can snapshot the file to "<path>.bak" before a
+	// large DELETE+re-insert sweep (S2 data-loss safeguard, 2026-06-04
+	// incident). Empty for in-memory databases (no file to back up).
+	path string
 }
+
+// backupRowDropThreshold is the minimum number of rows a single
+// saveInstancesOnce sweep must DELETE before it is worth snapshotting the DB
+// file to "<path>.bak". A sweep that drops one or two rows is routine session
+// churn (a session was removed/renamed); backing the file up on every such save
+// would thrash the disk. The 2026-06-04 incident wiped the entire populated
+// table at once, so a meaningful-drop gate catches the catastrophic case while
+// staying quiet during normal operation.
+const backupRowDropThreshold = 3
 
 // InstanceRow represents a session row in the database.
 type InstanceRow struct {
@@ -94,8 +158,14 @@ type InstanceRow struct {
 	// `[profiles.<account>.claude].config_dir` at spawn time and becomes the
 	// most-specific level in the CLAUDE_CONFIG_DIR resolution chain. Empty
 	// means "fall through to conductor/group/env/profile/global/default".
-	Account  string
+	Account string
+	// Pin anchors the session to the top/bottom of its group (pin-sessions
+	// feature). "", "top", or "bottom"; empty (the column default) means not
+	// pinned, so legacy rows need no backfill.
+	Pin      string
 	ToolData json.RawMessage // JSON blob for tool-specific data
+	// ArchivedAt is non-zero when the session is archived (hidden from active lists).
+	ArchivedAt time.Time
 }
 
 // WatcherRow represents a watcher row in the database.
@@ -120,6 +190,7 @@ type WatcherEventRow struct {
 	RoutedTo        string
 	SessionID       string
 	TriageSessionID string
+	Body            string
 	CreatedAt       time.Time
 }
 
@@ -222,7 +293,7 @@ func Open(dbPath string) (*StateDB, error) {
 		return nil, fmt.Errorf("statedb: wal mode: %w", err)
 	}
 
-	return &StateDB{db: db, pid: os.Getpid()}, nil
+	return &StateDB{db: db, pid: os.Getpid(), path: dbPath}, nil
 }
 
 // Close checkpoints WAL and closes the database.
@@ -279,6 +350,8 @@ func (s *StateDB) Migrate() error {
 			worktree_repo     TEXT NOT NULL DEFAULT '',
 			worktree_branch   TEXT NOT NULL DEFAULT '',
 			account           TEXT NOT NULL DEFAULT '',
+			archived_at       INTEGER NOT NULL DEFAULT 0,
+			pin               TEXT NOT NULL DEFAULT '',
 			tool_data       TEXT NOT NULL DEFAULT '{}',
 			acknowledged    INTEGER NOT NULL DEFAULT 0
 		)
@@ -394,6 +467,7 @@ func (s *StateDB) Migrate() error {
 			routed_to         TEXT NOT NULL DEFAULT '',
 			session_id        TEXT NOT NULL DEFAULT '',
 			triage_session_id TEXT NOT NULL DEFAULT '',
+			body              TEXT NOT NULL DEFAULT '',
 			created_at        INTEGER NOT NULL,
 			UNIQUE(watcher_id, dedup_key)
 		)
@@ -415,6 +489,11 @@ func (s *StateDB) Migrate() error {
 	alterMigrations := []string{
 		"ALTER TABLE instances ADD COLUMN acknowledged INTEGER NOT NULL DEFAULT 0",
 		"ALTER TABLE watcher_events ADD COLUMN triage_session_id TEXT NOT NULL DEFAULT ''",
+		// Slack-truncation fix: full message text alongside the (first-line,
+		// 200-byte) subject label, so the conductor bridge can forward the
+		// complete message instead of a truncated subject. Default '' keeps
+		// pre-fix rows readable (bridge falls back to subject when body is '').
+		"ALTER TABLE watcher_events ADD COLUMN body TEXT NOT NULL DEFAULT ''",
 		// v7 (issue #687, v1.7.50): per-session tmux socket isolation.
 		// Default '' keeps the pre-v1.7.50 behavior for existing rows.
 		"ALTER TABLE instances ADD COLUMN tmux_socket_name TEXT NOT NULL DEFAULT ''",
@@ -425,6 +504,11 @@ func (s *StateDB) Migrate() error {
 		// the pre-v1.9.22 behavior for legacy rows (fall through to
 		// conductor/group/env/profile/global/default).
 		"ALTER TABLE instances ADD COLUMN account TEXT NOT NULL DEFAULT ''",
+		// v10: user-archived sessions (hidden from active lists; 0 = active).
+		"ALTER TABLE instances ADD COLUMN archived_at INTEGER NOT NULL DEFAULT 0",
+		// v11 (pin-sessions): per-session pin to top/bottom of group. Default ''
+		// means "not pinned" for all pre-existing rows.
+		"ALTER TABLE instances ADD COLUMN pin TEXT NOT NULL DEFAULT ''",
 	}
 	for _, stmt := range alterMigrations {
 		if _, err := tx.Exec(stmt); err != nil {
@@ -485,6 +569,20 @@ func (s *StateDB) Migrate() error {
 				}
 			}
 		}
+		if oldVer < 10 {
+			if _, err := tx.Exec(`ALTER TABLE instances ADD COLUMN archived_at INTEGER NOT NULL DEFAULT 0`); err != nil {
+				if !strings.Contains(err.Error(), "duplicate column") {
+					return fmt.Errorf("statedb: migrate v10 archived_at: %w", err)
+				}
+			}
+		}
+		if oldVer < 11 {
+			if _, err := tx.Exec(`ALTER TABLE instances ADD COLUMN pin TEXT NOT NULL DEFAULT ''`); err != nil {
+				if !strings.Contains(err.Error(), "duplicate column") {
+					return fmt.Errorf("statedb: migrate v11 pin: %w", err)
+				}
+			}
+		}
 		if _, err := tx.Exec(`
 			UPDATE metadata SET value = ? WHERE key = 'schema_version'
 		`, schemaVersion); err != nil {
@@ -506,6 +604,13 @@ func (s *StateDB) IsEmpty() (bool, error) {
 }
 
 // --- Instance CRUD ---
+
+func archivedAtUnix(t time.Time) int64 {
+	if t.IsZero() {
+		return 0
+	}
+	return t.UTC().Unix()
+}
 
 // SaveInstance inserts or replaces a single instance.
 func (s *StateDB) SaveInstance(inst *InstanceRow) error {
@@ -541,15 +646,15 @@ func (s *StateDB) SaveInstance(inst *InstanceRow) error {
 			created_at, last_accessed,
 			parent_session_id, is_conductor, no_transition_notify,
 			worktree_path, worktree_repo, worktree_branch, account,
-			tool_data, title_locked
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			archived_at, pin, tool_data, title_locked
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		inst.ID, inst.Title, inst.ProjectPath, inst.GroupPath, inst.Order,
 		inst.Command, inst.Wrapper, inst.Tool, inst.Status, inst.TmuxSession, inst.TmuxSocketName,
 		inst.CreatedAt.Unix(), inst.LastAccessed.Unix(),
 		inst.ParentSessionID, isConductorInt, noTransitionNotifyInt,
 		inst.WorktreePath, inst.WorktreeRepo, inst.WorktreeBranch, inst.Account,
-		string(toolData), titleLockedInt,
+		archivedAtUnix(inst.ArchivedAt), inst.Pin, string(toolData), titleLockedInt,
 	)
 	return err
 }
@@ -608,6 +713,36 @@ func (s *StateDB) saveInstancesOnce(insts []*InstanceRow) error {
 		}
 	}
 
+	// S2 data-loss safeguard (2026-06-04 incident): for a NON-empty payload,
+	// the sweep below DELETEs every on-disk row whose id is absent from the new
+	// set. Count that drop FIRST (on the raw handle, before opening the write
+	// transaction — running a wal_checkpoint backup inside an open tx on the
+	// same pool would deadlock). When the drop is meaningful
+	// (>= backupRowDropThreshold), snapshot the DB file to "<path>.bak" so a
+	// buggy-but-non-empty replace (the incident dropped most of the table at
+	// once) stays recoverable. S1 already refuses the fully-empty sweep; S2
+	// covers the large-but-not-empty replaces S1 cannot catch. The backup is
+	// best-effort: a failed copy is logged, never fatal — the caller asked to
+	// save, and the insurance copy must not become a new failure mode.
+	if len(insts) > 0 && s.path != "" {
+		placeholders := make([]string, len(insts))
+		args := make([]any, len(insts))
+		for i, inst := range insts {
+			placeholders[i] = "?"
+			args[i] = inst.ID
+		}
+		var dropCount int
+		// #nosec G202 -- placeholders is a fixed sequence of "?" tokens generated
+		// from len(insts); all values flow through args[], never the SQL string.
+		countQuery := "SELECT COUNT(*) FROM instances WHERE id NOT IN (" + strings.Join(placeholders, ",") + ")"
+		if err := s.db.QueryRow(countQuery, args...).Scan(&dropCount); err == nil && dropCount >= backupRowDropThreshold {
+			if bErr := s.backupDBFile(); bErr != nil {
+				slog.Warn("statedb: pre-sweep backup failed (continuing with save)",
+					"path", s.path, "drop_count", dropCount, "err", bErr)
+			}
+		}
+	}
+
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
@@ -616,9 +751,21 @@ func (s *StateDB) saveInstancesOnce(insts []*InstanceRow) error {
 
 	// Delete rows not in the new list to prevent deleted sessions from reappearing.
 	if len(insts) == 0 {
-		if _, err := tx.Exec("DELETE FROM instances"); err != nil {
+		// S1 guard: an empty payload would `DELETE FROM instances`, wiping the
+		// whole table. If rows already exist this is almost certainly a bug in
+		// the caller (a stray empty save), not an intentional clear — refuse it
+		// rather than silently destroying the index. Intentional clears go
+		// through ClearAllInstances. An empty payload on an already-empty table
+		// is a benign no-op.
+		var existing int
+		if err := tx.QueryRow("SELECT COUNT(*) FROM instances").Scan(&existing); err != nil {
 			return err
 		}
+		if existing > 0 {
+			return ErrRefusingEmptySweep
+		}
+		// Already empty: nothing to delete, nothing to insert.
+		return tx.Commit()
 	} else {
 		placeholders := make([]string, len(insts))
 		args := make([]any, len(insts))
@@ -641,8 +788,8 @@ func (s *StateDB) saveInstancesOnce(insts []*InstanceRow) error {
 			created_at, last_accessed,
 			parent_session_id, is_conductor, no_transition_notify,
 			worktree_path, worktree_repo, worktree_branch, account,
-			tool_data, title_locked
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			archived_at, pin, tool_data, title_locked
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`)
 	if err != nil {
 		return err
@@ -675,13 +822,25 @@ func (s *StateDB) saveInstancesOnce(insts []*InstanceRow) error {
 			inst.CreatedAt.Unix(), inst.LastAccessed.Unix(),
 			inst.ParentSessionID, isConductorInt, noTransitionNotifyInt,
 			inst.WorktreePath, inst.WorktreeRepo, inst.WorktreeBranch, inst.Account,
-			string(toolData), titleLockedInt,
+			archivedAtUnix(inst.ArchivedAt), inst.Pin, string(toolData), titleLockedInt,
 		); err != nil {
 			return err
 		}
 	}
 
 	return tx.Commit()
+}
+
+// ClearAllInstances is the explicit escape hatch for intentionally emptying the
+// instances table. SaveInstances([]) refuses to wipe a populated table (S1
+// data-loss safeguard, ErrRefusingEmptySweep); callers that truly mean to clear
+// every row must call this method so the destructive intent is unambiguous and
+// greppable. It is a no-op on an already-empty table.
+func (s *StateDB) ClearAllInstances() error {
+	return withBusyRetry(func() error {
+		_, err := s.db.Exec("DELETE FROM instances")
+		return err
+	})
 }
 
 // LoadInstances returns all instances ordered by sort_order.
@@ -692,7 +851,7 @@ func (s *StateDB) LoadInstances() ([]*InstanceRow, error) {
 			created_at, last_accessed,
 			parent_session_id, is_conductor, no_transition_notify,
 			worktree_path, worktree_repo, worktree_branch, account,
-			tool_data, title_locked
+			archived_at, pin, tool_data, title_locked
 		FROM instances ORDER BY sort_order
 	`)
 	if err != nil {
@@ -703,7 +862,7 @@ func (s *StateDB) LoadInstances() ([]*InstanceRow, error) {
 	var result []*InstanceRow
 	for rows.Next() {
 		r := &InstanceRow{}
-		var createdUnix, accessedUnix int64
+		var createdUnix, accessedUnix, archivedUnix int64
 		var toolDataStr string
 		var isConductorInt, noTransitionNotifyInt, titleLockedInt int
 		if err := rows.Scan(
@@ -712,13 +871,16 @@ func (s *StateDB) LoadInstances() ([]*InstanceRow, error) {
 			&createdUnix, &accessedUnix,
 			&r.ParentSessionID, &isConductorInt, &noTransitionNotifyInt,
 			&r.WorktreePath, &r.WorktreeRepo, &r.WorktreeBranch, &r.Account,
-			&toolDataStr, &titleLockedInt,
+			&archivedUnix, &r.Pin, &toolDataStr, &titleLockedInt,
 		); err != nil {
 			return nil, err
 		}
 		r.CreatedAt = time.Unix(createdUnix, 0)
 		if accessedUnix > 0 {
 			r.LastAccessed = time.Unix(accessedUnix, 0)
+		}
+		if archivedUnix > 0 {
+			r.ArchivedAt = time.Unix(archivedUnix, 0).UTC()
 		}
 		r.IsConductor = isConductorInt != 0
 		r.NoTransitionNotify = noTransitionNotifyInt != 0
@@ -843,6 +1005,81 @@ func (s *StateDB) WriteStatus(id, status, tool string) error {
 			status, tool, status, id,
 		)
 		return err
+	})
+}
+
+// InstanceStatusUpdate is one targeted status mutation for
+// PersistInstanceStatusesTx: set instances.status = Status WHERE id = ID.
+// No other column is touched, so a concurrent writer's edits to any other
+// field of the same row are preserved.
+type InstanceStatusUpdate struct {
+	ID     string
+	Status string
+}
+
+// PersistInstanceStatusesTx applies a batch of targeted status updates inside a
+// SINGLE transaction. It is the persistence primitive for `session revive`.
+//
+// Why a dedicated primitive (two independent guarantees):
+//
+//  1. ATOMICITY / no partial write. All rows commit together or none do. A
+//     mid-loop failure on `revive --all` rolls the whole batch back instead of
+//     leaving the table half-healed (some rows StatusRunning, some still
+//     StatusError). Per-row INSERT-OR-REPLACE outside a tx could not promise
+//     this.
+//
+//  2. NO clobber of concurrent edits. Each row is written with a TARGETED
+//     `UPDATE instances SET status = ? WHERE id = ?` — only the single column
+//     revive owns (see Reviver.defaultReviveAction, which mutates nothing but
+//     Instance.Status). It deliberately does NOT use INSERT OR REPLACE of the
+//     whole row: a full-row write would overwrite every other column from
+//     revive's stale in-memory snapshot, clobbering any field (title, group,
+//     tool_data, last_accessed, …) a concurrent process edited between
+//     revive's load and its save. Mirrors WriteStatus / WriteClaudeSessionBinding,
+//     which target single columns for exactly this reason.
+//
+// There is NO DELETE sweep here — a row absent from `updates` is left entirely
+// untouched, so revive can never drop a session a concurrent `add` inserted
+// after revive loaded its snapshot (the lost-update race this fixes). Rows
+// whose id no longer exists (removed concurrently) simply match zero rows; the
+// UPDATE is a benign no-op, never a resurrection.
+//
+// The acknowledged-reset mirrors WriteStatus: flipping a row to "running"
+// clears its acknowledged flag so the TUI re-surfaces the freshly-revived
+// session. Wrapped in withBusyRetry because the whole batch is idempotent
+// (targeted UPDATEs to fixed ids), matching SaveInstances' retry rationale.
+func (s *StateDB) PersistInstanceStatusesTx(updates []InstanceStatusUpdate) error {
+	if len(updates) == 0 {
+		return nil
+	}
+	return withBusyRetry(func() error {
+		tx, err := s.db.Begin()
+		if err != nil {
+			return err
+		}
+		defer func() { _ = tx.Rollback() }()
+
+		stmt, err := tx.Prepare(
+			`UPDATE instances
+			   SET status = ?,
+			       acknowledged = CASE WHEN ? = 'running' THEN 0 ELSE acknowledged END
+			 WHERE id = ?`,
+		)
+		if err != nil {
+			return err
+		}
+		defer stmt.Close()
+
+		for _, u := range updates {
+			if _, err := stmt.Exec(u.Status, u.Status, u.ID); err != nil {
+				return err
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+		_ = s.Touch()
+		return nil
 	})
 }
 
@@ -1028,7 +1265,7 @@ func (s *StateDB) ElectPrimary(timeout time.Duration) (bool, error) {
 		return false, fmt.Errorf("statedb: clear stale primary: %w", err)
 	}
 
-	// Check if any alive instance already has is_primary=1
+	// Find a candidate primary that is still fresh by heartbeat.
 	var existingPID int
 	err = tx.QueryRow(
 		"SELECT pid FROM instance_heartbeats WHERE is_primary = 1 AND heartbeat >= ? LIMIT 1",
@@ -1036,14 +1273,32 @@ func (s *StateDB) ElectPrimary(timeout time.Duration) (bool, error) {
 	).Scan(&existingPID)
 
 	if err == nil {
-		// An alive primary exists
-		if err := tx.Commit(); err != nil {
-			return false, fmt.Errorf("statedb: commit elect: %w", err)
+		// A fresh-by-heartbeat primary row exists. Trust it as a live owner only
+		// if it is our own process OR the recorded PID is actually alive. A row
+		// left behind by an unclean exit (SIGKILL, OOM, terminal force-close,
+		// crash/panic) never ran ResignPrimary, so its heartbeat can stay within
+		// `timeout` for up to the full window after the process is gone. Without
+		// the liveness check, the next start sees that ghost as a live primary
+		// and exits "already running" — which is why users had to pkill (or wait
+		// out the window) before a restart would take. Verifying liveness here
+		// reclaims a dead primary immediately. The time-based clear above remains
+		// as a safety net against PID reuse.
+		if existingPID == s.pid || pidAlive(existingPID) {
+			if err := tx.Commit(); err != nil {
+				return false, fmt.Errorf("statedb: commit elect: %w", err)
+			}
+			return existingPID == s.pid, nil
 		}
-		return existingPID == s.pid, nil
+		// Dead primary: clear its flag and fall through to claim.
+		if _, err := tx.Exec(
+			"UPDATE instance_heartbeats SET is_primary = 0 WHERE pid = ?",
+			existingPID,
+		); err != nil {
+			return false, fmt.Errorf("statedb: clear dead primary: %w", err)
+		}
 	}
 
-	// No alive primary exists: claim it
+	// No live primary exists: claim it
 	if _, err := tx.Exec(
 		"UPDATE instance_heartbeats SET is_primary = 1 WHERE pid = ?",
 		s.pid,
@@ -1055,6 +1310,23 @@ func (s *StateDB) ElectPrimary(timeout time.Duration) (bool, error) {
 		return false, fmt.Errorf("statedb: commit elect: %w", err)
 	}
 	return true, nil
+}
+
+// pidAlive reports whether pid refers to a live process on this host. It uses
+// the kill -0 idiom (signal 0 performs permission/existence checks only and is
+// never delivered), mirroring filterAliveOurProcesses in
+// internal/tmux/ensure_pids_dead.go. A dead or reaped PID returns false so a
+// crashed primary is reclaimed immediately by ElectPrimary instead of lingering
+// for the full heartbeat-staleness window.
+func pidAlive(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return false
+	}
+	return proc.Signal(syscall.Signal(0)) == nil
 }
 
 // ResignPrimary clears the is_primary flag for this process.
@@ -1279,14 +1551,14 @@ func (s *StateDB) LoadWatchers() ([]*WatcherRow, error) {
 // write lock even with WAL + busy_timeout if the driver surfaces BUSY before
 // the backoff completes. Retries are cheap because the operation is
 // idempotent (INSERT OR IGNORE).
-func (s *StateDB) SaveWatcherEvent(watcherID, dedupKey, sender, subject, routedTo, sessionID string, maxEvents int) (bool, error) {
+func (s *StateDB) SaveWatcherEvent(watcherID, dedupKey, sender, subject, routedTo, sessionID, body string, maxEvents int) (bool, error) {
 	var result sql.Result
 	if err := withBusyRetry(func() error {
 		var err error
 		result, err = s.db.Exec(`
-			INSERT OR IGNORE INTO watcher_events (watcher_id, dedup_key, sender, subject, routed_to, session_id, created_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?)
-		`, watcherID, dedupKey, sender, subject, routedTo, sessionID, time.Now().Unix())
+			INSERT OR IGNORE INTO watcher_events (watcher_id, dedup_key, sender, subject, routed_to, session_id, body, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		`, watcherID, dedupKey, sender, subject, routedTo, sessionID, body, time.Now().Unix())
 		return err
 	}); err != nil {
 		return false, err
@@ -1418,7 +1690,7 @@ func (s *StateDB) LoadWatcherByName(name string) (*WatcherRow, error) {
 // LoadWatcherEvents returns up to limit events for the given watcher, ordered most recent first.
 func (s *StateDB) LoadWatcherEvents(watcherID string, limit int) ([]WatcherEventRow, error) {
 	rows, err := s.db.Query(`
-		SELECT id, watcher_id, dedup_key, sender, subject, routed_to, session_id, created_at
+		SELECT id, watcher_id, dedup_key, sender, subject, routed_to, session_id, body, created_at
 		FROM watcher_events WHERE watcher_id = ?
 		ORDER BY created_at DESC LIMIT ?
 	`, watcherID, limit)
@@ -1430,7 +1702,7 @@ func (s *StateDB) LoadWatcherEvents(watcherID string, limit int) ([]WatcherEvent
 	for rows.Next() {
 		var e WatcherEventRow
 		var createdAt int64
-		if err := rows.Scan(&e.ID, &e.WatcherID, &e.DedupKey, &e.Sender, &e.Subject, &e.RoutedTo, &e.SessionID, &createdAt); err != nil {
+		if err := rows.Scan(&e.ID, &e.WatcherID, &e.DedupKey, &e.Sender, &e.Subject, &e.RoutedTo, &e.SessionID, &e.Body, &createdAt); err != nil {
 			return nil, err
 		}
 		e.CreatedAt = time.Unix(createdAt, 0)

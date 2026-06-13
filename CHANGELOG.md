@@ -7,6 +7,243 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.9.58] - 2026-06-13
+
+### Added
+
+- **Session switcher: hop between sessions without detaching (`Ctrl+S`)** ([#1411](https://github.com/asheshgoplani/agent-deck/pull/1411)). Press `Ctrl+S` while attached to open an MRU-ordered picker pre-highlighted on the current session. `Ctrl+S`/`Ctrl+A` cycle forward/backward; arrow keys browse without auto-committing; `Enter` attaches immediately; after cycling, the switcher auto-attaches ~1s after the last keypress. `Esc` re-attaches to the originating session when opened while attached, or just closes from the overview. Configurable via `[hotkeys].switch_session`; detach key always wins on conflict. No storage paths touched.
+- **Cycle group view modes with `t`** ([#1417](https://github.com/asheshgoplani/agent-deck/pull/1417), closes [#1415](https://github.com/asheshgoplani/agent-deck/issues/1415)). Cycles the session list through Normal / Active-on-Top / Populated-on-Top. Active-on-top surfaces running/waiting sessions above a dim divider within each group; populated-on-top floats non-empty groups above empty ones. Pin positions (#1336) are respected across modes. Mode persists to UI state. Pure partition layer — sorting, collapse, and manual K/J order are unchanged within each section.
+- **Shell sessions show a running indicator when a non-interactive foreground process is active** ([#1308](https://github.com/asheshgoplani/agent-deck/pull/1308)). Opt-in via `[status] shell_running_indicator = true` (default false to preserve existing shell→idle default). When enabled, a shell session running `yarn dev` (→ `node`), `mvn spring-boot:run` (→ `java`), etc., shows the running indicator instead of idle; interactive programs (editors, pagers, `ssh`, multiplexers) stay idle. Uses the existing pane-info cache — no new tmux queries per tick. Staleness guards prevent a cache snapshot predating the session's last start from promoting a freshly started session.
+
+## [1.9.57] - 2026-06-12
+
+### Fixed
+
+- **Conductor bridge no longer reports a false "Failed to send" when an idle conductor's turn outruns the response timeout** ([#1404](https://github.com/asheshgoplani/agent-deck/pull/1404)). When the conductor is idle on arrival, the bridge delivers the message with a blocking `--wait`; a single turn longer than `RESPONSE_TIMEOUT` (300s) made the CLI exit non-zero and the user was told the send failed even though the conductor kept working. The bridge now classifies the "agent still running" timeout, tells the user "Still working — will reply here when done", and a reply-only watcher delivers the captured output asynchronously once the turn finishes — without re-sending the message (no double-processing). Applied to the Telegram, Slack, and Discord idle paths; complements the #452 busy-path queue.
+- **`remote update` can actually update a remote that advertises an available update** ([#1405](https://github.com/asheshgoplani/agent-deck/pull/1405)). `parseRemoteVersion` grabbed the LAST `v` in `agent-deck version` output, so a remote printing `Agent Deck v1.9.49 (update available: v1.9.55)` was mis-read as already being on `1.9.55)` and the update was skipped — a catch-22 where a remote could never be updated while it advertised one. The parser now anchors on the first semver token (the real current version).
+- **Forked sessions keep inherited `extra_args` across restarts and further forks** ([#1408](https://github.com/asheshgoplani/agent-deck/pull/1408), fixes [#1407](https://github.com/asheshgoplani/agent-deck/issues/1407)). A fork inherited the parent's extra claude CLI tokens only inside the baked one-shot fork command; the fork's record never persisted them, so the flags silently dropped on the fork's first restart and a fork-of-a-fork never got them at all. `CreateForkedInstanceWithOptions` now persists an independent copy of the parent's `ExtraArgs` onto the fork, matching how `ClaudeOptions` already survive.
+
+### Changed
+
+- **One canonical conductor bridge script, embedded via `go:embed`** ([#1406](https://github.com/asheshgoplani/agent-deck/pull/1406)). The repo carried two hand-maintained, silently drifted copies of `bridge.py` — the standalone `conductor/bridge.py` the tests ran against (had #452 queue/async, hooks, #971) and a ~2,100-line Go raw-string const that actually deployed (had #1386 secret resolution, Discord, #926 reply parsing). They are unified into a single canonical `internal/session/conductor_bridge.py` carrying the per-function union of both lineages (no fix dropped from either side), embedded directly into the binary; `conductor/tests/` and the python-compat CI gate now exercise the exact bytes that deploy. Drift between tested and shipped bridge code is structurally impossible again.
+- **Release gate excludes integration-heavy test packages from the blocking run** ([#1331](https://github.com/asheshgoplani/agent-deck/pull/1331)). `internal/tmux`, `internal/integration` and `internal/tuitest` no longer block the release tag (their tmux/systemd/socket dependencies caused recurring flaky release failures unrelated to the code being released); systemd/socket-dependent `mcppool` tests moved behind a `go:build integration` tag with their pure unit tests kept in the gate. A continue-on-error informational step still runs the full integration set on every release.
+
+## [1.9.56] - 2026-06-12
+
+### Added
+
+- **Pin sessions to a fixed top/bottom slot in their group** ([#1336](https://github.com/asheshgoplani/agent-deck/pull/1336), closes [#1335](https://github.com/asheshgoplani/agent-deck/issues/1335)). A new per-session `pin` field (`top` / `bottom` / unset, settable via `agent-deck session set <s> pin top` or the TUI edit dialog's "Pin position" pills) anchors a session outside the status/recency actionable sort — a pinned-bottom session in error no longer jumps to the top of its group, and pinned rows keep manual K/J ordering within their band. Pinned rows carry a 📌 marker and pin edits take effect live, without a restart. Additive schema v11 migration (`pin` column, default empty) — existing rows are untouched.
+- **Maestro is presented as the fleet supervisor in the TUI** ([#1401](https://github.com/asheshgoplani/agent-deck/pull/1401)). The `conductor-maestro` session renders with a gold ⬢ glyph, gold title (an explicit per-session color still wins, #391 semantics), and a `[SUPERVISOR]` badge; it surfaces first in its group regardless of status, and its group pins above everything — including the legacy `conductor` group pin.
+- **Capability verification checklist** ([#1395](https://github.com/asheshgoplani/agent-deck/pull/1395)). New `docs/verification/` with a user-level capability checklist (markdown + machine-readable JSON) and the results of the first full verification run — groundwork for gating releases on verified capabilities.
+- **Conductor setup pre-accepts Claude's workspace-trust dialog** ([#1393](https://github.com/asheshgoplani/agent-deck/pull/1393), closes [#1359](https://github.com/asheshgoplani/agent-deck/issues/1359)). `conductor setup` seeds `hasTrustDialogAccepted` for the just-created conductor directory in the root `~/.claude.json` (the same mechanism #1149 added for multi-repo worktree parents), so a freshly set-up conductor no longer stalls on "do you trust the files in this folder?" at first boot or heartbeat. Claude-only; a failure is logged and never breaks setup.
+
+### Fixed
+
+- **Quick-approve (`a`) targets the highlighted window, not the session's active window** ([#1403](https://github.com/asheshgoplani/agent-deck/pull/1403), fixes [#1369](https://github.com/asheshgoplani/agent-deck/issues/1369)). On a window sub-row, `1`+Enter is now delivered to that exact tmux window (`<session>:<index>`), gated on the window's *detected* tool rather than the session's stored tool — so a Claude permission prompt sitting in a non-active window of a shell-created session is finally approvable. Session rows keep the existing active-window behavior.
+- **Restart no longer requires a manual pkill after an unclean exit** ([#1394](https://github.com/asheshgoplani/agent-deck/pull/1394), closes [#1391](https://github.com/asheshgoplani/agent-deck/issues/1391)). `ElectPrimary` now verifies the recorded primary's PID is actually alive (kill -0) instead of trusting heartbeat freshness alone, so a primary killed by SIGKILL/OOM/terminal force-close is reclaimed immediately rather than blocking startup with "already running" until the heartbeat window expired.
+- **Default-group delete block shows in a modal instead of a clampable banner** ([#1402](https://github.com/asheshgoplani/agent-deck/pull/1402), follow-up to [#1334](https://github.com/asheshgoplani/agent-deck/pull/1334)). Pressing `d` on the protected "My Sessions" group now opens an acknowledge-only centered modal; the previous bottom-of-screen error banner could be sliced off by the viewport clamp when the panel filled the terminal, leaving the no-op silent in practice.
+- **Web profile selector is now static text** ([#1392](https://github.com/asheshgoplani/agent-deck/pull/1392), fixes [#1365](https://github.com/asheshgoplani/agent-deck/issues/1365)). The topbar profile `<select>` looked switchable, but the web server binds one profile at startup and has no switch endpoint — choosing another profile silently did nothing. It now renders as read-only text with an explanatory tooltip.
+- **Worktree include-walk no longer recurses into nested worktrees** ([#1398](https://github.com/asheshgoplani/agent-deck/pull/1398)). The `.worktreeinclude` candidate search now stops at any directory carrying its own `.git` entry (linked worktrees, submodules — the same boundaries git itself refuses to cross). Previously each new worktree copied a skeleton of every sibling worktree's gitignored files, growing a `.worktrees/A/.worktrees/B/…` forest one level deeper per spawn (multiple GB observed) and making every worktree creation progressively slower.
+
+## [1.9.55] - 2026-06-11
+
+> This release consolidates the previously unreleased (untagged) `1.9.55`/`1.9.56` changelog sections plus the v1.9.55 merge train — everything since v1.9.54.
+
+### Added
+
+- **Archive/unarchive sessions, with web and TUI parity** ([#1325](https://github.com/asheshgoplani/agent-deck/pull/1325)). Sessions can be archived (schema v10 `archived_at`, additive migration) to stop and hide them without deleting anything: a dedicated **Archived** tab in the web UI and a TUI filter, `A` to archive, `Shift+U` to unarchive, sidebar Archive action, search/filter over archived sessions, and restore without auto-starting tmux. Archiving only sets a flag — conversations, metadata, and rows are untouched.
+- **`session switch-account` — move a session to another Claude account, conversation included** ([#1377](https://github.com/asheshgoplani/agent-deck/pull/1377), #924 follow-up). New `agent-deck session switch-account <session> <account>` stops the session, migrates the Claude conversation file into the target account's config dir (copy-only, with destination backup + size verification), sets the account, and restarts with `--resume`. `session set <s> account <name>` now auto-migrates too. Also fixes two worker-scratch bugs that made account switches silently not apply (stale symlinks kept pointing at the old account's profile; `.claude.json` rename-on-write clobbered the mirror symlink).
+- **Re-run a worktree's setup script with the `b` hotkey** ([#1379](https://github.com/asheshgoplani/agent-deck/pull/1379)). Re-runs `.agent-deck/worktree-setup.sh` for the selected worktree session (after a rebase, dependency change, or transient failure) without destroying and recreating the session — and without losing the agent's conversation. Spinner + elapsed timer in the preview pane, completion/failure toast, re-entrancy guard, rebindable as `worktree_setup`.
+- **`n` on a remote group/session opens a full remote-aware new-session dialog** ([#1388](https://github.com/asheshgoplani/agent-deck/pull/1388), building on [#1364](https://github.com/asheshgoplani/agent-deck/pull/1364)). The dialog pre-fills remote path suggestions and the remote session's group, and the create routes to the remote over SSH with the chosen tool — sessions are never created on localhost (#743 invariant). Previously pressing `n` on a remote row quick-created a shell with no tool selection.
+- **PRs now run the full `go test -race` suite** ([#1389](https://github.com/asheshgoplani/agent-deck/pull/1389), closes [#1363](https://github.com/asheshgoplani/agent-deck/issues/1363)). A new `go-test.yml` PR gate mirrors the release gate (gotestsum with known-flaky retry), so stale tests surface at PR time instead of at the release tag.
+- **Complete web-UI test loop + weekly visual suite rebuild** ([#1385](https://github.com/asheshgoplani/agent-deck/pull/1385), closes [#1298](https://github.com/asheshgoplani/agent-deck/issues/1298)). Fills web coverage gaps and rebuilds the weekly visual-regression suite for the redesigned app shell. Visual baselines are now **CI-generated only** (`gh workflow run weekly-regression.yml -f update_baselines=true`, then commit the artifact); the stale Docker-generated baselines that failed 18/18 weekly are gone.
+- **Per-CLI capability map in the agent-deck skill** ([#1381](https://github.com/asheshgoplani/agent-deck/pull/1381)). Launched sessions now know what each tool can do: a claude/codex/gemini capability matrix (in-session fan-out, skills, MCPs, review, sandbox modes, resume/fork, …) plus a rule of thumb for choosing the `-c` tool for a child session.
+- **Session-create flow is now diagnosable from debug.log** ([#1378](https://github.com/asheshgoplani/agent-deck/pull/1378)). `setError` logs footer errors at ERROR level; `sessionCreatedMsg` and `createSessionInGroupWithWorktreeAndOptions` log INFO breadcrumbs that bracket the create flow, so silent session-creation failures leave a trace.
+
+### Changed
+
+- **⚠️ Enter now advances between fields in the new-session dialog by default** ([#1390](https://github.com/asheshgoplani/agent-deck/pull/1390)). On the free-text **Name** and **Branch** fields, Enter moves to the next field instead of submitting — typing a name and pressing Enter no longer silently creates a session with all defaults. **Ctrl+S** is the explicit "create now" shortcut from any field. Restore the old behavior with `[ui].new_session_enter_advances = false`. The same PR makes the dialog remember the last-used tool (persisted in the profile StateDB, never `config.toml`; explicit `[default_tool]` wins), reorders the hot path to **Name → Tool → Path**, and fixes `[claude].default_model` not being applied at spawn for sessions launched without per-session options.
+- **TUI lag at scale: cut tmux subprocess load** ([#1372](https://github.com/asheshgoplani/agent-deck/pull/1372), part of [#1366](https://github.com/asheshgoplani/agent-deck/issues/1366)). Navigation no longer fires `capture-pane` for a preview pane that isn't rendered (single-column layout), and the 2 s status sweep backs off adaptively (up to 10 s) when a sweep overruns, instead of piling up and pinning the tmux server.
+- **gofmt is enforced in CI** ([#1387](https://github.com/asheshgoplani/agent-deck/pull/1387)). golangci-lint now runs the gofmt linter; existing formatting drift fixed.
+
+### Fixed
+
+- **Nested-scratch credential chaining — 401s persisting across restarts** ([#1384](https://github.com/asheshgoplani/agent-deck/pull/1384)). Successor to #1222/#1224: when agent-deck runs inside a scratch-pinned worker that spawns children, the parent's worker-scratch `CLAUDE_CONFIG_DIR` leaked into config resolution, chaining the child's `.credentials.json` to another worker's (possibly forked) token copy — re-asserted on every restart. Two layers: a resolver guard ignores a `CLAUDE_CONFIG_DIR` that points inside the worker-scratch root, and the credential re-assert collapses nested-scratch chains to the true profile canonical (or refuses to link into the scratch tree at all).
+- **Conductor telegram channel self-heals when the persisted `Channels` field is lost** ([#1382](https://github.com/asheshgoplani/agent-deck/pull/1382)). Losing `Channels` (e.g. via an index wipe + manual record rebuild) silently disarmed every channel defense and left bots deaf while sessions kept running. Conductor config (`env_file` exporting `TELEGRAM_STATE_DIR`) is now the durable source of truth: the channel entry is restored at both spawn chokepoints, so `--channels` re-emits on every start/restart/resume. Explicit opt-out (`PluginChannelLinkDisabled`, or removing the env line) wins.
+- **bridge.py resolves XDG paths with legacy fallback** ([#1356](https://github.com/asheshgoplani/agent-deck/pull/1356), fixes [#1350](https://github.com/asheshgoplani/agent-deck/issues/1350)). The conductor bridge now resolves config/conductor paths under XDG base dirs with fallback to legacy `~/.agent-deck`, matching the Go side's path resolution.
+- **Conductor bridge restart no longer registers a duplicate phantom conductor instance** ([#1380](https://github.com/asheshgoplani/agent-deck/pull/1380), fixes [#1351](https://github.com/asheshgoplani/agent-deck/issues/1351)). The bridge reuses the existing conductor session record instead of adding a new one on every restart.
+- **`[conductor.telegram].user_id` (and discord) resolve `$VAR` env references like the bot token** ([#1386](https://github.com/asheshgoplani/agent-deck/pull/1386)). `user_id = "$TELEGRAM_USER_ID"` now resolves through the same path as the token; literal integers unchanged.
+- **Badge-update watcher no longer leaks a goroutine and fsnotify watcher on every attach** ([#1375](https://github.com/asheshgoplani/agent-deck/pull/1375)). `WatchBadgeUpdates` was launched before `context.WithCancel` in `Attach()`, so it captured `context.Background()` on the TUI path and was never stopped. After a day of deck hopping this accumulated ~400 leaked goroutines (250 ms poll tickers each) and hundreds of inotify file descriptors consuming ~70% of one CPU core. Fix: move the goroutine launch after the `WithCancel` call.
+- **Worktree creation no longer fails when `branch.<name>.remote` holds a fork URL** ([#1376](https://github.com/asheshgoplani/agent-deck/pull/1376)). `getDefaultRemote` now only accepts the `branch.<name>.remote` value when it matches a configured remote name; otherwise resolution falls through to the origin/single-remote logic. Fixes "fatal: invalid reference: git@github.com:/.git/main: exit status 128" when checking out PR branches from fork URLs.
+- **`agent-deck add -g work/bar` no longer creates a spurious flat `work-bar` group** ([#1367](https://github.com/asheshgoplani/agent-deck/pull/1367)). `CreateGroup`'s `sanitizeGroupName` replaced `/` with `-` before splitting on it, so a nested group path created the correct nested hierarchy AND a phantom flat group at the root. New `CreateGroupPath` helper splits on `/` and chains `CreateGroup`/`CreateSubgroup` for each level.
+- **Codex session detector no longer polls full history after a session ID is bound** ([#1324](https://github.com/asheshgoplani/agent-deck/pull/1324)). Once `CodexSessionID` is populated, `updateCodexSession` returns early instead of walking the entire `$CODEX_HOME/sessions` tree on every poll tick. The disk scan is preserved as a bootstrap fallback for sessions that have not yet acquired a binding. Fixes unnecessary CPU burn on large Codex session histories (reported in v1.9.47).
+
+## [1.9.54] - 2026-06-10
+
+### Added
+
+- **Configurable agent tool-visibility denylist** ([#1346](https://github.com/asheshgoplani/agent-deck/pull/1346)). A new `[ui].hidden_tools` config option lets you hide selected agent tools from the picker (TUI + web), with a picker UI for managing the list. The `shell` tool is always available regardless of the denylist.
+
+### Fixed
+
+- **Quick fork no longer hangs on heavy repos** ([#1354](https://github.com/asheshgoplani/agent-deck/pull/1354)). Copying gitignored files during a fork is now opt-in via `[fork].with_ignored` (default off), fixing quick-fork hanging indefinitely on repos with large gitignored trees (regression since v1.9.49, [#1299](https://github.com/asheshgoplani/agent-deck/pull/1299)).
+- **Claude name-sync no longer clobbers user renames or fork titles** ([#1355](https://github.com/asheshgoplani/agent-deck/pull/1355)). Syncing a session's name from Claude no longer overwrites a title the user set manually or a fork's title. Renames now set `TitleLocked` consistently across the TUI, web, and CLI.
+
+### Changed
+
+- **Hardened the cross-platform persistence-verification harness** ([#1309](https://github.com/asheshgoplani/agent-deck/pull/1309)). `verify-session-persistence.sh` now degrades truthfully on macOS/non-systemd hosts: scenarios 3/4 `[SKIP]` when claude argv is unobservable on non-stub hosts — but `[FAIL]` in stub mode (`AGENT_DECK_VERIFY_USE_STUB=1`, i.e. CI), where the stub must record args and a `[SKIP]` would be a false-green on the mandatory gate. Scenario 5 resolves its tmux name via `session show --json`, and a malformed-JSON payload from a successful `session show --json` is surfaced (loud error) rather than masked as an empty name; likewise any non-not-found error from `session show --json` (exit 1 = DB/load/permission) now surfaces instead of degrading to a false-green `[SKIP]` — including down the argv-capture path, where scenarios 3/4 now `[FAIL]` on a real resolver error regardless of stub mode (vs flattening it to empty→`[SKIP]`). Cleanup removes ONLY the exact session titles this invocation created (tracked as each is created) — never a `verify-persist-${PID}` prefix match on `agent-deck list` output, which collided with foreign runs and fired even on a failed preflight (data-loss risks). `RUN_ID` is now per-invocation unique (PID + epoch seconds + `${RANDOM}`) rather than a bare reusable PID, so two runs can never generate identical titles and cleanup can only match its own sessions even across a reused PID. The harness cleans up its own tempdir, requires `jq` explicitly, and the fake Claude stub no longer relies on GNU-only `sleep infinity`. Gated by new macOS + Linux unit tests.
+
+## [1.9.53] - 2026-06-09
+
+### Fixed
+
+- **Notify-daemon no longer rebinds stopped/removed sessions from a stale SessionEnd hook** ([#1352](https://github.com/asheshgoplani/agent-deck/pull/1352)). A late-arriving `SessionEnd` hook could re-bind a session that had already been stopped or removed, causing session-id collisions that led to `session output` reading the wrong pane, dropped child-completion notifications, and mis-delivered input. The daemon now ignores stale rebind requests for sessions that are no longer active. Closes [#1349](https://github.com/asheshgoplani/agent-deck/issues/1349).
+- **Create the notifier/bridge systemd log dir before start** ([#1347](https://github.com/asheshgoplani/agent-deck/pull/1347)). The conductor now creates the notifier/bridge log directory before launching the unit, avoiding a 209/STDOUT systemd crash-loop when the directory did not yet exist.
+- **Only inject `/opt/homebrew/bin` into generated systemd unit PATH on macOS** ([#1348](https://github.com/asheshgoplani/agent-deck/pull/1348)). The generated conductor systemd unit now adds `/opt/homebrew/bin` to `PATH` only on macOS, instead of unconditionally.
+
+## [1.9.52] - 2026-06-09
+
+### Fixed
+
+- **Shift+Enter and other modified keys work under the kitty keyboard protocol** ([#1333](https://github.com/asheshgoplani/agent-deck/pull/1333)). Modified keys are now delivered in CSI-u form so that Shift+Enter (and other modifier combinations) reach the underlying agent correctly in kitty.
+- **Deleting the default group reports an error instead of a silent no-op** ([#1334](https://github.com/asheshgoplani/agent-deck/pull/1334)). The TUI now surfaces an error when a user attempts to delete the default group, rather than silently doing nothing.
+
+### Changed
+
+- **Bump go-minor-patch dependency group** ([#1340](https://github.com/asheshgoplani/agent-deck/pull/1340)). Bumps `golang.org/x/sync` (0.20 → 0.21), `golang.org/x/sys` (0.45 → 0.46), `golang.org/x/term` (0.43 → 0.44), and `modernc.org/sqlite` (1.51 → 1.52).
+
+## [1.9.51] - 2026-06-09
+
+### Added
+
+- **Global `default_path` config key for `agent-deck add`** ([#1303](https://github.com/asheshgoplani/agent-deck/pull/1303)). A new top-level `default_path` key in `~/.config/agent-deck/config.toml` (or `~/.agent-deck/config.toml`) provides a persistent fallback directory for `agent-deck add` when no explicit path or group `default_path` is specified. Tilde, `$VAR`, and `${VAR}` expansion are applied; if the resolved path does not exist the tool falls through to `cwd`.
+- **`show_pane_titles` display toggle** ([#1343](https://github.com/asheshgoplani/agent-deck/pull/1343)). A new `[display] show_pane_titles = true` config key (and matching Settings panel toggle) shows the dim tmux pane-title (task description) suffix on every session row instead of only the selected one.
+- **Session ID in preview copy** ([#1339](https://github.com/asheshgoplani/agent-deck/pull/1339)). The `C` / `Shift+C` preview copy now includes a `Session: <id>` line matching the ID shown in the preview pane, so users can yank the session ID along with the other session info.
+- **Jujutsu quick-fork with-state materialization** ([#1311](https://github.com/asheshgoplani/agent-deck/pull/1311)). `f` (quick fork) and `Shift+F` on a jj repo now materialise the parent's uncommitted and gitignored working state into the new jj workspace — matching the existing git with-state path. Lifts the interim `gateForkStateForBackend` gate for jj; the ForkDialog no longer pre-checks with-state and fails on submit for jj repos.
+
+### Fixed
+
+- **OpenClaw bridge protocol version bump 3 → 4** ([#1342](https://github.com/asheshgoplani/agent-deck/pull/1342)). Aligns the client's `ProtocolVersion` constant with the gateway's current version 4.
+- **Serialize mcppool stdin writes to prevent JSON-RPC framing corruption** ([#1329](https://github.com/asheshgoplani/agent-deck/pull/1329)). Concurrent `handleClient` goroutines could interleave their writes to the MCP process stdin, corrupting JSON-RPC framing. A `stdinMu sync.Mutex` now serialises each complete `payload + newline` write atomically.
+- **Close tmux control pipes on signal exit to prevent orphaned clients** ([#1332](https://github.com/asheshgoplani/agent-deck/pull/1332)). `SIGHUP` (terminal window close) is now caught alongside `SIGINT`/`SIGTERM`, and `PipeManager.Close()` is called before the DB resignation so control-mode clients detach cleanly instead of reparenting and piling up against the tmux server.
+
+## [1.9.50] - 2026-06-08
+
+### Fixed
+
+- **Data-loss: preserve dotfiles-managed symlinks on config writes**. A new `internal/atomicfile` helper performs symlink-preserving atomic writes: when a config path is a symlink it resolves the real target and writes there (handling dangling chains and symlink loops), so a dotfiles-managed config file stays a symlink instead of being clobbered by a regular file. Applied to the Claude config files ([#1314](https://github.com/asheshgoplani/agent-deck/pull/1314)), Gemini config files ([#1316](https://github.com/asheshgoplani/agent-deck/pull/1316)), Hermes config file ([#1318](https://github.com/asheshgoplani/agent-deck/pull/1318)), Cursor `mcp.json` ([#1320](https://github.com/asheshgoplani/agent-deck/pull/1320)), and `config.toml` ([#1322](https://github.com/asheshgoplani/agent-deck/pull/1322)). Strengthened remove-hooks symlink regression assertion ([#1323](https://github.com/asheshgoplani/agent-deck/pull/1323)).
+- **tmux quick-switch now works on the XDG layout** ([#1328](https://github.com/asheshgoplani/agent-deck/pull/1328), [#1327](https://github.com/asheshgoplani/agent-deck/pull/1327)). The ack-signal directory is now created before use so `ctrl+b <n>` quick-switch works under the XDG path layout, and the bind script is shell-escaped to harden against injection.
+- **Quick-create shell sessions no longer send a literal "shell" command** ([#1307](https://github.com/asheshgoplani/agent-deck/pull/1307)). The TUI quick-create path stopped injecting the literal `shell` string into shell sessions.
+- **gg-detection timer reset when group dialog closes** ([#1312](https://github.com/asheshgoplani/agent-deck/pull/1312)).
+- **PTY exhaustion from test cleanup: TestMain defer leak plugged** ([#1310](https://github.com/asheshgoplani/agent-deck/pull/1310)). All 11 package `TestMain` functions that ended with `os.Exit(code)` while holding `defer cleanup()` registrations now route through a `runTestMain` helper so the defers actually run. This prevented tmux bootstrap servers and isolated TMUX_TMPDIR sockets from being killed on test binary exit, silently accumulating pty handles until the OS pty pool (`kern.tty.ptmx_max=511`) was exhausted. Adds an AST-level audit test and a behavioral sentinel test (drives the real `TestMain` exit path in a child process) to prevent regression.
+
+### Added
+
+- **Comprehensive quick fork + cross-tool fork parity (Claude / OpenCode / Pi / Codex / jj)** ([#1299](https://github.com/asheshgoplani/agent-deck/pull/1299)). The TUI quick fork (`f`) now creates a new git worktree + branch, carries the parent's uncommitted working-tree state (including gitignored files), matches the parent's Docker isolation, and inherits the parent's Claude launch options — instead of a conversation-only fork. A new `[fork]` config section (`worktree`, `with_state`, `with_ignored`, `docker = "auto"|"on"|"off"`, `branch_prefix`, `inherit_from_parent`) makes these defaults configurable; unset keys default to the comprehensive behavior. Forking now works consistently across Claude, OpenCode, Pi, and Codex (and Codex-compatible custom tools) from the TUI, CLI (`agent-deck session fork <id>`), and Web UI, routed through one shared tool-specific dispatcher; adds Codex session forking (`codex fork <session-id>`), OpenCode CLI fork + worktree support, and Web fork affordances driven by backend forkability. `Shift+F` honors `[fork].branch_prefix`; session-id mutators validate IDs and generated fork shell commands are shell-quoted; settings preserve `[fork]` on save. **Behavior change:** the `Shift+F` fork dialog now opens pre-seeded from `[fork]` defaults (comprehensive, "tweak down") rather than honoring `[worktree].default_enabled` / `[docker].default_enabled`.
+- **Reproducible Flox dev environment** ([#1302](https://github.com/asheshgoplani/agent-deck/pull/1302)). Adds `.flox/env/manifest.toml` and `manifest.lock` pinning the full dev/test toolchain (Go, golangci-lint, tmux, jq, gh, Node.js 20, goreleaser, and the three agent CLIs) across macOS and Linux on both arm64 and x86_64. Activate with `flox activate` in any checkout.
+
+### Changed
+
+- **Pin GitHub Actions to commit SHAs in the release workflow** ([#1326](https://github.com/asheshgoplani/agent-deck/pull/1326)). Supply-chain hardening: third-party actions in `release.yml` are pinned to immutable commit SHAs.
+- **Reconcile XDG test isolation after rebase** ([#1304](https://github.com/asheshgoplani/agent-deck/pull/1304)).
+
+## [1.9.49] - 2026-06-07
+
+### Added
+
+- **XDG base directory support, hardened** ([#1294](https://github.com/asheshgoplani/agent-deck/pull/1294), supersedes [#1281](https://github.com/asheshgoplani/agent-deck/pull/1281)). Agent Deck now honours the XDG base directory specification: configuration under `$XDG_CONFIG_HOME`, data under `$XDG_DATA_HOME`, and cache under `$XDG_CACHE_HOME`, with backward-compatible fallback to the legacy `~/.agent-deck` location. Includes a safe migration command, atomic copy, and uninstall backups.
+- **Smoother new-session keyboard navigation** ([#1295](https://github.com/asheshgoplani/agent-deck/pull/1295)). The new-session dialog gains smoother keyboard navigation, with an opt-in `[ui].new_session_enter_advances` config flag that lets Enter advance between fields.
+- **Lighter curated TUI footer** ([#1300](https://github.com/asheshgoplani/agent-deck/pull/1300), supersedes [#1289](https://github.com/asheshgoplani/agent-deck/pull/1289), credit [@JMBattista](https://github.com/JMBattista)). An opt-in `[ui] footer` setting renders a lighter, curated TUI footer.
+
+## [1.9.48] - 2026-06-07
+
+### Fixed
+
+- **Sessions disappearing from the TUI: `revive` is now concurrency-safe** ([#1296](https://github.com/asheshgoplani/agent-deck/pull/1296)). The session `revive` path could clobber sessions added concurrently; it now reconciles safely so concurrently-added sessions are preserved.
+- **Data-loss safeguards S1–S4**. Hardening the storage layer after the recurring "tests wiped the live profile" class of incidents:
+  - **S1 — refuse empty-payload `SaveInstances` sweep on a populated table** ([#1283](https://github.com/asheshgoplani/agent-deck/pull/1283)). `SaveInstances` no longer issues a destructive `DELETE FROM instances` when handed an empty slice against a populated table.
+  - **S2 + S3 — backup-before-destructive-write and refuse config section-drop** ([#1286](https://github.com/asheshgoplani/agent-deck/pull/1286)). State DB and `config.toml` are snapshotted before destructive rewrites, and `SaveUserConfig` refuses to silently drop whole top-level config sections.
+  - **S4 — warn/refuse on silent legacy `~/.agent-deck` fallback** ([#1285](https://github.com/asheshgoplani/agent-deck/pull/1285)). Path resolution no longer silently falls back to the real legacy `~/.agent-deck` location.
+- **Reconcile session title/badge on attach** ([#1282](https://github.com/asheshgoplani/agent-deck/pull/1282)). Session title and badge are reconciled when attaching.
+- **Bridge HTTP proxy support for Telegram** ([#1280](https://github.com/asheshgoplani/agent-deck/pull/1280)). The bridge supports an HTTP proxy for the Telegram bot via environment variables.
+- **Fork-state cleanup uses `RemoveWorktree`** ([#1279](https://github.com/asheshgoplani/agent-deck/pull/1279)). Fork-state cleanup now goes through `RemoveWorktree`.
+- **Materialize fork state from repo root** ([#1277](https://github.com/asheshgoplani/agent-deck/pull/1277)). Fork state is materialized relative to the repository root.
+
+### Added
+
+- **Pi session forking** ([#1287](https://github.com/asheshgoplani/agent-deck/pull/1287)). `agent-deck session fork` and the TUI `f`/`F` fork shortcuts now support built-in Pi sessions by launching `pi --fork <source-jsonl> --session-dir <child-dir>` from Agent Deck's per-instance Pi session directories.
+- **Fork-with-state controls in the ForkDialog** ([#1291](https://github.com/asheshgoplani/agent-deck/pull/1291), [#1292](https://github.com/asheshgoplani/agent-deck/pull/1292), [#1293](https://github.com/asheshgoplani/agent-deck/pull/1293)). The ForkDialog gains fork-with-state controls, with PR-review follow-ups and behavioral coverage for the fork rollback paths.
+- **Mandatory HOME+XDG test isolation + guard test (S5)** ([#1284](https://github.com/asheshgoplani/agent-deck/pull/1284)). All path-touching `TestMain` functions now sandbox HOME and all `XDG_*` vars, with a guard test that fails if any path resolves under the real home directory.
+- **`show_only_installed_tools` config flag** ([#1276](https://github.com/asheshgoplani/agent-deck/pull/1276)). New session config flag to show only installed tools.
+- **Optional last-update timestamp badge on session rows** ([#1273](https://github.com/asheshgoplani/agent-deck/pull/1273)). Session rows can optionally display a last-update timestamp badge.
+
+### Changed
+
+- New installs now use the XDG Base Directory layout: config under `$XDG_CONFIG_HOME/agent-deck` (default `~/.config/agent-deck`), durable state under `$XDG_DATA_HOME/agent-deck` (default `~/.local/share/agent-deck`), and cache/debug files under `$XDG_CACHE_HOME/agent-deck` (default `~/.cache/agent-deck`). Existing `~/.agent-deck` installs continue to work through category-specific legacy fallback.
+- Added `agent-deck migrate-paths [--dry-run] [--force]` to copy known legacy `~/.agent-deck` files into the split XDG layout without deleting or renaming the legacy directory.
+- Runtime and watcher durable state paths now use `$XDG_DATA_HOME/agent-deck` for new installs, with category-specific legacy fallback for existing `~/.agent-deck` state. Hooks, events, inboxes, runtime ledgers, logs, locks, conductor state, watcher state, triage output, and worker scratch no longer fall back to legacy just because an unrelated legacy marker exists.
+
+## [1.9.47] - 2026-06-03
+
+### Fixed
+
+- **The recurring "Please run /login" / 401 outage** ([#1266](https://github.com/asheshgoplani/agent-deck/pull/1266)). The keep-warm OAuth refresh daemon was sending its refresh request as `application/x-www-form-urlencoded`, which Anthropic rejects with a 400 — so the warm-keeping silently failed and tokens still expired. The refresh is now sent as a JSON body with a `client_id` fallback, plus a contract test to lock the request shape. Combined with the v1.9.46 clean-symlink reassert and keep-warm daemon, **one login per profile now persists** across multi-session use — no API key required.
+- **Skills-pane web regression: attached skills list never loaded on deep-link** ([#1270](https://github.com/asheshgoplani/agent-deck/pull/1270)). The web skills pane failed to render / lost row-click selection when opened directly; rendering and selection are restored.
+- **`session send` silently failing in Claude Code vim normal mode** ([#1264](https://github.com/asheshgoplani/agent-deck/issues/1264) / [#1271](https://github.com/asheshgoplani/agent-deck/pull/1271)). When Claude Code's prompt was in vim NORMAL mode (the default state after a turn finishes with `"editorMode": "vim"`), the trailing Enter was interpreted as a navigation keystroke instead of submit, so messages were typed but never sent — and the send-verify retry loop's bare Enter nudges all no-op'd for the same reason. A new opt-in `[claude].vim_mode` knob gates an Escape + `i` insert-mode guarantee at the keysender layer, so every `SendEnter` / `SendKeysAndEnter` against a vim-mode target submits reliably. Off by default; non-vim Claude sessions and other tools are unaffected.
+- **`fork --with-state` correctness on the vcs backend** ([#1029](https://github.com/asheshgoplani/agent-deck/issues/1029) / [#1051](https://github.com/asheshgoplani/agent-deck/issues/1051) / [#1263](https://github.com/asheshgoplani/agent-deck/pull/1263)). The #1029 fork-with-state correctness batch is reconciled onto the vcs backend abstraction so forking with state behaves correctly on the vcs backend.
+- **Remote deploy `ETXTBSY` on self-replacing binary** ([#1171](https://github.com/asheshgoplani/agent-deck/issues/1171) / [#1265](https://github.com/asheshgoplani/agent-deck/pull/1265)). Remote deploy now writes to a temp file and uses an atomic rename, avoiding the `ETXTBSY` error when replacing a running binary.
+- **Conductor stale `CLAUDE_SESSION_ID` recovery** ([#1237](https://github.com/asheshgoplani/agent-deck/pull/1237)). The conductor recovers from a stale `CLAUDE_SESSION_ID` via a disk scan, stopping raw JSON from leaking into chat.
+- **PEP 668 detection in Python dependency install** ([#1169](https://github.com/asheshgoplani/agent-deck/pull/1169)). `installPythonDeps` detects an externally-managed environment (PEP 668) and surfaces an actionable error instead of failing opaquely.
+- **SHA-256 verification on local self-update binary** ([#1219](https://github.com/asheshgoplani/agent-deck/pull/1219)). The self-update flow verifies the SHA-256 checksum of the downloaded binary before applying it.
+- **Full Slack message body delivered to conductor** ([#1223](https://github.com/asheshgoplani/agent-deck/pull/1223)). The watcher now delivers the full Slack message body to the conductor instead of a truncated subject.
+- **`launch-subagent` inherits parent session group** ([#1213](https://github.com/asheshgoplani/agent-deck/pull/1213)). Sub-agents launched via `launch-subagent` inherit the parent session's group by default.
+- **tmux transient-stall false-death** ([#1216](https://github.com/asheshgoplani/agent-deck/pull/1216)). Live sessions are no longer marked dead on transient tmux stalls.
+- **Dropdowns obscuring content in short terminals** ([#1244](https://github.com/asheshgoplani/agent-deck/pull/1244)). Dropdowns no longer overflow and obscure content in short terminal windows.
+- **Resume built-in Pi sessions** ([#1197](https://github.com/asheshgoplani/agent-deck/pull/1197)). Built-in Pi sessions resume correctly in Agent Deck.
+- **Hook-handler / test-isolation fixes** ([#1196](https://github.com/asheshgoplani/agent-deck/pull/1196) / [#1050](https://github.com/asheshgoplani/agent-deck/pull/1050) / [#1220](https://github.com/asheshgoplani/agent-deck/pull/1220)). User-config cache is cleared in plugin-catalog test helpers, isolated `TMUX_TMPDIR` uses a `/tmp` base on darwin, and skills e2e specs no longer fail on a collapsed sidebar in headless viewports.
+
+### Added
+
+- **First-class session support for Hermes Agent CLI** ([#1257](https://github.com/asheshgoplani/agent-deck/pull/1257)). Hermes Agent CLI is supported as a first-class session tool.
+- **Cursor Agent CLI MCP management** ([#1135](https://github.com/asheshgoplani/agent-deck/pull/1135)). Agent Deck can manage the Cursor Agent CLI `mcp.json` (both project and global scope).
+- **Web Edit session dialog** ([#1132](https://github.com/asheshgoplani/agent-deck/pull/1132)). The web UI gains `PATCH /sessions/{id}` and an Edit dialog, closing the "Edit session settings" gap in the parity matrix.
+- **Tool registry migration** ([#1258](https://github.com/asheshgoplani/agent-deck/issues/1258) / [#1261](https://github.com/asheshgoplani/agent-deck/pull/1261)). A tool registry migration prototype lays groundwork for unified tool definitions.
+- **Global `sync_title` toggle** ([#1255](https://github.com/asheshgoplani/agent-deck/pull/1255)). A global `sync_title` config disables session-name sync when not wanted.
+
+### Changed
+
+- **Bumped Go 1.25.10 → 1.25.11** ([#1262](https://github.com/asheshgoplani/agent-deck/issues/1262) / [#1267](https://github.com/asheshgoplani/agent-deck/pull/1267)). Go is bumped to 1.25.11 to clear reachable stdlib vulnerabilities GO-2026-5039 and GO-2026-5037. Also pulls in the go-minor-patch dependency group (3 updates) and bumps `actions/attest-build-provenance` from 2 to 4 ([#1268](https://github.com/asheshgoplani/agent-deck/pull/1268) / [#1269](https://github.com/asheshgoplani/agent-deck/pull/1269)).
+- **`launch_shell` env inheritance** ([#1218](https://github.com/asheshgoplani/agent-deck/issues/1218) / [#1231](https://github.com/asheshgoplani/agent-deck/pull/1231)). A new opt-in `[shell].launch_shell` option starts shell sessions through the user's login shell so they inherit the shell environment variables.
+- **Durable per-parent outbox-drain perf gate** ([#1235](https://github.com/asheshgoplani/agent-deck/pull/1235)). The durable per-parent outbox drain gains a performance gate (WARM walltime + Tier-2 fsync count) to guard against regression.
+
+## [1.9.46] - 2026-06-02
+
+### Added
+
+- **`include_cwd_prefix` display toggle** ([#1221](https://github.com/asheshgoplani/agent-deck/issues/1221) / [#1229](https://github.com/asheshgoplani/agent-deck/pull/1229)). A configurable toggle controls whether the working-directory prefix is shown in session display, letting users opt out of the cwd prefix where it adds noise.
+- **Claude Opus 4.8 in the model catalog** ([#1241](https://github.com/asheshgoplani/agent-deck/issues/1241) / [#1242](https://github.com/asheshgoplani/agent-deck/pull/1242)). `claude-opus-4-8` is added to `MODEL_ID_CATALOG` so the latest Opus model is selectable and resolves correctly throughout the UI.
+- **SLSA build-provenance attestation with fail-closed verification** ([#1159](https://github.com/asheshgoplani/agent-deck/issues/1159) / [#1250](https://github.com/asheshgoplani/agent-deck/pull/1250)). Release artifacts now carry SLSA build provenance, and artifact verification is fail-closed — an unattested or tampered artifact is rejected rather than silently accepted.
+- **Tier-1 WARM performance suite** ([#1234](https://github.com/asheshgoplani/agent-deck/issues/1234) / [#1251](https://github.com/asheshgoplani/agent-deck/pull/1251)). A warm-path performance test suite with corrected warm measurement, guarding the hot code paths against regression.
+
+### Changed
+
+- **Single-instance per profile is now the default** ([#1246](https://github.com/asheshgoplani/agent-deck/issues/1246) / [#1247](https://github.com/asheshgoplani/agent-deck/pull/1247)). `allow_multiple` now defaults to `false`, so a profile runs a single instance by default. This stops concurrent instances from tearing each other down.
+- **Bumped all deprecated GitHub Actions** ([#991](https://github.com/asheshgoplani/agent-deck/issues/991) / [#1249](https://github.com/asheshgoplani/agent-deck/pull/1249)). Every deprecated Action across the CI workflows (including perf-smoke and lighthouse-ci) is upgraded to a supported version, keeping the pipelines from breaking on runner deprecations.
+- **Stabilized the Playwright e2e suite** ([#1236](https://github.com/asheshgoplani/agent-deck/pull/1236) / [#1248](https://github.com/asheshgoplani/agent-deck/pull/1248)). Broken Playwright specs on main are repaired and desktop-coupled specs gain phone-viewport applicability guards, so the e2e suite runs green across viewports.
+
+### Fixed
+
+- **Durable, subscription-safe credentials (clean-symlink + keep-warm daemon)** ([#1222](https://github.com/asheshgoplani/agent-deck/issues/1222) / [#1253](https://github.com/asheshgoplani/agent-deck/pull/1253)). Credentials are managed via a clean symlink (dropping the fragile mtime-promote step) and a keep-warm refresh daemon, making multi-session use subscription-safe without an API key and eliminating the credential loss that drove the work-profile re-login loop.
+- **Tool-aware post-send verification** ([#1238](https://github.com/asheshgoplani/agent-deck/issues/1238) / [#1205](https://github.com/asheshgoplani/agent-deck/issues/1205) / [#876](https://github.com/asheshgoplani/agent-deck/issues/876) / [#1245](https://github.com/asheshgoplani/agent-deck/pull/1245)). Post-send verification is now tool-aware, so sends to non-Claude tools are no longer reported as false-negative drops.
+- **Hook-handler graceful degradation on missing `PROJECT_DIR`** ([#1233](https://github.com/asheshgoplani/agent-deck/issues/1233) / [#1243](https://github.com/asheshgoplani/agent-deck/pull/1243)). A missing `PROJECT_DIR` now degrades gracefully instead of emitting a FATAL on every call.
+- **iTerm2 ghost-lines** ([#1240](https://github.com/asheshgoplani/agent-deck/issues/1240) / [#1252](https://github.com/asheshgoplani/agent-deck/pull/1252)). Ghost-lines under iTerm2 are prevented without regressing panel width-measurement.
+
+## [1.9.45] - 2026-05-30
+
+### Added
+
+- **Near-instant idle-conductor completion delivery (wake-nudge wired)** ([#1225](https://github.com/asheshgoplani/agent-deck/issues/1225) / [#1226](https://github.com/asheshgoplani/agent-deck/pull/1226)). The durable outbox shipped in v1.9.44 is correct (no loss, exactly-once) but an **idle** conductor only drained on its next heartbeat — up to ~14 min of latency. The `WakeNudger` (built but previously unwired) is now triggered from the single producer commit chokepoint (`commitEventToInbox`), which both producers funnel through: the interactive `running→waiting` path and the one-shot `run-task` kernel-exit path. The moment a completion durably lands in a parent's inbox, an **idle** conductor is woken to drain it — collapsing the idle worst case from ~14 min to **sub-second**. The nudge is event-driven (fired on commit, not polled), conductor-scoped, idle-gated (never sends into a busy pane — a send-keys there only queues, the exact failure the pull model avoids), debounced per-parent (~500ms, coalesces a burst of simultaneous completions into one wake without delaying the first), and **best-effort/fire-and-forget**: a dropped or failed nudge is harmless because the same durable record is still drained on the parent's next Stop/heartbeat (wake ≠ deliver). A busy parent is intentionally left to drain at its next turn boundary — the physical floor for a busy Claude pane — so the nudge adds no noise there. Zero billed inference.
+
 ## [1.9.44] - 2026-05-29
 
 ### Added

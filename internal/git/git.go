@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -425,6 +426,46 @@ func CreateWorktree(repoDir, worktreePath, branchName string) error {
 	return nil
 }
 
+// HeadCommit returns the commit currently checked out at repoDir. Works for
+// normal repos, linked worktrees, and bare-repo project roots.
+func HeadCommit(repoDir string) (string, error) {
+	repoDir = resolveGitInvocationDir(repoDir)
+	cmd := exec.Command("git", "-C", repoDir, "rev-parse", "--verify", "HEAD^{commit}")
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	output, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve HEAD commit: %s: %w", strings.TrimSpace(stderr.String()), err)
+	}
+	return strings.TrimSpace(string(output)), nil
+}
+
+// CreateWorktreeAtStartPoint creates a new branch worktree from an explicit
+// start point. Returns createdBranch=true only after git successfully creates
+// the branch for this call. Used by fork-with-state to anchor the new worktree
+// at the parent session's HEAD instead of the invocation repo's HEAD.
+func CreateWorktreeAtStartPoint(repoDir, worktreePath, branchName, startPoint string) (createdBranch bool, err error) {
+	if err := ValidateBranchName(branchName); err != nil {
+		return false, fmt.Errorf("invalid branch name: %w", err)
+	}
+	if strings.TrimSpace(startPoint) == "" {
+		return false, errors.New("start point cannot be empty")
+	}
+	repoDir = resolveGitInvocationDir(repoDir)
+	if !IsGitRepo(repoDir) {
+		return false, errors.New("not a git repository")
+	}
+	if BranchExists(repoDir, branchName) {
+		return false, fmt.Errorf("branch %q already exists", branchName)
+	}
+	cmd := exec.Command("git", "-C", repoDir, "worktree", "add", "-b", branchName, worktreePath, startPoint)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return false, fmt.Errorf("failed to create worktree at start point: %s: %w", strings.TrimSpace(string(output)), err)
+	}
+	return true, nil
+}
+
 // ListWorktrees returns all worktrees for the repository at repoDir
 func ListWorktrees(repoDir string) ([]Worktree, error) {
 	repoDir = resolveGitInvocationDir(repoDir)
@@ -791,7 +832,11 @@ func getDefaultRemote(repoDir string) (string, error) {
 		output, err := cmd.Output()
 		if err == nil {
 			remote := strings.TrimSpace(string(output))
-			if remote != "" {
+			// branch.<name>.remote may hold a bare URL (e.g. after pulling a
+			// PR branch directly from a fork URL). A URL is fetchable but is
+			// not a remote-tracking ref prefix, so "<url>/main" later fails
+			// with "invalid reference" — only accept configured remote names.
+			if remote != "" && slices.Contains(remotes, remote) {
 				return remote, nil
 			}
 		}

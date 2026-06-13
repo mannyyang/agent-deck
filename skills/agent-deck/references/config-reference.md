@@ -14,9 +14,11 @@ All options for `~/.agent-deck/config.toml`.
 - [[hermes] Section](#hermes-section)
 - [[docker] Section](#docker-section)
 - [[worktree] Section](#worktree-section)
+- [[fork] Section](#fork-section)
 - [[logs] Section](#logs-section)
 - [[updates] Section](#updates-section)
 - [[display] Section](#display-section)
+- [[ui] Section](#ui-section)
 - [[global_search] Section](#global_search-section)
 - [Skills Registry (Outside config.toml)](#skills-registry-outside-configtoml)
 - [[mcp_pool] Section](#mcp_pool-section)
@@ -28,7 +30,13 @@ All options for `~/.agent-deck/config.toml`.
 
 ```toml
 default_tool = "claude"   # Pre-selected tool when creating sessions
+sync_title   = true       # Let agents rename sessions from their session-name
 ```
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `default_tool` | string | `"claude"` | Pre-selected tool when creating sessions. |
+| `sync_title` | bool | `true` | When `true`, agent-deck overwrites a session's title with the agent's own session-name (e.g. Claude's `--name` / `/rename`, issues #572/#697). Set `false` to keep the title you gave the session — globally, for every tool. The per-session title-lock (`agent-deck session set-title-lock <id> on`) remains as a finer-grained override. Also toggleable in the TUI Settings panel (`S`) under **SESSIONS**. |
 
 ## [shell] Section
 
@@ -40,6 +48,7 @@ env_files = ["~/.agent-deck.env", ".env"]   # .env files to source for ALL sessi
 init_script = "~/.agent-deck/init.sh"       # Script or command to run before each session
 ignore_missing_env_files = true             # Silently skip missing .env files (default: true)
 exit_to_shell = false                       # Drop to an interactive shell when an agent exits (default: false)
+launch_shell = false                        # Wrap commands with interactive shell startup to inherit env vars (default: false)
 ```
 
 | Key | Type | Default | Description |
@@ -48,6 +57,7 @@ exit_to_shell = false                       # Drop to an interactive shell when 
 | `init_script` | string | `""` | Shell script or inline command to run before each session. Useful for direnv, nvm, pyenv, etc. File paths (starting with `/`, `~/`, `./`, `../`) are sourced; anything else is treated as an inline command. |
 | `ignore_missing_env_files` | bool | `true` | When `true`, missing .env files are silently skipped using `[ -f file ] && source file`. When `false`, sessions will error if an env file doesn't exist. |
 | `exit_to_shell` | bool | `false` | When `true`, exiting a built-in agent (e.g. `/exit` from Claude Code) drops the pane back to an interactive shell at the same cwd instead of dying / auto-restarting. Lets you do shell-only work (`aws-vault exec`, `direnv`) then `claude --resume` the same session. Opt-in; the session id is preserved so resume targets the same conversation. Per-session override via the session record. Excludes sandboxed sessions. Issue #1161. |
+| `launch_shell` | bool | `false` | When `true`, wraps agent spawn commands with an interactive shell startup (`$SHELL -il -c '<command>'`; bash also sources `~/.bashrc`) so that environment variables from `~/.zshrc`, `~/.bashrc`, etc. are available to the agent process. This helps when agents launched from the TUI do not inherit the interactive shell's environment. For the most reliable cross-platform behavior, prefer putting shared variables in `~/.agent-deck.env` via `env_files`. Opt-in; the default OFF preserves direct spawn behavior. Per-session override via the session record. Excludes sandboxed and SSH sessions. Issue #1218. |
 
 ### Sourcing order
 
@@ -70,6 +80,7 @@ auto_mode = false                  # Enable --permission-mode auto (classifier-b
 allow_dangerous_mode = false       # Enable --allow-dangerously-skip-permissions
 use_chrome = false                 # Enable --chrome
 use_teammate_mode = false          # Enable --teammate-mode tmux
+vim_mode = false                   # Force insert mode before each send (Claude Code "editorMode": "vim")
 extra_args = ["--agent", "reviewer"] # Extra Claude CLI flags
 env_file = "~/.claude.env"         # .env file specific to Claude sessions
 
@@ -86,6 +97,7 @@ config_dir = "~/.claude-work"      # Optional override for profile "work"
 | `allow_dangerous_mode` | bool | `false` | Adds `--allow-dangerously-skip-permissions`. Unlocks bypass as an option without activating it. Ignored when `dangerous_mode` or `auto_mode` is true. |
 | `use_chrome` | bool | `false` | Adds `--chrome` to Claude sessions and is remembered from the New Session dialog. |
 | `use_teammate_mode` | bool | `false` | Adds `--teammate-mode tmux` to Claude sessions and is remembered from the New Session dialog. |
+| `vim_mode` | bool | `false` | Set when the inner Claude Code prompt uses vim keybindings (`"editorMode": "vim"`). Each `session send` then prepends an Escape + `i` insert-mode guarantee so a message sent while the prompt is in vim NORMAL mode actually submits instead of being typed-but-unsent (issue #1264). Only affects Claude-compatible tools. |
 | `extra_args` | array of strings | `[]` | Extra Claude CLI flags remembered from the New Session dialog and appended to new/restarted Claude sessions. Do not store secrets here. |
 | `env_file` | string | `""` | A .env file sourced for Claude sessions only. Sourced after global `[shell].env_files`. See [Path Resolution](#path-resolution). |
 | `command` | string | `"claude"` | Override the binary/invocation (e.g., `"cdw"` for a wrapper that sets `CLAUDE_CONFIG_DIR`). |
@@ -296,6 +308,31 @@ branch_prefix = "$USER/"          # "my-session" -> "dani/my-session"
 branch_prefix = ""                # "my-session" -> "my-session"
 ```
 
+## [fork] Section
+
+Defaults for forking a session — the TUI quick fork (`f`) and the `Shift+F` dialog. By default a fork creates a new git worktree + branch, carries the parent's uncommitted working-tree changes (staged, unstaged, and untracked files), matches Docker isolation, and inherits the Claude launch options. Copying **gitignored** files is **opt-in** (`with_ignored = false`): that tree is unbounded (data sets, virtual envs, `node_modules`) and can carry secrets, so it would otherwise block the fork silently. These settings are **independent** of `[worktree].default_enabled` / `[docker].default_enabled` (which govern non-fork session creation).
+
+```toml
+[fork]
+inherit_from_parent = false   # Mirror the parent and ignore the keys below
+worktree            = true    # Create a new worktree + branch for the fork
+with_state          = true    # Carry the parent's uncommitted changes into the fork
+with_ignored        = false   # Also copy gitignored files (implies with_state); opt-in
+docker              = "auto"  # "auto" (match parent) | "on" | "off"
+branch_prefix       = "fork/" # Auto branch name = <branch_prefix><sanitized-title>
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `inherit_from_parent` | bool | `false` | When `true`, the fork mirrors the parent (worktree + state + gitignored on, Docker matches parent) and the individual keys below are ignored. |
+| `worktree` | bool | `true` | Create a new git worktree + branch for the fork. |
+| `with_state` | bool | `true` | Carry the parent's uncommitted working-tree changes (staged, unstaged, and untracked files; gitignored excluded unless `with_ignored`) into the fork's worktree. |
+| `with_ignored` | bool | `false` | Also copy gitignored files (e.g. `.env`, `node_modules`) into the worktree. Implies `with_state`. **Opt-in:** the gitignored tree is unbounded and may contain secrets, and the copy is blocking with no size cap. Set `true` to include it, or use `inherit_from_parent` to mirror the parent wholesale. |
+| `docker` | string | `"auto"` | Docker isolation for the fork: `"auto"` matches the parent (sandboxed parent → a fresh container; otherwise none), `"on"` always sandboxes, `"off"` never. |
+| `branch_prefix` | string | `"fork/"` | Prefix for the auto-suggested fork branch name. Applies to both quick fork and the `Shift+F` dialog. |
+
+> **Note:** Forking is supported across Claude, OpenCode, Pi, and Codex (and Codex-compatible custom tools) via each tool's native fork, in the TUI, CLI (`agent-deck session fork <id>`), and Web UI. The Web/API endpoint (`POST /api/sessions/{id}/fork`) performs a plain tool-native fork and does **not** apply these `[fork]` worktree/state/Docker defaults — those are TUI quick-fork/dialog scope. Codex forking requires a codex CLI with `codex fork <session-id>` support.
+
 ## [logs] Section
 
 Session log file management.
@@ -344,6 +381,7 @@ full_repaint = false                              # Force full screen clear ever
 default_filter = "active"                         # Initial status filter: "", "active", "running", "waiting", "idle", "error"
 active_filter_label = "Open"                      # Label for the active filter pill (default: "Open")
 active_filter_excludes = ["error", "stopped"]     # Statuses the % "Open" filter hides (default: ["error", "stopped"])
+show_pane_titles = false                          # Show the pane title (task description) on every row, not just the selected one
 ```
 
 | Key | Type | Default | Description |
@@ -352,6 +390,26 @@ active_filter_excludes = ["error", "stopped"]     # Statuses the % "Open" filter
 | `default_filter` | string | `""` | Status filter applied on TUI startup. `"active"` engages the configurable Open filter. Auto-clears if no sessions match. |
 | `active_filter_label` | string | `"Open"` | Label shown on the filter pill when active filter is engaged (e.g., "Active", "Live", "Open"). |
 | `active_filter_excludes` | []string | `["error", "stopped"]` | Statuses hidden when the `%` "Open" filter is engaged. Default matches the original hardcoded behavior. Valid values: `running`, `waiting`, `idle`, `error`, `starting`, `stopped`. Unknown entries are dropped silently; if the resulting list is empty the default applies. **Set to `["error"]`** to keep stopped/closed sessions visible while still hiding errors — fixes the over-broad "Open" semantics where closed sessions disappeared from view. Extend with `idle` for an aggressive "show only running/waiting" definition of open. |
+| `show_pane_titles` | bool | `false` | Shows the dim tmux pane-title (task description) suffix on every session row instead of only the selected row. Also toggleable in the TUI Settings panel (`S`) under **DISPLAY**. |
+
+## [ui] Section
+
+New-session tool picker visibility (TUI + web). Display filters only — CLI launch and existing sessions are unaffected.
+
+```toml
+[ui]
+hidden_tools = ["gemini", "opencode", "pi"]   # Denylist: hide these from the picker
+show_only_installed_tools = true              # Also hide tools not found on PATH
+new_session_enter_advances = false            # Opt OUT: restore Enter-submits behavior
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `hidden_tools` | []string | `[]` | Tool names to hide from the new-session picker. `shell` is always shown and cannot be hidden. Unknown names log a warning and are ignored. Edit via TUI **Settings (`S`) → Visible tools…** or by hand in `config.toml`. |
+| `show_only_installed_tools` | bool | `false` | When `true`, hides built-in and custom tools whose command does not resolve on the host `PATH`. `shell` stays visible. If nothing else resolves, the picker falls back to showing all tools with a one-line hint. Toggle in TUI Settings under **TOOL PICKER**. |
+| `new_session_enter_advances` | bool | `true` | Controls what **Enter** does on the free-text **Name** / **Branch** fields of the new-session dialog. Default `true`: Enter **advances** to the next field, so typing a name and pressing Enter no longer silently creates a session with all defaults. **Ctrl+S** is the explicit "create now" shortcut and submits from any field in both modes. Set `false` to restore the legacy behavior where Enter on Name/Branch submits the form. |
+
+Filters compose: `hidden_tools` is applied first, then `show_only_installed_tools` (when enabled).
 
 ## [global_search] Section
 

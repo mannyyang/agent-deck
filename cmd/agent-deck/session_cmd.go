@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -12,8 +13,11 @@ import (
 	"strings"
 	"time"
 
+	"al.essio.dev/pkg/shellescape"
+
 	"github.com/asheshgoplani/agent-deck/internal/clipboard"
 	"github.com/asheshgoplani/agent-deck/internal/git"
+	"github.com/asheshgoplani/agent-deck/internal/jujutsu"
 	"github.com/asheshgoplani/agent-deck/internal/profile"
 	"github.com/asheshgoplani/agent-deck/internal/send"
 	"github.com/asheshgoplani/agent-deck/internal/session"
@@ -63,6 +67,8 @@ func handleSession(profile string, args []string) {
 		handleSessionSetTitleLock(profile, args[1:])
 	case "set":
 		handleSessionSet(profile, args[1:])
+	case "switch-account":
+		handleSessionSwitchAccount(profile, args[1:])
 	case "move", "mv":
 		handleSessionMove(profile, args[1:])
 	case "send":
@@ -94,11 +100,12 @@ func printSessionHelp() {
 	fmt.Println("  remove <id>             Remove session from registry (stopped/error only; --force to bypass)")
 	fmt.Println("  restart [id] [--all]    Restart session (Claude: reload MCPs)")
 	fmt.Println("  revive [--all|--name]   Rebuild dead control pipes for errored sessions")
-	fmt.Println("  fork <id>               Fork Claude session with context")
+	fmt.Println("  fork <id>               Fork Claude, OpenCode, Pi, or Codex session with context")
 	fmt.Println("  attach <id>             Attach to session interactively")
 	fmt.Println("  show [id]               Show session details (auto-detect current if no id)")
 	fmt.Println("  current                 Show current session and profile (auto-detect)")
 	fmt.Println("  set <id> <field> <value>  Update session property")
+	fmt.Println("  switch-account <id> <account>  Switch Claude account and migrate the conversation")
 	fmt.Println("  move <id> <path>        Move session to a new path (migrates Claude history)")
 	fmt.Println("  send <id> <message>     Send a message to a running session")
 	fmt.Println("  output <id>             Get the last response from a session")
@@ -594,7 +601,24 @@ func restartAllSessions(out *CLIOutput, storage *session.Storage, instances []*s
 	}
 }
 
-// handleSessionFork forks a Claude session
+// sessionForkBeforeStartHook is nil in production. Tests assign it to inspect
+// the fully-prepared fork before tmux Start() mutates the environment. When
+// the hook is set, handleSessionFork invokes it and returns immediately —
+// no tmux session, no persistence, no Start(). This lets contract tests
+// assert option propagation without spawning real sessions.
+var sessionForkBeforeStartHook func(parent *session.Instance, forked *session.Instance, state git.WorktreeStateOptions)
+
+// branchCleanupHint builds the trailing "&& git branch -D ..." fragment of
+// the manual-cleanup hint shown when fork-with-state cleanup partially fails.
+// Returns empty string when the branch wasn't created by this operation.
+func branchCleanupHint(createdBranch bool, repoRoot, branchName string) string {
+	if !createdBranch {
+		return ""
+	}
+	return fmt.Sprintf(" && git -C %s branch -D %s", shellescape.Quote(repoRoot), shellescape.Quote(branchName))
+}
+
+// handleSessionFork forks a supported tool session
 func handleSessionFork(profile string, args []string) {
 	fs := flag.NewFlagSet("session fork", flag.ExitOnError)
 	jsonOutput := fs.Bool("json", false, "Output as JSON")
@@ -604,11 +628,11 @@ func handleSessionFork(profile string, args []string) {
 	titleShort := fs.String("t", "", "Title for forked session (short)")
 	group := fs.String("group", "", "Group for forked session")
 	groupShort := fs.String("g", "", "Group for forked session (short)")
-	worktreeBranch := fs.String("w", "", "Create fork in git worktree for branch")
-	worktreeBranchLong := fs.String("worktree", "", "Create fork in git worktree for branch")
-	newBranch := fs.Bool("b", false, "Create new branch (use with --worktree)")
-	newBranchLong := fs.Bool("new-branch", false, "Create new branch")
-	withState := fs.Bool("with-state", false, "Copy parent's staged+unstaged+untracked files into the new worktree (#1029, requires -w)")
+	worktreeBranch := fs.String("w", "", "Create fork in a worktree/workspace for branch (git or jj)")
+	worktreeBranchLong := fs.String("worktree", "", "Create fork in a worktree/workspace for branch (git or jj)")
+	newBranch := fs.Bool("b", false, "Create new branch/bookmark (use with --worktree)")
+	newBranchLong := fs.Bool("new-branch", false, "Create new branch/bookmark")
+	withState := fs.Bool("with-state", false, "Carry parent's uncommitted working state into the new worktree/workspace (git or jj; #1029/#1305, requires -w)")
 	withStateGitignored := fs.Bool("with-state-and-gitignored", false, "Like --with-state, plus gitignored files (e.g. .env). Implies --with-state. Requires -w.")
 	sandbox := fs.Bool("sandbox", false, "Run forked session in Docker sandbox")
 	sandboxImage := fs.String("sandbox-image", "", "Docker image for sandbox (overrides config default)")
@@ -616,7 +640,7 @@ func handleSessionFork(profile string, args []string) {
 	fs.Usage = func() {
 		fmt.Println("Usage: agent-deck session fork <id|title> [options]")
 		fmt.Println()
-		fmt.Println("Fork a Claude session with conversation context.")
+		fmt.Println("Fork a Claude, OpenCode, Pi, or Codex session with conversation context.")
 		fmt.Println()
 		fmt.Println("Options:")
 		fs.PrintDefaults()
@@ -661,31 +685,39 @@ func handleSessionFork(profile string, args []string) {
 		return // unreachable, satisfies staticcheck SA5011
 	}
 
-	// Verify it's a Claude session
-	if !session.IsClaudeCompatible(inst.Tool) {
+	// Verify this tool has a session-fork implementation.
+	isClaudeFork := session.IsClaudeCompatible(inst.Tool)
+	isPiFork := inst.Tool == "pi"
+	isOpenCodeFork := inst.Tool == "opencode"
+	isCodexFork := session.IsCodexCompatible(inst.Tool)
+	if !isClaudeFork && !isPiFork && !isOpenCodeFork && !isCodexFork {
 		out.Error(
-			fmt.Sprintf("session '%s' is not a Claude session (tool: %s)", inst.Title, inst.Tool),
+			fmt.Sprintf("session '%s' is not a forkable session (tool: %s)", inst.Title, inst.Tool),
 			ErrCodeInvalidOperation,
 		)
 		os.Exit(1)
 	}
 
-	// Try to capture session ID from tmux if missing (handles pre-fix sessions)
-	if inst.ClaudeSessionID == "" && inst.Exists() {
+	// Try to capture Claude session ID from tmux if missing (handles pre-fix sessions).
+	if isClaudeFork && inst.ClaudeSessionID == "" && inst.Exists() {
 		inst.PostStartSync(2 * time.Second)
 	}
 
-	// Verify it can be forked
+	// Verify it can be forked.
 	if !inst.CanFork() {
 		out.Error(
-			fmt.Sprintf("session '%s' cannot be forked: no active Claude session ID", inst.Title),
+			fmt.Sprintf("session '%s' cannot be forked: no resumable session for tool %s", inst.Title, inst.Tool),
 			ErrCodeInvalidOperation,
 		)
 		os.Exit(1)
 	}
 
-	// Default title if not provided
-	if forkTitle == "" {
+	// Default title if not provided. An explicitly passed -t/--title is user
+	// intent and gets TitleLocked below (mirrors the TUI fork dialog); the
+	// auto-generated "<title>-fork" default keeps the #572 name sync enabled
+	// (mirrors quick fork).
+	explicitTitle := forkTitle != ""
+	if !explicitTitle {
 		forkTitle = inst.Title + "-fork"
 	}
 
@@ -720,11 +752,58 @@ func handleSessionFork(profile string, args []string) {
 		worktreeType = string(backend.Type())
 		repoRoot := backend.RepoDir()
 
+		// --with-state* anchors the new worktree/workspace at the parent's
+		// committed point and materializes the parent's working state. git and
+		// jujutsu both support it (jj since #1305); any other backend can't, so
+		// reject early. The git-direct collision gate and anchoring below are
+		// reached only on the git branch; jujutsu has its own branch.
+		if wantState && backend.Type() != vcs.TypeGit && backend.Type() != vcs.TypeJujutsu {
+			out.Error("--with-state is not supported for this repository's VCS backend", ErrCodeInvalidOperation)
+			os.Exit(1)
+		}
+
 		// Apply configured branch prefix before validation/existence checks
 		wtSettings := session.GetWorktreeSettings()
 		wtBranch = wtSettings.ApplyBranchPrefix(wtBranch)
 
-		if !createNewBranch && !backend.BranchExists(wtBranch) {
+		// Destination gate (BUG-01/08). With-state forks create a NEW branch
+		// anchored at the parent's HEAD, so they must refuse any pre-existing
+		// branch or worktree — one well-defined collision gate, evaluated before
+		// path computation and the legacy reuse check. Non-with-state forks keep
+		// upstream's "branch must already exist (use -b to create)" contract.
+		// These two are mutually exclusive: with-state requires the branch ABSENT,
+		// the else-branch requires it PRESENT — never flatten them.
+		if wantState && backend.Type() == vcs.TypeGit {
+			if err := git.ValidateForkWithStateDestination(repoRoot, wtBranch); err != nil {
+				var collErr *git.DestinationCollisionError
+				if errors.As(err, &collErr) {
+					switch collErr.Kind {
+					case git.CollisionWorktreeExists:
+						out.Error(fmt.Sprintf("branch '%s' already has a worktree at %s; choose a new destination branch for --with-state", collErr.Branch, collErr.Path), ErrCodeInvalidOperation)
+					case git.CollisionBranchExists:
+						out.Error(fmt.Sprintf("branch '%s' already exists; choose a new destination branch for --with-state", collErr.Branch), ErrCodeInvalidOperation)
+					default:
+						out.Error(collErr.Error(), ErrCodeInvalidOperation)
+					}
+					os.Exit(1)
+				}
+				out.Error(fmt.Sprintf("failed to validate destination: %v", err), ErrCodeInvalidOperation)
+				os.Exit(1)
+			}
+		} else if wantState {
+			// jujutsu with-state: a fresh destination bookmark is required, mirroring
+			// the git collision gate. (Workspace-path collision is caught by the
+			// os.Stat check below.)
+			exists, bmErr := jujutsu.BookmarkExists(repoRoot, wtBranch)
+			if bmErr != nil {
+				out.Error(fmt.Sprintf("failed to validate destination: %v", bmErr), ErrCodeInvalidOperation)
+				os.Exit(1)
+			}
+			if exists {
+				out.Error(fmt.Sprintf("bookmark '%s' already exists; choose a new destination branch for --with-state", wtBranch), ErrCodeInvalidOperation)
+				os.Exit(1)
+			}
+		} else if !createNewBranch && !backend.BranchExists(wtBranch) {
 			out.Error(fmt.Sprintf("branch '%s' does not exist (use -b to create)", wtBranch), ErrCodeInvalidOperation)
 			os.Exit(1)
 		}
@@ -736,11 +815,19 @@ func handleSessionFork(profile string, args []string) {
 			Template:  wtSettings.Template(),
 		})
 
-		// Check for an existing worktree for this branch before creating a new one
-		if existingPath, err := backend.GetWorktreeForBranch(wtBranch); err == nil && existingPath != "" {
-			fmt.Fprintf(os.Stderr, "Reusing existing worktree at %s for branch %s\n", existingPath, wtBranch)
-			worktreePath = existingPath
-		} else {
+		// Check for an existing worktree for this branch before creating a new
+		// one. Routed through the backend so jujutsu reuse keeps working. The
+		// with-state path is validated above and must NEVER reuse a worktree, so
+		// the reuse assignment is gated on !wantState (BUG-01/08).
+		reuseExistingWorktree := false
+		if !wantState {
+			if existingPath, err := backend.GetWorktreeForBranch(wtBranch); err == nil && existingPath != "" {
+				fmt.Fprintf(os.Stderr, "Reusing existing worktree at %s for branch %s\n", existingPath, wtBranch)
+				worktreePath = existingPath
+				reuseExistingWorktree = true
+			}
+		}
+		if !reuseExistingWorktree {
 			if _, statErr := os.Stat(worktreePath); statErr == nil {
 				out.Error(fmt.Sprintf("worktree path already exists: %s", worktreePath), ErrCodeInvalidOperation)
 				os.Exit(1)
@@ -751,28 +838,126 @@ func handleSessionFork(profile string, args []string) {
 				os.Exit(1)
 			}
 
-			// --with-state* is git-specific (uses index/stash). Reject for jujutsu.
-			if backend.Type() == vcs.TypeGit {
-				setupErr, err := git.CreateWorktreeWithStateAndSetup(
-					repoRoot, worktreePath, wtBranch,
-					git.WorktreeStateOptions{WithState: wantState, WithIgnored: *withStateGitignored},
-					os.Stdout, os.Stderr, session.GetWorktreeSettings().SetupTimeout())
-				if err != nil {
-					out.Error(fmt.Sprintf("worktree creation failed: %v", err), ErrCodeInvalidOperation)
+			var setupErr error
+			if wantState && backend.Type() == vcs.TypeGit {
+				//
+				// Mid-op refusal: surface an actionable error BEFORE creating the
+				// worktree, so the user sees the exact abort command for their
+				// parent instead of MaterializeWipFromParent's terse backstop
+				// wording (which fires AFTER worktree creation and triggers
+				// cleanup-on-error). The backstop in materialize_wip.go's
+				// refuseUnsafeParentState still covers detectErr != nil cases — we
+				// fall through silently there.
+				if kind, detectErr := git.DetectInProgressOperation(inst.ProjectPath); detectErr == nil && kind != "" {
+					abortCmd := map[string]string{
+						"rebase":      "git rebase --abort",
+						"merge":       "git merge --abort",
+						"cherry-pick": "git cherry-pick --abort",
+						"revert":      "git revert --abort",
+						"bisect":      "git bisect reset",
+					}[kind]
+					out.Error(fmt.Sprintf("parent session is mid-%s; finish or abort the %s before forking with state (cd %s && %s)",
+						kind, kind, inst.ProjectPath, abortCmd), ErrCodeInvalidOperation)
 					os.Exit(1)
 				}
-				if setupErr != nil {
-					fmt.Fprintf(os.Stderr, "Warning: worktree setup script failed: %v\n", setupErr)
+
+				if git.HasSubmodules(inst.ProjectPath) {
+					fmt.Fprintln(os.Stderr, "Warning: submodules detected — copied as files, not recursed (parent's submodule states preserved)")
+				}
+
+				// Capture parent's HEAD so linked-worktree parents anchor correctly.
+				parentHead, hcErr := git.HeadCommit(inst.ProjectPath)
+				if hcErr != nil {
+					out.Error(fmt.Sprintf("failed to resolve parent session HEAD: %v", hcErr), ErrCodeInvalidOperation)
+					os.Exit(1)
+				}
+
+				createdBranch, cwErr := git.CreateWorktreeAtStartPoint(repoRoot, worktreePath, wtBranch, parentHead)
+				if cwErr != nil {
+					out.Error(fmt.Sprintf("worktree creation failed: %v", cwErr), ErrCodeInvalidOperation)
+					os.Exit(1)
+				}
+
+				// Materialize parent state, with cleanup-on-error.
+				if matErr := git.MaterializeWipFromParent(inst.ProjectPath, worktreePath, *withStateGitignored); matErr != nil {
+					var cleanupErrs []string
+					if rmErr := git.RemoveWorktree(repoRoot, worktreePath, true); rmErr != nil {
+						cleanupErrs = append(cleanupErrs, fmt.Sprintf("worktree remove failed: %v", rmErr))
+					}
+					if createdBranch {
+						if brErr := exec.Command("git", "-C", repoRoot, "branch", "-D", wtBranch).Run(); brErr != nil {
+							cleanupErrs = append(cleanupErrs, fmt.Sprintf("branch delete failed: %v", brErr))
+						}
+					}
+					if len(cleanupErrs) == 0 {
+						out.Error(fmt.Sprintf("failed to materialize parent state: %v; new worktree cleaned up", matErr), ErrCodeInvalidOperation)
+					} else {
+						out.Error(fmt.Sprintf("failed to materialize parent state: %v; cleanup also failed (%s); manual cleanup required: rm -rf %s%s",
+							matErr,
+							strings.Join(cleanupErrs, "; "),
+							shellescape.Quote(worktreePath),
+							branchCleanupHint(createdBranch, repoRoot, wtBranch),
+						), ErrCodeInvalidOperation)
+					}
+					os.Exit(1)
+				}
+
+				// Continue upstream's wrapper tail: worktreeinclude + setup hook.
+				if inclErr := git.ProcessWorktreeInclude(repoRoot, worktreePath, os.Stderr); inclErr != nil {
+					fmt.Fprintf(os.Stderr, "worktreeinclude: %v\n", inclErr)
+				}
+				setupErr = git.RunWorktreeSetupAfterCreate(repoRoot, worktreePath, os.Stdout, os.Stderr, session.GetWorktreeSettings().SetupTimeout())
+			} else if wantState {
+				// jujutsu with-state (#1305): anchor the new workspace at the
+				// parent's committed point (@-) and materialize its working copy.
+				parentBase, pbErr := jujutsu.WorkingCopyParentRevision(inst.ProjectPath)
+				if pbErr != nil {
+					out.Error(fmt.Sprintf("failed to resolve parent session committed anchor: %v", pbErr), ErrCodeInvalidOperation)
+					os.Exit(1)
+				}
+				if cwErr := jujutsu.CreateWorkspaceAtRevision(repoRoot, worktreePath, wtBranch, parentBase); cwErr != nil {
+					out.Error(fmt.Sprintf("workspace creation failed: %v", cwErr), ErrCodeInvalidOperation)
+					os.Exit(1)
+				}
+				if matErr := jujutsu.MaterializeWipFromParent(inst.ProjectPath, worktreePath, *withStateGitignored); matErr != nil {
+					var cleanupErrs []string
+					if rmErr := backend.RemoveWorktree(worktreePath, true); rmErr != nil {
+						cleanupErrs = append(cleanupErrs, fmt.Sprintf("workspace forget failed: %v", rmErr))
+					}
+					if brErr := backend.DeleteBranch(wtBranch, true); brErr != nil {
+						cleanupErrs = append(cleanupErrs, fmt.Sprintf("bookmark delete failed: %v", brErr))
+					}
+					if len(cleanupErrs) == 0 {
+						out.Error(fmt.Sprintf("failed to materialize parent state: %v; new workspace cleaned up", matErr), ErrCodeInvalidOperation)
+					} else {
+						out.Error(fmt.Sprintf("failed to materialize parent state: %v; cleanup also failed (%s); manual cleanup required: rm -rf %s",
+							matErr, strings.Join(cleanupErrs, "; "), shellescape.Quote(worktreePath)), ErrCodeInvalidOperation)
+					}
+					os.Exit(1)
+				}
+				if *withStateGitignored && !jujutsu.SupportsGitignoredCopy(inst.ProjectPath) {
+					fmt.Fprintln(os.Stderr, "Warning: forked without gitignored files: this jj repo has no git metadata to copy them")
+				}
+			} else if backend.Type() == vcs.TypeGit {
+				// Non-with-state git path: upstream's combined wrapper unchanged.
+				var cwErr error
+				setupErr, cwErr = git.CreateWorktreeWithStateAndSetup(
+					repoRoot, worktreePath, wtBranch,
+					git.WorktreeStateOptions{},
+					os.Stdout, os.Stderr, session.GetWorktreeSettings().SetupTimeout())
+				if cwErr != nil {
+					out.Error(fmt.Sprintf("worktree creation failed: %v", cwErr), ErrCodeInvalidOperation)
+					os.Exit(1)
 				}
 			} else {
-				if wantState {
-					out.Error("--with-state is only supported for git repositories", ErrCodeInvalidOperation)
-					os.Exit(1)
-				}
+				// Non-git backend (jujutsu): with-state already rejected above.
 				if err := backend.CreateWorktree(worktreePath, wtBranch); err != nil {
 					out.Error(fmt.Sprintf("worktree creation failed: %v", err), ErrCodeInvalidOperation)
 					os.Exit(1)
 				}
+			}
+			if setupErr != nil {
+				fmt.Fprintf(os.Stderr, "Warning: worktree setup script failed: %v\n", setupErr)
 			}
 		}
 
@@ -785,10 +970,14 @@ func handleSessionFork(profile string, args []string) {
 	}
 
 	// Create the forked instance
-	forkedInst, _, err := inst.CreateForkedInstanceWithOptions(forkTitle, forkGroup, opts)
+	var forkedInst *session.Instance
+	forkedInst, _, err = inst.CreateForkedInstanceForTool(forkTitle, forkGroup, opts)
 	if err != nil {
 		out.Error(fmt.Sprintf("failed to create fork: %v", err), ErrCodeInvalidOperation)
 		os.Exit(1)
+	}
+	if explicitTitle {
+		forkedInst.TitleLocked = true
 	}
 
 	if worktreeType != "" {
@@ -798,6 +987,14 @@ func handleSessionFork(profile string, args []string) {
 	// Apply sandbox config if requested.
 	if *sandbox {
 		forkedInst.Sandbox = session.NewSandboxConfig(*sandboxImage)
+	}
+
+	// Test seam: when set, capture the fully-prepared fork before tmux Start()
+	// mutates the environment and return early. Production runs leave the hook
+	// nil, so this is a no-op outside of tests.
+	if sessionForkBeforeStartHook != nil {
+		sessionForkBeforeStartHook(inst, forkedInst, git.WorktreeStateOptions{WithState: wantState, WithIgnored: *withStateGitignored})
+		return
 	}
 
 	// Start the forked session
@@ -815,7 +1012,7 @@ func handleSessionFork(profile string, args []string) {
 	// Rebuild group tree and ensure group exists
 	groupTree := session.NewGroupTreeWithGroups(instances, groupsData)
 	if forkedInst.GroupPath != "" {
-		groupTree.CreateGroup(forkedInst.GroupPath)
+		groupTree.CreateGroupPath(forkedInst.GroupPath)
 	}
 
 	// Save
@@ -1153,7 +1350,7 @@ func handleSessionSet(profile string, args []string) {
 		fmt.Println("  tool               Tool type (claude, gemini, shell, etc.)")
 		fmt.Println("  wrapper            Wrapper command (use {command} to include tool command)")
 		fmt.Println("  channels           Comma-separated plugin channel ids (claude only)")
-		fmt.Println("  plugins            Comma-separated plugin catalog names (claude only) — see [plugins.<name>] in ~/.agent-deck/config.toml")
+		fmt.Printf("  plugins            Comma-separated plugin catalog names (claude only) — see [plugins.<name>] in %s\n", effectiveUserConfigPathForHelp())
 		fmt.Println("  extra-args         Extra claude CLI tokens (claude only; use `-- --flag value` for tokens starting with -; persisted plaintext — no secrets)")
 		fmt.Println("  color              Optional TUI row tint: '#RRGGBB' or ANSI '0'..'255' or '' (issue #391)")
 		fmt.Println("  claude-session-id  Claude conversation ID")
@@ -1212,6 +1409,13 @@ func handleSessionSet(profile string, args []string) {
 		return // unreachable, satisfies staticcheck SA5011
 	}
 
+	// #924 follow-up: the conversation follows the account. Capture the old
+	// account's config dir before SetField mutates resolution.
+	var preAccountConfigDir string
+	if field == session.FieldAccount && inst.Tool == "claude" {
+		preAccountConfigDir = session.GetClaudeConfigDirForInstance(inst)
+	}
+
 	// Delegate to session.SetField so CLI and TUI share validation. The
 	// extraArgTokens slice carries pre-tokenized argv for extra-args (CLI
 	// preserves values with spaces); SetField ignores it for other fields.
@@ -1225,6 +1429,20 @@ func handleSessionSet(profile string, args []string) {
 	// until after instancesMu.Unlock.
 	if postCommit != nil {
 		postCommit()
+	}
+
+	// Copy the conversation into the new account's config dir so the
+	// restart-required switch resumes with full context. Copy-only; a fresh
+	// session (no conversation yet) is not an error.
+	if preAccountConfigDir != "" {
+		targetDir := session.GetClaudeConfigDirForInstance(inst)
+		if migrated, merr := session.MigrateConversationFrom(inst, preAccountConfigDir, targetDir); merr != nil {
+			if !errors.Is(merr, session.ErrNoConversation) {
+				fmt.Fprintf(os.Stderr, "Warning: account set, but conversation not migrated: %v\n", merr)
+			}
+		} else if migrated != "" && !quietMode && !*jsonOutput {
+			fmt.Printf("Conversation migrated to %s\n", migrated)
+		}
 	}
 
 	// Save
@@ -2016,7 +2234,7 @@ func handleSessionSend(profile string, args []string) {
 			os.Exit(1)
 		}
 	} else {
-		if err := sendWithRetry(tmuxSess, message, false); err != nil {
+		if err := sendWithRetry(tmuxSess, message, skipClaudeDeliveryVerify(inst.Tool)); err != nil {
 			out.Error(fmt.Sprintf("failed to send message: %v", err), ErrCodeInvalidOperation)
 			os.Exit(1)
 		}
@@ -2135,6 +2353,17 @@ func sendWithRetry(tmuxSess *tmux.Session, message string, skipVerify bool) erro
 	return sendWithRetryTarget(tmuxSess, message, skipVerify, defaultSendOptions())
 }
 
+// skipClaudeDeliveryVerify reports whether the Claude-tuned post-send delivery
+// verification (issue #876) should be skipped for tool. The verify keys off
+// Claude-specific TUI signals (an "active" transition, the composer glyph,
+// unsent-paste markers); non-Claude tools never surface those, so running it
+// false-negatives a delivered message as "dropped silently" (#1238, #1205,
+// #876). Claude tools keep the verify; every non-Claude tool skips it — the
+// general superset of #1228's codex-only skip.
+func skipClaudeDeliveryVerify(tool string) bool {
+	return !session.UsesClaudeDeliveryVerify(tool)
+}
+
 // draftSender is implemented by *tmux.Session for the --draft path.
 type draftSender interface {
 	SendKeysChunked(string) error
@@ -2232,7 +2461,7 @@ func sendNoWait(target sendRetryTarget, tool, message string) error {
 			time.Sleep(500 * time.Millisecond)
 		}
 	}
-	return sendWithRetryTarget(target, message, false, noWaitSendOptions())
+	return sendWithRetryTarget(target, message, skipClaudeDeliveryVerify(tool), noWaitSendOptions())
 }
 
 type sendRetryTarget interface {
@@ -2740,14 +2969,27 @@ func streamSessionSend(inst *session.Instance, sessionRef, profile string, sentA
 	}
 
 	var jsonlPath string
+	// peers carries the latest profile snapshot so the resolve can refuse a
+	// transcript path that collides with another live instance's session id
+	// (issue #1349 defense-in-depth #2): streaming the wrong transcript is one
+	// of the corruption symptoms the rebind bug caused.
+	var peers []*session.Instance
+	if _, initial, _, loadErr := loadSessionData(profile); loadErr == nil {
+		peers = initial
+	}
 	deadline := time.Now().Add(opts.timeout)
 	for time.Now().Before(deadline) {
-		jsonlPath = resolvedInst.GetJSONLPath()
+		p, resolveErr := resolvedInst.GetJSONLPathChecked(peers)
+		if resolveErr != nil {
+			return fmt.Errorf("refusing to stream a colliding transcript: %w", resolveErr)
+		}
+		jsonlPath = p
 		if jsonlPath != "" {
 			break
 		}
 		// Refresh from DB in case the session was just created.
 		if _, freshInstances, _, loadErr := loadSessionData(profile); loadErr == nil {
+			peers = freshInstances
 			if fi, _, _ := ResolveSession(sessionRef, freshInstances); fi != nil {
 				resolvedInst = fi
 			}

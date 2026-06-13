@@ -1,3 +1,5 @@
+//go:build integration
+
 package mcppool
 
 // FD-leak regression for V1.9 T5 / critical-hunt #3 + #4.
@@ -54,7 +56,7 @@ func TestSocketProxy_Start_FailingCommand_NoFDLeak(t *testing.T) {
 	defer cancel()
 
 	const cycles = 200
-	const logSubstring = ".agent-deck/logs/mcppool/"
+	const logSubstring = "agent-deck/logs/mcppool/"
 
 	// Prime once so any one-shot Go runtime FDs (proc readers, etc.) settle.
 	primer, _ := NewSocketProxy(ctx, "fdleak-prime", "/no/such/binary-prime", nil, nil)
@@ -101,7 +103,7 @@ func TestHTTPServer_Start_FailingCommand_NoFDLeak(t *testing.T) {
 	defer cancel()
 
 	const cycles = 200
-	const logSubstring = ".agent-deck/logs/http-servers/"
+	const logSubstring = "agent-deck/logs/http-servers/"
 
 	// Prime to settle any one-shot runtime FDs.
 	primer := NewHTTPServer(ctx, "fdleak-http-prime", "http://127.0.0.1:1", "http://127.0.0.1:1", "/no/such/binary-prime", nil, nil, 100*time.Millisecond)

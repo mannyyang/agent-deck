@@ -4,8 +4,6 @@
 package ui
 
 import (
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 
@@ -13,21 +11,14 @@ import (
 )
 
 // withPluginCatalog redirects HOME and writes a config.toml so
-// session.GetAvailablePluginNames returns predictable values.
+// session.GetAvailablePluginNames returns predictable values. Clears the
+// user-config cache because the tempdir's config.toml may share an mtime
+// with the previous test's, causing the cache to return stale plugin
+// definitions.
 func withPluginCatalog(t *testing.T, content string) {
 	t.Helper()
-	temp := t.TempDir()
-	originalHome := os.Getenv("HOME")
-	os.Setenv("HOME", temp)
-	t.Cleanup(func() { os.Setenv("HOME", originalHome) })
-
-	dir := filepath.Join(temp, ".agent-deck")
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		t.Fatalf("mkdir: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "config.toml"), []byte(content), 0o600); err != nil {
-		t.Fatalf("write config: %v", err)
-	}
+	home := setXDGTestHome(t)
+	writeXDGTestConfig(t, home, content)
 }
 
 // TestEditSessionDialog_PluginsFieldShownForClaudeWithCatalog asserts the

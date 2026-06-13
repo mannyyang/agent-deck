@@ -167,6 +167,60 @@ func (m *WebMutator) CloseSession(id string) error {
 	return inst.Kill()
 }
 
+// ArchiveSession stops the session process and marks it archived so it
+// is hidden from active lists but retained in storage.
+func (m *WebMutator) ArchiveSession(id string) error {
+	m.h.instancesMu.RLock()
+	inst := m.h.instanceByID[id]
+	m.h.instancesMu.RUnlock()
+	if inst == nil {
+		return fmt.Errorf("session not found: %s", id)
+	}
+	if err := inst.Kill(); err != nil {
+		return fmt.Errorf("failed to stop session: %w", err)
+	}
+	m.h.instancesMu.Lock()
+	inst.ArchivedAt = time.Now().UTC()
+	m.h.instancesMu.Unlock()
+	return m.persistAllInstances()
+}
+
+// UnarchiveSession clears the archive flag without starting tmux.
+func (m *WebMutator) UnarchiveSession(id string) error {
+	m.h.instancesMu.RLock()
+	inst := m.h.instanceByID[id]
+	m.h.instancesMu.RUnlock()
+	if inst == nil {
+		return fmt.Errorf("session not found: %s", id)
+	}
+	m.h.instancesMu.Lock()
+	if !inst.IsArchived() {
+		m.h.instancesMu.Unlock()
+		return fmt.Errorf("session is not archived: %s", id)
+	}
+	inst.ArchivedAt = time.Time{}
+	m.h.instancesMu.Unlock()
+	return m.persistAllInstances()
+}
+
+func (m *WebMutator) persistAllInstances() error {
+	storage, err := session.NewStorageWithProfile(m.h.profile)
+	if err != nil {
+		return fmt.Errorf("open storage: %w", err)
+	}
+	defer storage.Close()
+
+	m.h.instancesMu.RLock()
+	instances := make([]*session.Instance, len(m.h.instances))
+	copy(instances, m.h.instances)
+	m.h.instancesMu.RUnlock()
+
+	if err := storage.SaveWithGroups(instances, m.h.groupTree); err != nil {
+		return fmt.Errorf("save sessions: %w", err)
+	}
+	return nil
+}
+
 // UndoDelete restores the most-recently deleted session if its delete
 // timestamp is within the configured undo window. Returns the restored
 // session id. Returns web.ErrUndoNothing if the stack is empty, or
@@ -229,9 +283,7 @@ func (m *WebMutator) pushUndo(inst *session.Instance) {
 	}
 }
 
-// ForkSession forks an existing session using the proper Claude resume command.
-// It uses CreateForkedInstanceWithOptions which builds "claude --resume <session-id>"
-// via buildClaudeForkCommandForTarget, ensuring the fork resumes the parent conversation.
+// ForkSession forks an existing session using the proper tool-specific fork command.
 func (m *WebMutator) ForkSession(id string) (string, error) {
 	m.h.instancesMu.RLock()
 	parent := m.h.instanceByID[id]
@@ -240,9 +292,7 @@ func (m *WebMutator) ForkSession(id string) (string, error) {
 		return "", fmt.Errorf("session not found: %s", id)
 	}
 
-	forked, _, err := parent.CreateForkedInstanceWithOptions(
-		parent.Title+" (fork)", parent.GroupPath, nil,
-	)
+	forked, _, err := parent.CreateForkedInstanceForTool(parent.Title+" (fork)", parent.GroupPath, nil)
 	if err != nil {
 		return "", fmt.Errorf("fork session: %w", err)
 	}
@@ -267,6 +317,73 @@ func (m *WebMutator) ForkSession(id string) (string, error) {
 		return "", fmt.Errorf("save forked session: %w", err)
 	}
 	return forked.ID, nil
+}
+
+// UpdateSession applies one or more field edits via session.SetField (the
+// same path the TUI EditSessionDialog uses) and persists. Returns the list
+// of fields that actually changed and whether any change requires a restart.
+//
+// instancesMu is held only across the SetField loop — postCommits and the
+// storage flush run after unlock, mirroring the TUI's home.go edit handler
+// so slow tmux subprocesses don't stall the status worker.
+func (m *WebMutator) UpdateSession(id string, updates map[string]string) ([]string, bool, error) {
+	if len(updates) == 0 {
+		return nil, false, nil
+	}
+	m.h.instancesMu.RLock()
+	inst := m.h.instanceByID[id]
+	m.h.instancesMu.RUnlock()
+	if inst == nil {
+		return nil, false, fmt.Errorf("session not found: %s", id)
+	}
+
+	changed := make([]string, 0, len(updates))
+	restartRequired := false
+	var postCommits []func()
+
+	m.h.instancesMu.Lock()
+	for field, value := range updates {
+		oldValue, postCommit, err := session.SetField(inst, field, value, nil)
+		if err != nil {
+			m.h.instancesMu.Unlock()
+			return nil, false, err
+		}
+		if oldValue == value {
+			continue
+		}
+		changed = append(changed, field)
+		if postCommit != nil {
+			postCommits = append(postCommits, postCommit)
+		}
+		if session.RestartPolicyFor(field) == session.FieldRestartRequired {
+			restartRequired = true
+		}
+	}
+	m.h.instancesMu.Unlock()
+
+	for _, fn := range postCommits {
+		fn()
+	}
+
+	if len(changed) == 0 {
+		return nil, false, nil
+	}
+
+	storage, err := session.NewStorageWithProfile(m.h.profile)
+	if err != nil {
+		return nil, false, fmt.Errorf("open storage: %w", err)
+	}
+	defer storage.Close()
+
+	m.h.instancesMu.RLock()
+	instances := make([]*session.Instance, len(m.h.instances))
+	copy(instances, m.h.instances)
+	m.h.instancesMu.RUnlock()
+
+	if err := storage.SaveWithGroups(instances, m.h.groupTree); err != nil {
+		return nil, false, fmt.Errorf("save session: %w", err)
+	}
+	return changed, restartRequired, nil
 }
 
 // CreateGroup creates a new group (or subgroup if parentPath is non-empty) and

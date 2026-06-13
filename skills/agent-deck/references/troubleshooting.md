@@ -10,7 +10,7 @@ Common issues and solutions for agent-deck.
 | MCPs not loading | `agent-deck session restart <name>` |
 | CLI changes not in TUI | Press `Ctrl+R` to refresh |
 | Flag not working | Put flags BEFORE arguments |
-| Fork fails | Check session has valid Claude session ID |
+| Fork fails | Check Claude session has a valid session ID, or Pi session has JSONL history under Agent Deck's Pi session dir |
 | Status stuck | Wait 2 seconds or press `u` to mark unread |
 
 ## Common Issues
@@ -97,6 +97,29 @@ enabled = true
 ```
 
 Also verify `~/.claude/projects/` exists and has content.
+
+### Shift+Enter Submits Instead of Inserting a Newline (Kitty)
+
+In **kitty**, Shift+Enter (and other modified keys) may submit immediately
+inside agent-deck even though they insert a newline when the agent runs
+natively. This is a kitty-specific quirk: tmux negotiates extended keys with
+the outer terminal using xterm's *modifyOtherKeys* protocol, which kitty does
+not implement (kitty only speaks its own CSI-u keyboard protocol). So kitty
+keeps sending a bare carriage return and the agent submits.
+
+agent-deck already sets `extended-keys-format csi-u` on its tmux sessions so
+that, *once the terminal sends a distinct Shift+Enter*, it reaches the agent in
+the form Claude Code understands. The remaining piece must be set in kitty
+itself — make kitty emit the CSI-u Shift+Enter unconditionally:
+
+```conf
+# ~/.config/kitty/kitty.conf
+map shift+enter send_text all \x1b[13;2u
+```
+
+Reload kitty's config (`Ctrl+Shift+F5`) and Shift+Enter will insert a newline,
+both natively and inside agent-deck. iTerm2, Ghostty, WezTerm and xterm honor
+modifyOtherKeys and do not need this mapping.
 
 ## Debugging
 

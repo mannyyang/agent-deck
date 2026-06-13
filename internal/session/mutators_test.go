@@ -21,6 +21,27 @@ func TestSetField_Title_UpdatesAndReturnsOldValue(t *testing.T) {
 	}
 }
 
+// An explicit rename must lock the title, otherwise the #572 Claude-name sync
+// (e.g. an auto-assigned plan title) reverts it on the next hook event.
+func TestSetField_Title_LocksTitle(t *testing.T) {
+	inst := &Instance{Title: "old-title"}
+
+	if _, _, err := SetField(inst, FieldTitle, "my-rename", nil); err != nil {
+		t.Fatalf("SetField returned error: %v", err)
+	}
+	if !inst.TitleLocked {
+		t.Error("TitleLocked = false after explicit rename, want true")
+	}
+
+	// The lock stays user-controllable: title-locked=false re-enables sync.
+	if _, _, err := SetField(inst, FieldTitleLocked, "false", nil); err != nil {
+		t.Fatalf("SetField(title-locked) returned error: %v", err)
+	}
+	if inst.TitleLocked {
+		t.Error("TitleLocked = true after explicit unlock, want false")
+	}
+}
+
 func TestSetField_Color_Valid(t *testing.T) {
 	cases := []struct {
 		name  string
@@ -380,5 +401,75 @@ func TestSetField_PreservesToolOptionsJSON(t *testing.T) {
 	}
 	if string(inst.ToolOptionsJSON) != `{"model":"opus"}` {
 		t.Errorf("ToolOptionsJSON clobbered by title edit: %s", inst.ToolOptionsJSON)
+	}
+}
+
+func TestSetField_OpenCodeSessionID_StampsDetectedAt(t *testing.T) {
+	inst := NewInstanceWithTool("oc", "/tmp/p", "opencode")
+	if _, _, err := SetField(inst, FieldOpenCodeSessionID, "ses_abc", nil); err != nil {
+		t.Fatalf("SetField: %v", err)
+	}
+	if inst.OpenCodeSessionID != "ses_abc" {
+		t.Fatalf("OpenCodeSessionID = %q, want ses_abc", inst.OpenCodeSessionID)
+	}
+	if inst.OpenCodeDetectedAt.IsZero() {
+		t.Fatal("OpenCodeDetectedAt must be stamped so CanForkOpenCode's recency gate passes")
+	}
+}
+
+func TestSetField_OpenCodeSessionID_RejectsShellMeta(t *testing.T) {
+	inst := NewInstanceWithTool("oc", "/tmp/p", "opencode")
+	inst.OpenCodeSessionID = "ses_safe"
+
+	if _, _, err := SetField(inst, FieldOpenCodeSessionID, "ses_abc;touch /tmp/pwned", nil); err == nil {
+		t.Fatal("SetField should reject OpenCode session IDs with shell metacharacters")
+	}
+	if inst.OpenCodeSessionID != "ses_safe" {
+		t.Fatalf("OpenCodeSessionID mutated on error: %q", inst.OpenCodeSessionID)
+	}
+}
+
+func TestSetField_CodexSessionID_StampsDetectedAt(t *testing.T) {
+	inst := NewInstanceWithTool("cx", "/tmp/p", "codex")
+	if _, _, err := SetField(inst, FieldCodexSessionID, "11111111-2222-3333-4444-555555555555", nil); err != nil {
+		t.Fatalf("SetField: %v", err)
+	}
+	if inst.CodexSessionID != "11111111-2222-3333-4444-555555555555" {
+		t.Fatalf("CodexSessionID = %q", inst.CodexSessionID)
+	}
+	if inst.CodexDetectedAt.IsZero() {
+		t.Fatal("CodexDetectedAt must be stamped")
+	}
+}
+
+func TestSetField_CodexSessionID_RejectsNonUUID(t *testing.T) {
+	inst := NewInstanceWithTool("cx", "/tmp/p", "codex")
+	inst.CodexSessionID = "11111111-2222-3333-4444-555555555555"
+
+	if _, _, err := SetField(inst, FieldCodexSessionID, "not-a-uuid", nil); err == nil {
+		t.Fatal("SetField should reject non-UUID Codex session IDs")
+	}
+	if inst.CodexSessionID != "11111111-2222-3333-4444-555555555555" {
+		t.Fatalf("CodexSessionID mutated on error: %q", inst.CodexSessionID)
+	}
+}
+
+func TestSetField_ToolSessionID_ClearStillAllowed(t *testing.T) {
+	oc := NewInstanceWithTool("oc", "/tmp/p", "opencode")
+	oc.OpenCodeSessionID = "ses_safe"
+	if _, _, err := SetField(oc, FieldOpenCodeSessionID, "", nil); err != nil {
+		t.Fatalf("SetField clear opencode-session-id: %v", err)
+	}
+	if oc.OpenCodeSessionID != "" {
+		t.Fatalf("OpenCodeSessionID should clear, got %q", oc.OpenCodeSessionID)
+	}
+
+	cx := NewInstanceWithTool("cx", "/tmp/p", "codex")
+	cx.CodexSessionID = "11111111-2222-3333-4444-555555555555"
+	if _, _, err := SetField(cx, FieldCodexSessionID, "  ", nil); err != nil {
+		t.Fatalf("SetField clear codex-session-id: %v", err)
+	}
+	if cx.CodexSessionID != "" {
+		t.Fatalf("CodexSessionID should clear, got %q", cx.CodexSessionID)
 	}
 }

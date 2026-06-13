@@ -62,6 +62,15 @@ func useTestBadgeDir(t *testing.T) string {
 	return dir
 }
 
+func useSimulatedITerm(t *testing.T) {
+	t.Helper()
+	t.Setenv("TERM_PROGRAM", "iTerm.app")
+	t.Setenv("WARP_IS_LOCAL_SHELL_SESSION", "")
+	t.Setenv("ITERM_SESSION_ID", "")
+	t.Setenv("LC_TERMINAL", "")
+	t.Setenv("AGENTDECK_ITERM_BADGE", "")
+}
+
 // waitForOSC blocks until w contains an OSC SetBadgeFormat for title, or
 // the deadline expires.
 func waitForOSC(t *testing.T, w *lockedWriter, title string, timeout time.Duration) {
@@ -99,10 +108,7 @@ func TestIssue1114_WriteBadgeUpdate_AtomicFileWrite(t *testing.T) {
 // the pre-fix bug where EmitITermBadgeViaTty silently dropped the OSC.
 func TestIssue1114_AttachWatcher_EmitsOSCOnFileChange(t *testing.T) {
 	useTestBadgeDir(t)
-	t.Setenv("TERM_PROGRAM", "iTerm.app")
-	t.Setenv("ITERM_SESSION_ID", "")
-	t.Setenv("LC_TERMINAL", "")
-	t.Setenv("AGENTDECK_ITERM_BADGE", "")
+	useSimulatedITerm(t)
 
 	w := newLockedWriter()
 
@@ -146,10 +152,7 @@ func TestIssue1114_AttachWatcher_EmitsOSCOnFileChange(t *testing.T) {
 // between two attached agent-deck users in the same iTerm2 window.
 func TestIssue1114_Watcher_IgnoresOtherSessions(t *testing.T) {
 	useTestBadgeDir(t)
-	t.Setenv("TERM_PROGRAM", "iTerm.app")
-	t.Setenv("ITERM_SESSION_ID", "")
-	t.Setenv("LC_TERMINAL", "")
-	t.Setenv("AGENTDECK_ITERM_BADGE", "")
+	useSimulatedITerm(t)
 
 	w := newLockedWriter()
 
@@ -191,6 +194,7 @@ func TestIssue1114_Watcher_IgnoresOtherSessions(t *testing.T) {
 func TestIssue1114_Watcher_NoOpOutsideITerm2(t *testing.T) {
 	useTestBadgeDir(t)
 	t.Setenv("TERM_PROGRAM", "Apple_Terminal")
+	t.Setenv("WARP_IS_LOCAL_SHELL_SESSION", "")
 	t.Setenv("ITERM_SESSION_ID", "")
 	t.Setenv("LC_TERMINAL", "")
 	t.Setenv("AGENTDECK_ITERM_BADGE", "")
@@ -229,10 +233,7 @@ func TestIssue1114_Watcher_NoOpOutsideITerm2(t *testing.T) {
 // silently bypass the user's opt-out.
 func TestIssue1114_Watcher_ConfigDisabledSuppresses(t *testing.T) {
 	useTestBadgeDir(t)
-	t.Setenv("TERM_PROGRAM", "iTerm.app")
-	t.Setenv("ITERM_SESSION_ID", "")
-	t.Setenv("LC_TERMINAL", "")
-	t.Setenv("AGENTDECK_ITERM_BADGE", "")
+	useSimulatedITerm(t)
 
 	w := newLockedWriter()
 
@@ -267,10 +268,7 @@ func TestIssue1114_Watcher_ConfigDisabledSuppresses(t *testing.T) {
 // same DisplayName depending on whether the attach was fresh or post-rename.
 func TestIssue1114_OSCMatchesAttachEmit(t *testing.T) {
 	useTestBadgeDir(t)
-	t.Setenv("TERM_PROGRAM", "iTerm.app")
-	t.Setenv("ITERM_SESSION_ID", "")
-	t.Setenv("LC_TERMINAL", "")
-	t.Setenv("AGENTDECK_ITERM_BADGE", "")
+	useSimulatedITerm(t)
 
 	w := newLockedWriter()
 
@@ -300,4 +298,40 @@ func TestIssue1114_OSCMatchesAttachEmit(t *testing.T) {
 
 	cancel()
 	<-done
+}
+
+// TestIssue1114_AttachLaunchesWatcherWithCancelableCtx is the structural
+// regression test for the badge-watcher resource leak: Attach() used to
+// launch `go WatchBadgeUpdates(ctx, ...)` BEFORE the
+// `ctx, cancel := context.WithCancel(ctx)` line, so the goroutine
+// captured the caller's context — context.Background() on the TUI path
+// (attachCmd.Run) — and was never stopped. Every attach leaked one
+// goroutine (250 ms poll ticker) plus one fsnotify watcher (an inotify
+// fd + an epoll fd on Linux), all watching the same badge-updates
+// directory inode. A day of deck hopping accumulated ~400 watchers and
+// double-digit sustained CPU.
+//
+// Attach itself needs a live tmux server, so — same pattern as the
+// PERF-E / mobile-input structural specs — this asserts on the source:
+// inside Attach(), the WithCancel call must precede the
+// WatchBadgeUpdates launch so the watcher receives the context that the
+// deferred cancel actually cancels on detach.
+func TestIssue1114_AttachLaunchesWatcherWithCancelableCtx(t *testing.T) {
+	src, err := os.ReadFile("pty.go")
+	require.NoError(t, err)
+
+	attachIdx := strings.Index(string(src), "func (s *Session) Attach(")
+	require.GreaterOrEqual(t, attachIdx, 0, "Attach() not found in pty.go")
+	body := string(src)[attachIdx:]
+
+	withCancelIdx := strings.Index(body, "context.WithCancel(")
+	watchIdx := strings.Index(body, "go WatchBadgeUpdates(")
+	require.GreaterOrEqual(t, withCancelIdx, 0, "context.WithCancel not found in Attach()")
+	require.GreaterOrEqual(t, watchIdx, 0, "go WatchBadgeUpdates not found in Attach()")
+
+	require.Less(t, withCancelIdx, watchIdx,
+		"WatchBadgeUpdates must be launched AFTER context.WithCancel in Attach(); "+
+			"launching it before hands it the caller's non-cancellable context "+
+			"(context.Background() on the TUI attach path) and leaks one goroutine + "+
+			"one fsnotify watcher per attach")
 }

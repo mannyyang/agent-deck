@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/asheshgoplani/agent-deck/internal/testutil"
 )
@@ -79,6 +80,23 @@ func TestMain(m *testing.M) {
 		return
 	}
 
+	os.Exit(runTestMain(m))
+}
+
+// runTestMain holds the real TestMain body. It exists so the cleanup defers
+// below actually run: TestMain calls os.Exit, which does NOT run deferred
+// functions, so registering them here and returning the exit code is the only
+// way to guarantee the bootstrap tmux server is killed and the isolated
+// TMUX_TMPDIR is removed. Skipping this leaked a tmux server (1 pty) on every
+// run — the 2026-06-07 pty-exhaustion incident.
+func runTestMain(m *testing.M) int {
+	// Isolate HOME+XDG so agent-deck path resolution lands in a temp dir, never
+	// the real ~/.agent-deck (2026-06-04 data-loss incident, S5). Placed after
+	// the child-helper guards above (those re-exec as subprocess tools and must
+	// keep the inherited env). See internal/testutil/homeenv.go.
+	cleanupHome := testutil.IsolateHome()
+	defer cleanupHome()
+
 	// Isolate the tmux socket. Without this, `tmux new-session` / `list-sessions` /
 	// `kill-session` calls in test setup & cleanup hit the user's default
 	// /tmp/tmux-<uid>/default socket — destabilizing their live sessions.
@@ -90,7 +108,9 @@ func TestMain(m *testing.M) {
 
 	// Bootstrap an idle tmux server in the isolated socket so the tests that
 	// depend on `tmux list-sessions` succeeding (#618 cleanup-attach OSC,
-	// etc.) actively run rather than silent-skipping on cold-boot.
+	// etc.) actively run rather than silent-skipping on cold-boot. Registered
+	// last so its kill-server defer runs FIRST — while TMUX_TMPDIR still points
+	// at the isolated socket, before cleanupTmux restores the env.
 	cleanupBootstrap := bootstrapTmuxServer()
 	defer cleanupBootstrap()
 
@@ -105,7 +125,7 @@ func TestMain(m *testing.M) {
 	// See CLAUDE.md: "2026-01-20 Incident: 20+ Test-Skip-Regen sessions orphaned, wasting ~3GB RAM"
 	cleanupTestSessions()
 
-	os.Exit(code)
+	return code
 }
 
 // cleanupTestSessions kills any tmux sessions created during testing.
@@ -134,10 +154,24 @@ func bootstrapTmuxServer() func() {
 	if _, err := exec.LookPath("tmux"); err != nil {
 		return func() {}
 	}
-	cmd := exec.Command("tmux", "new-session", "-d", "-s", bootstrapSessionName, "sh", "-c", "sleep 3600")
-	if out, err := cmd.CombinedOutput(); err != nil {
-		fmt.Fprintf(os.Stderr, "bootstrapTmuxServer(tmux): new-session failed: %v (%s)\n", err, strings.TrimSpace(string(out)))
-		return func() {}
+	start := func() bool {
+		cmd := exec.Command("tmux", "new-session", "-d", "-s", bootstrapSessionName, "sh", "-c", "sleep 3600")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			fmt.Fprintf(os.Stderr, "bootstrapTmuxServer(tmux): new-session failed: %v (%s)\n", err, strings.TrimSpace(string(out)))
+			return false
+		}
+		return true
+	}
+	ok := start()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := exec.Command("tmux", "has-session", "-t", bootstrapSessionName).Run(); err == nil {
+			break
+		}
+		if !ok {
+			ok = start()
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 	return func() {
 		_ = exec.Command("tmux", "kill-server").Run()
@@ -149,14 +183,25 @@ func bootstrapTmuxServer() func() {
 // against F3 silent-skip trap.
 func TestTmuxBootstrap_ServerIsRunning(t *testing.T) {
 	skipIfNoTmuxBinary(t)
-	if err := exec.Command("tmux", "list-sessions").Run(); err != nil {
-		t.Fatalf("tmux list-sessions failed after bootstrap: %v", err)
+	var lastErr error
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := exec.Command("tmux", "list-sessions").Run(); err != nil {
+			lastErr = fmt.Errorf("list-sessions: %w", err)
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		out, err := exec.Command("tmux", "list-sessions", "-F", "#{session_name}").Output()
+		if err != nil {
+			lastErr = fmt.Errorf("list-sessions -F: %w", err)
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		if strings.Contains(string(out), bootstrapSessionName) {
+			return
+		}
+		lastErr = fmt.Errorf("bootstrap session %q not present; got: %s", bootstrapSessionName, string(out))
+		time.Sleep(100 * time.Millisecond)
 	}
-	out, err := exec.Command("tmux", "list-sessions", "-F", "#{session_name}").Output()
-	if err != nil {
-		t.Fatalf("list-sessions -F: %v", err)
-	}
-	if !strings.Contains(string(out), bootstrapSessionName) {
-		t.Fatalf("bootstrap session %q not present; got: %s", bootstrapSessionName, string(out))
-	}
+	t.Fatalf("tmux bootstrap not ready within 10s: %v", lastErr)
 }

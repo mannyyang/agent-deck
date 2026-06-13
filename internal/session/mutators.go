@@ -3,6 +3,7 @@ package session
 import (
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -25,12 +26,15 @@ const (
 	FieldNotes              = "notes"
 	FieldClaudeSessionID    = "claude-session-id"
 	FieldGeminiSessionID    = "gemini-session-id"
+	FieldOpenCodeSessionID  = "opencode-session-id"
+	FieldCodexSessionID     = "codex-session-id"
 	FieldTitleLocked        = "title-locked"
 	FieldNoTransitionNotify = "no-transition-notify"
 	FieldSkipPermissions    = "skip-permissions"
 	FieldAutoMode           = "auto-mode"
 	FieldAccount            = "account"      // #924 per-session named account slot
 	FieldIdleTimeout        = "idle-timeout" // #1143 auto-stop dormant sessions
+	FieldPin                = "pin"          // pin-sessions: anchor top/bottom of group
 )
 
 var ValidMutableFields = []string{
@@ -46,12 +50,15 @@ var ValidMutableFields = []string{
 	FieldNotes,
 	FieldClaudeSessionID,
 	FieldGeminiSessionID,
+	FieldOpenCodeSessionID,
+	FieldCodexSessionID,
 	FieldTitleLocked,
 	FieldNoTransitionNotify,
 	FieldSkipPermissions,
 	FieldAutoMode,
 	FieldAccount,
 	FieldIdleTimeout,
+	FieldPin,
 }
 
 type FieldRestartPolicy int
@@ -78,6 +85,35 @@ type MutationError struct {
 
 func (e *MutationError) Error() string { return e.Msg }
 
+var (
+	openCodeSessionIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$`)
+	codexSessionIDPattern    = regexp.MustCompile(`^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$`)
+)
+
+func normalizeToolSessionID(field, value string) (string, error) {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return "", nil
+	}
+	switch field {
+	case FieldOpenCodeSessionID:
+		if !openCodeSessionIDPattern.MatchString(trimmed) {
+			return "", &MutationError{
+				Field: field,
+				Msg:   fmt.Sprintf("invalid opencode session id %q — expected a shell-safe identifier", trimmed),
+			}
+		}
+	case FieldCodexSessionID:
+		if !codexSessionIDPattern.MatchString(trimmed) {
+			return "", &MutationError{
+				Field: field,
+				Msg:   fmt.Sprintf("invalid codex session id %q — expected UUID format", trimmed),
+			}
+		}
+	}
+	return trimmed, nil
+}
+
 // SetField is the single source of truth for session metadata edits — both
 // `agent-deck session set` and the TUI EditSessionDialog call it.
 //
@@ -95,6 +131,10 @@ func SetField(inst *Instance, field, value string, extraArgsTokens []string) (ol
 	case FieldTitle:
 		oldValue = inst.Title
 		inst.Title = value
+		// An explicit rename is user intent: lock the title so the #572
+		// Claude-name sync (plan titles, /rename) can't revert it on the
+		// next hook event. Unlock via `session set <id> title-locked false`.
+		inst.TitleLocked = true
 		inst.SyncTmuxDisplayName()
 
 	case FieldPath:
@@ -248,6 +288,24 @@ func SetField(inst *Instance, field, value string, extraArgsTokens []string) (ol
 		inst.GeminiDetectedAt = time.Now()
 		postCommit = makeSessionEnvPostCommit(inst, "GEMINI_SESSION_ID", value)
 
+	case FieldOpenCodeSessionID:
+		oldValue = inst.OpenCodeSessionID
+		normalized, err := normalizeToolSessionID(field, value)
+		if err != nil {
+			return oldValue, nil, err
+		}
+		inst.OpenCodeSessionID = normalized
+		inst.OpenCodeDetectedAt = time.Now()
+
+	case FieldCodexSessionID:
+		oldValue = inst.CodexSessionID
+		normalized, err := normalizeToolSessionID(field, value)
+		if err != nil {
+			return oldValue, nil, err
+		}
+		inst.CodexSessionID = normalized
+		inst.CodexDetectedAt = time.Now()
+
 	case FieldTitleLocked:
 		oldValue = strconv.FormatBool(inst.TitleLocked)
 		b, perr := parseFieldBool(value)
@@ -298,6 +356,21 @@ func SetField(inst *Instance, field, value string, extraArgsTokens []string) (ol
 			return oldValue, nil, &MutationError{Field: field, Msg: perr.Error()}
 		}
 		inst.IdleTimeoutSecs = secs
+
+	case FieldPin:
+		// pin-sessions: anchor the session to the top/bottom of its group,
+		// exempt from the status/recency sort. "" clears the pin. Live: the
+		// next rebuildFlatItems re-sorts and the row lands in its band.
+		oldValue = string(inst.Pin)
+		switch PinMode(strings.TrimSpace(value)) {
+		case PinNone, PinTop, PinBottom:
+			inst.Pin = PinMode(strings.TrimSpace(value))
+		default:
+			return oldValue, nil, &MutationError{
+				Field: field,
+				Msg:   fmt.Sprintf("invalid pin %q — expected 'top', 'bottom', or '' to unpin", value),
+			}
+		}
 
 	default:
 		return "", nil, &MutationError{

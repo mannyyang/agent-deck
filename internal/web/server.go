@@ -107,6 +107,8 @@ type SessionMutator interface {
 	// CloseSession stops the session process while keeping its metadata
 	// in storage (TUI Shift+D — non-destructive close).
 	CloseSession(sessionID string) error
+	ArchiveSession(sessionID string) error
+	UnarchiveSession(sessionID string) error
 	ForkSession(sessionID string) (string, error)
 	// UndoDelete restores the most-recently deleted session if it was
 	// deleted within the implementation's undo window. Returns the
@@ -114,6 +116,14 @@ type SessionMutator interface {
 	// when the stack is empty and ErrUndoExpired when the most recent
 	// entry is older than the window — the handler maps both to 404.
 	UndoDelete() (string, error)
+	// UpdateSession applies one or more field edits to a session. updates maps
+	// session.Field* constants (raw strings — see internal/session/mutators.go)
+	// to their string-encoded new values; bools are "true"/"false". Returns the
+	// list of fields that actually changed (a no-op subset is permitted; only
+	// fields whose new value differs from the stored value are reported) and
+	// whether any updated field requires a restart to take effect. Validation
+	// errors (unknown field, invalid value) leave the session unchanged.
+	UpdateSession(sessionID string, updates map[string]string) (updatedFields []string, restartRequired bool, err error)
 	CreateGroup(name, parentPath string) (string, error)
 	RenameGroup(groupPath, newName string) error
 	DeleteGroup(groupPath string) error
@@ -162,11 +172,17 @@ func NewServer(cfg Config) *Server {
 		menuData = NewSessionDataService(cfg.Profile)
 	}
 
+	mutationLimiter := rate.NewLimiter(rate.Limit(20), 40) // 20 req/s, burst 40
+	if cfg.Profile == "fixture" {
+		// Playwright e2e hammers mutations across 400+ serial cases on one
+		// process; production limits would flake skills/mcps/session specs.
+		mutationLimiter = rate.NewLimiter(rate.Inf, 0)
+	}
 	s := &Server{
 		cfg:              cfg,
 		menuData:         menuData,
 		menuSubscribers:  make(map[chan struct{}]struct{}),
-		mutationLimiter:  rate.NewLimiter(rate.Limit(20), 40), // 20 req/s, burst 40
+		mutationLimiter:  mutationLimiter,
 		hookStatusLoader: defaultLoadHookStatuses,
 	}
 	s.baseCtx, s.cancelBase = context.WithCancel(context.Background())
@@ -213,6 +229,7 @@ func NewServer(cfg Config) *Server {
 	// ServeMux precedence routes it cleanly instead of treating
 	// "undelete" as a sessionID.
 	mux.HandleFunc("POST /api/sessions/undelete", s.handleSessionUndelete)
+	mux.HandleFunc("/api/sessions/archived", s.handleArchivedSessions)
 	mux.HandleFunc("/api/sessions/", s.handleSessionByAction)
 	mux.HandleFunc("/api/groups", s.handleGroupsCollection)
 	mux.HandleFunc("/api/groups/", s.handleGroupByPath)

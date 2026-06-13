@@ -3,6 +3,7 @@ package testutil
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 )
 
 // Name of the marker env var set during test isolation. Runtime guards in
@@ -60,7 +61,7 @@ func IsolateTmuxSocket() func() {
 	_ = os.Unsetenv("TMUX")
 	_ = os.Unsetenv("TMUX_PANE")
 
-	dir, err := os.MkdirTemp("", "agent-deck-test-tmux-")
+	dir, err := os.MkdirTemp(shortTmuxTmpBase(), "ad-tmux-")
 	if err != nil {
 		// If we can't isolate via MkdirTemp, we still want tests to
 		// run — but we REALLY don't want them on the default socket.
@@ -81,6 +82,61 @@ func IsolateTmuxSocket() func() {
 		// the kernel removes them when the bound tmux server exits.
 		_ = os.RemoveAll(dir)
 	}
+}
+
+// ShortTmuxSocket returns a tmux -S socket path under a short base dir (/tmp
+// when writable, via shortTmuxTmpBase) that fits the darwin sun_path 104-byte
+// limit regardless of $TMPDIR length or test name, plus a cleanup func that
+// removes the dir. Use for any test that passes its own `tmux -S <path>`;
+// t.TempDir() on darwin resolves under /var/folders/<hash>/T/<TestName>... and
+// overshoots the limit for long test names ("File name too long").
+//
+//	socket, cleanup := testutil.ShortTmuxSocket()
+//	t.Cleanup(cleanup)
+func ShortTmuxSocket() (socket string, cleanup func()) {
+	dir, err := os.MkdirTemp(shortTmuxTmpBase(), "ad-sock-")
+	if err != nil {
+		// Primary MkdirTemp failed. Retry directly under /tmp so each call
+		// still gets a UNIQUE dir (MkdirTemp's random suffix) that fits
+		// sun_path; a PID-keyed path would be process-constant and collide
+		// across calls, racing one call's cleanup against another's socket.
+		// A static PID path remains only as an absolute last resort.
+		if dir, err = os.MkdirTemp("/tmp", "agent-deck-test-sock-"); err != nil {
+			dir = fmt.Sprintf("/tmp/agent-deck-test-sock-%d", os.Getpid())
+			_ = os.MkdirAll(dir, 0o700)
+		}
+	}
+	return filepath.Join(dir, "s"), func() { _ = os.RemoveAll(dir) }
+}
+
+// shortTmuxTmpBase returns a short base directory for the per-test TMUX_TMPDIR.
+//
+// UNIX-domain socket paths are capped at sockaddr_un.sun_path (104 chars on
+// darwin, 108 on linux). tmux appends "/tmux-<uid>/<sock>" (~17 chars) to
+// TMUX_TMPDIR, and MkdirTemp's random suffix eats ~10 more, so the base must
+// stay well under ~75 chars. On darwin, os.TempDir() returns
+// /var/folders/<aa>/<32-char-hash>/T (resolved through /private/...) which is
+// ~56 chars and immediately overshoots the limit. /tmp is the well-known short
+// path on every Unix-like OS, matches tmux's own default location, and matches
+// the existing failure-mode fallback at the bottom of IsolateTmuxSocket.
+//
+// Returns "/tmp" when writable; otherwise returns "" so os.MkdirTemp falls
+// back to os.TempDir() (preserving the prior behavior on hosts that remap
+// TMPDIR but leave /tmp unwritable — rare under sandboxes/SELinux/AppArmor).
+func shortTmuxTmpBase() string {
+	const candidate = "/tmp"
+	info, err := os.Stat(candidate)
+	if err != nil || !info.IsDir() {
+		return ""
+	}
+	probe, err := os.CreateTemp(candidate, ".ad-tmux-probe-")
+	if err != nil {
+		return ""
+	}
+	name := probe.Name()
+	_ = probe.Close()
+	_ = os.Remove(name)
+	return candidate
 }
 
 // restoreEnv puts an env var back to its original state. If it wasn't set

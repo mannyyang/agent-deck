@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"time"
 
@@ -17,6 +18,7 @@ import (
 const (
 	ConductorAgentClaude = "claude"
 	ConductorAgentCodex  = "codex"
+	ConductorAgentHermes = "hermes"
 
 	ConductorSessionTitlePrefix     = "conductor-"
 	ConductorHeartbeatMessagePrefix = "Heartbeat:"
@@ -51,6 +53,13 @@ var conductorAgentSpecs = map[string]ConductorAgentSpec{
 		DefaultCommand:         "codex",
 		InstructionsFileName:   "AGENTS.md",
 		SupportsClearOnCompact: false,
+	},
+	ConductorAgentHermes: {
+		Agent:                  ConductorAgentHermes,
+		DisplayName:            "Hermes",
+		DefaultCommand:         "hermes",
+		InstructionsFileName:   "HERMES.md",
+		SupportsClearOnCompact: true,
 	},
 }
 
@@ -171,7 +180,9 @@ func (m *ConductorMeta) GetAgent() string {
 	return ConductorAgentClaude
 }
 
-// GetClearOnCompact returns whether to block compaction and send /clear instead, defaulting to true
+// GetClearOnCompact returns whether to block compaction and send /clear instead, defaulting to true.
+// For Hermes conductors, this enables context clearing on compaction (similar to Claude),
+// as Hermes does not perform automatic summarization like Claude does.
 func (m *ConductorMeta) GetClearOnCompact() bool {
 	spec, _ := GetConductorAgentSpec(m.GetAgent())
 	if !spec.SupportsClearOnCompact {
@@ -217,7 +228,7 @@ func GetConductorAgentSpec(agent string) (ConductorAgentSpec, error) {
 	normalized := normalizeConductorAgent(agent)
 	spec, ok := conductorAgentSpecs[normalized]
 	if !ok {
-		return ConductorAgentSpec{}, fmt.Errorf("unsupported conductor agent %q (supported: %s, %s)", agent, ConductorAgentClaude, ConductorAgentCodex)
+		return ConductorAgentSpec{}, fmt.Errorf("unsupported conductor agent %q (supported: %s, %s, %s)", agent, ConductorAgentClaude, ConductorAgentCodex, ConductorAgentHermes)
 	}
 	return spec, nil
 }
@@ -350,11 +361,7 @@ func normalizeConductorProfile(profile string) string {
 
 // ConductorDir returns the base conductor directory (~/.agent-deck/conductor)
 func ConductorDir() (string, error) {
-	dir, err := GetAgentDeckDir()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(dir, "conductor"), nil
+	return dataPath("conductor", "conductor")
 }
 
 // ConductorNameDir returns the directory for a named conductor (~/.agent-deck/conductor/<name>)
@@ -595,6 +602,24 @@ func SetupConductorWithAgent(name, profile, agent string, heartbeatEnabled bool,
 		return fmt.Errorf("failed to create conductor dir: %w", err)
 	}
 
+	// Pre-accept the Claude trust dialog for the conductor directory (#1359).
+	// conductor setup just created this directory, so there is nothing to
+	// vet — yet on first launch Claude Code would prompt "do you trust the
+	// files in this folder?" and the conductor would stall there, defeating
+	// autonomous/heartbeat operation. This reuses the same mechanism added
+	// for multi-repo worktree parents in #1149: seed
+	// projects[dir].hasTrustDialogAccepted = true in the user's root
+	// ~/.claude.json (where Claude keys trust, regardless of profile).
+	// Claude-only; failures are logged but non-fatal so setup still succeeds.
+	if spec.Agent == ConductorAgentClaude {
+		if err := PreAcceptClaudeTrust(GetUserMCPRootPath(), dir); err != nil {
+			sessionLog.Warn("conductor_preaccept_trust_failed",
+				slog.String("conductor", name),
+				slog.String("dir", dir),
+				slog.String("error", err.Error()))
+		}
+	}
+
 	targetPath := filepath.Join(dir, spec.InstructionsFileName)
 
 	if customInstructionsMD != "" {
@@ -604,7 +629,13 @@ func SetupConductorWithAgent(name, profile, agent string, heartbeatEnabled bool,
 		}
 	} else if info, err := os.Lstat(targetPath); err != nil || info.Mode()&os.ModeSymlink == 0 {
 		// No custom path - write default template (but preserve existing symlink)
-		content := renderConductorInstructionsTemplate(conductorPerNameClaudeMDTemplate, name, profile, spec)
+		var perNameTemplate string
+		if spec.Agent == ConductorAgentHermes {
+			perNameTemplate = conductorPerNameHermesMDTemplate
+		} else {
+			perNameTemplate = conductorPerNameClaudeMDTemplate
+		}
+		content := renderConductorInstructionsTemplate(perNameTemplate, name, profile, spec)
 		if err := os.WriteFile(targetPath, []byte(content), 0o644); err != nil {
 			return fmt.Errorf("failed to write %s: %w", spec.InstructionsFileName, err)
 		}
@@ -686,11 +717,26 @@ func renderConductorHeartbeatScript(name, profile string) string {
 	script := strings.ReplaceAll(conductorHeartbeatScript, "{NAME}", name)
 	script = strings.ReplaceAll(script, "{PROFILE}", profile)
 	script = strings.ReplaceAll(script, "{HEARTBEAT_PREFIX}", ConductorBridgeHeartbeatPrefix)
+	conductorRoot := "$HOME/.agent-deck/conductor"
+	if dir, err := ConductorDir(); err == nil {
+		conductorRoot = shellDoubleQuotedValue(dir)
+	}
+	script = strings.ReplaceAll(script, "{CONDUCTOR_ROOT}", conductorRoot)
 	if profile == DefaultProfile {
 		// For default profile, omit -p flag entirely
 		script = strings.ReplaceAll(script, `-p "$PROFILE" `, "")
 	}
 	return script
+}
+
+func shellDoubleQuotedValue(value string) string {
+	replacer := strings.NewReplacer(
+		`\`, `\\`,
+		`"`, `\"`,
+		`$`, `\$`,
+		"`", "\\`",
+	)
+	return replacer.Replace(value)
 }
 
 // HeartbeatPlistLabel returns the launchd label for a conductor's heartbeat
@@ -841,7 +887,12 @@ func isExecutablePath(path string) bool {
 // processes (launchd, systemd) that don't inherit the user's shell PATH can
 // still find the agent-deck binary.
 func buildDaemonPath(agentDeckPath string) string {
-	baseEntries := []string{"/usr/local/bin", "/opt/homebrew/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"}
+	baseEntries := []string{"/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"}
+	if runtime.GOOS == "darwin" {
+		// Homebrew on Apple Silicon installs to /opt/homebrew/bin; that path
+		// does not exist on Linux, so only include it on macOS.
+		baseEntries = []string{"/usr/local/bin", "/opt/homebrew/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"}
+	}
 	ordered := make([]string, 0, len(baseEntries)+1)
 	seen := map[string]struct{}{}
 
@@ -889,8 +940,12 @@ STATUS=$(agent-deck -p "$PROFILE" session show "$SESSION" --json 2>/dev/null | a
 
 # Resolve HEARTBEAT_RULES.md (per-conductor, then per-profile, then global fallback).
 # Mirrors the lookup order used by conductor/bridge.py since PR #218.
+CONDUCTOR_ROOT="{CONDUCTOR_ROOT}"
 RULES_FILE=""
 for candidate in \
+    "$CONDUCTOR_ROOT/{NAME}/HEARTBEAT_RULES.md" \
+    "$CONDUCTOR_ROOT/{PROFILE}/HEARTBEAT_RULES.md" \
+    "$CONDUCTOR_ROOT/HEARTBEAT_RULES.md" \
     "$HOME/.agent-deck/conductor/{NAME}/HEARTBEAT_RULES.md" \
     "$HOME/.agent-deck/conductor/{PROFILE}/HEARTBEAT_RULES.md" \
     "$HOME/.agent-deck/conductor/HEARTBEAT_RULES.md"; do
@@ -1055,6 +1110,9 @@ func InstallPolicyMD(customPath string) error {
 	if err != nil {
 		return err
 	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("failed to create directory: %w", err)
+	}
 	targetPath := filepath.Join(dir, "POLICY.md")
 
 	if customPath != "" {
@@ -1063,9 +1121,6 @@ func InstallPolicyMD(customPath string) error {
 	}
 
 	// No custom path - write default template (but preserve existing symlink)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return fmt.Errorf("failed to create directory: %w", err)
-	}
 	if info, err := os.Lstat(targetPath); err == nil && info.Mode()&os.ModeSymlink != 0 {
 		return nil
 	}
@@ -1397,6 +1452,28 @@ func GetConductorSettings() ConductorSettings {
 	return config.Conductor
 }
 
+// bridgeXDGBaseDirs returns the effective XDG base directories (the parents of
+// the agent-deck subdir) that agentpaths resolves against. Injecting these into
+// the bridge daemon env (issue #1350) makes the bridge's XDG branch land in the
+// same place the Go side wrote the conductors/config, instead of relying on the
+// legacy fallback. Mirrors agentpaths.xdgDir base selection: an absolute
+// $XDG_*_HOME wins, else ~/.local/share or ~/.config.
+func bridgeXDGBaseDirs() (dataBase, configBase string, err error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", "", err
+	}
+	base := func(envName string, fallbackParts ...string) string {
+		if v := strings.TrimSpace(os.Getenv(envName)); v != "" && filepath.IsAbs(v) {
+			return v
+		}
+		return filepath.Join(append([]string{home}, fallbackParts...)...)
+	}
+	dataBase = base("XDG_DATA_HOME", ".local", "share")
+	configBase = base("XDG_CONFIG_HOME", ".config")
+	return dataBase, configBase, nil
+}
+
 // LaunchdPlistName is the launchd label for the conductor bridge daemon
 const LaunchdPlistName = "com.agentdeck.conductor-bridge"
 
@@ -1424,10 +1501,17 @@ func GenerateLaunchdPlist() (string, error) {
 	bridgePath := filepath.Join(condDir, "bridge.py")
 	logPath := filepath.Join(condDir, "bridge.log")
 
+	dataBase, configBase, err := bridgeXDGBaseDirs()
+	if err != nil {
+		return "", err
+	}
+
 	plist := strings.ReplaceAll(conductorPlistTemplate, "__PYTHON3__", python3Path)
 	plist = strings.ReplaceAll(plist, "__BRIDGE_PATH__", bridgePath)
 	plist = strings.ReplaceAll(plist, "__LOG_PATH__", logPath)
 	plist = strings.ReplaceAll(plist, "__HOME__", homeDir)
+	plist = strings.ReplaceAll(plist, "__XDG_DATA_HOME__", dataBase)
+	plist = strings.ReplaceAll(plist, "__XDG_CONFIG_HOME__", configBase)
 	agentDeckPath := FindAgentDeck()
 	plist = strings.ReplaceAll(plist, "__PATH__", buildDaemonPath(agentDeckPath))
 
@@ -1448,8 +1532,8 @@ func LaunchdPlistPath() (string, error) {
 // PATH (so pyenv/asdf-selected interpreters win), then common absolute paths.
 func findPython3() string {
 	// Prefer the conductor venv python which has bridge dependencies installed.
-	if homeDir, err := os.UserHomeDir(); err == nil {
-		venvPython := filepath.Join(homeDir, ".agent-deck", "conductor", "venv", "bin", "python3")
+	if conductorDir, err := ConductorDir(); err == nil {
+		venvPython := filepath.Join(conductorDir, "venv", "bin", "python3")
 		if _, err := os.Stat(venvPython); err == nil {
 			return venvPython
 		}
@@ -1511,6 +1595,10 @@ const conductorPlistTemplate = `<?xml version="1.0" encoding="UTF-8"?>
         <string>__PATH__</string>
         <key>HOME</key>
         <string>__HOME__</string>
+        <key>XDG_DATA_HOME</key>
+        <string>__XDG_DATA_HOME__</string>
+        <key>XDG_CONFIG_HOME</key>
+        <string>__XDG_CONFIG_HOME__</string>
     </dict>
 
     <key>ThrottleInterval</key>
@@ -1572,6 +1660,7 @@ After=network.target
 
 [Service]
 Type=simple
+ExecStartPre=-/bin/mkdir -p __LOG_DIR__
 ExecStart=__PYTHON3__ __BRIDGE_PATH__
 Restart=always
 RestartSec=10
@@ -1580,7 +1669,7 @@ StandardOutput=append:__LOG_PATH__
 StandardError=append:__LOG_PATH__
 Environment=PATH=__PATH__
 Environment=HOME=__HOME__
-
+__XDG_ENV__
 [Install]
 WantedBy=default.target
 `
@@ -1597,6 +1686,7 @@ After=network.target
 
 [Service]
 Type=simple
+ExecStartPre=-/bin/mkdir -p __LOG_DIR__
 ExecStart=__AGENT_DECK__ notify-daemon
 Restart=always
 RestartSec=5
@@ -1712,10 +1802,18 @@ func GenerateSystemdBridgeService() (string, error) {
 	bridgePath := filepath.Join(condDir, "bridge.py")
 	logPath := filepath.Join(condDir, "bridge.log")
 
+	dataBase, configBase, err := bridgeXDGBaseDirs()
+	if err != nil {
+		return "", err
+	}
+	xdgEnv := "Environment=XDG_DATA_HOME=" + dataBase + "\nEnvironment=XDG_CONFIG_HOME=" + configBase
+
 	unit := strings.ReplaceAll(systemdBridgeServiceTemplate, "__PYTHON3__", python3Path)
 	unit = strings.ReplaceAll(unit, "__BRIDGE_PATH__", bridgePath)
 	unit = strings.ReplaceAll(unit, "__LOG_PATH__", logPath)
+	unit = strings.ReplaceAll(unit, "__LOG_DIR__", filepath.Dir(logPath))
 	unit = strings.ReplaceAll(unit, "__HOME__", homeDir)
+	unit = strings.ReplaceAll(unit, "__XDG_ENV__", xdgEnv)
 	agentDeckPath := FindAgentDeck()
 	unit = strings.ReplaceAll(unit, "__PATH__", buildDaemonPath(agentDeckPath))
 	return unit, nil
@@ -1727,16 +1825,15 @@ func GenerateTransitionNotifierLaunchdPlist() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	agentDeckDir, err := GetAgentDeckDir()
-	if err != nil {
-		return "", err
-	}
 	agentDeckPath := FindAgentDeck()
 	execPath := "agent-deck"
 	if agentDeckPath != "" {
 		execPath = agentDeckPath
 	}
-	logPath := filepath.Join(agentDeckDir, "logs", "transition-notifier.log")
+	logPath, err := logDataPath("transition-notifier.log")
+	if err != nil {
+		return "", fmt.Errorf("transition notifier log path: %w", err)
+	}
 
 	plist := strings.ReplaceAll(transitionNotifierPlistTemplate, "__AGENT_DECK__", execPath)
 	plist = strings.ReplaceAll(plist, "__LOG_PATH__", logPath)
@@ -1760,19 +1857,19 @@ func GenerateSystemdTransitionNotifierService() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	agentDeckDir, err := GetAgentDeckDir()
-	if err != nil {
-		return "", err
-	}
 	agentDeckPath := FindAgentDeck()
 	execPath := "agent-deck"
 	if agentDeckPath != "" {
 		execPath = agentDeckPath
 	}
-	logPath := filepath.Join(agentDeckDir, "logs", "transition-notifier.log")
+	logPath, err := logDataPath("transition-notifier.log")
+	if err != nil {
+		return "", fmt.Errorf("transition notifier log path: %w", err)
+	}
 
 	unit := strings.ReplaceAll(systemdTransitionNotifierServiceTemplate, "__AGENT_DECK__", execPath)
 	unit = strings.ReplaceAll(unit, "__LOG_PATH__", logPath)
+	unit = strings.ReplaceAll(unit, "__LOG_DIR__", filepath.Dir(logPath))
 	unit = strings.ReplaceAll(unit, "__HOME__", homeDir)
 	unit = strings.ReplaceAll(unit, "__PATH__", buildDaemonPath(agentDeckPath))
 	return unit, nil

@@ -36,6 +36,36 @@ type RenameGroupRequest struct {
 	Name string `json:"name"`
 }
 
+// UpdateSessionRequest is the body for PATCH /api/sessions/{id}. Every field
+// is optional; only the fields present in the request body are updated.
+// Pointer types let the handler distinguish "not supplied" from "set to zero
+// value" — important for booleans, where a missing field must not silently
+// clear the flag.
+//
+// Field names mirror session.Field* constants so the handler can dispatch
+// directly through session.SetField without a translation table.
+type UpdateSessionRequest struct {
+	Title           *string `json:"title,omitempty"`
+	Notes           *string `json:"notes,omitempty"`
+	Color           *string `json:"color,omitempty"`
+	Tool            *string `json:"tool,omitempty"`
+	ExtraArgs       *string `json:"extraArgs,omitempty"`
+	Plugins         *string `json:"plugins,omitempty"`
+	Channels        *string `json:"channels,omitempty"`
+	SkipPermissions *bool   `json:"skipPermissions,omitempty"`
+	AutoMode        *bool   `json:"autoMode,omitempty"`
+}
+
+// UpdateSessionResponse confirms a PATCH succeeded. RestartRequired is true
+// when any updated field only takes effect on next launch (tool, extra-args,
+// plugins, skip-permissions, auto-mode). Clients use it to prompt before/after
+// issuing a separate POST .../restart.
+type UpdateSessionResponse struct {
+	SessionID       string   `json:"sessionId"`
+	UpdatedFields   []string `json:"updatedFields"`
+	RestartRequired bool     `json:"restartRequired"`
+}
+
 // SessionActionResponse is returned by session action endpoints.
 type SessionActionResponse struct {
 	SessionID string         `json:"sessionId"`
@@ -67,6 +97,21 @@ type SettingsResponse struct {
 	ReadOnly     bool   `json:"readOnly"`
 	WebMutations bool   `json:"webMutations"`
 	Version      string `json:"version"`
+
+	// show_only_installed_tools filter (issue #1259). ToolFilter reports the
+	// flag is on; VisibleTools lists the tool names that resolved on PATH (the
+	// web dialog intersects its static list against this); ToolFilterFallback
+	// reports the empty-fallback so the dialog shows a "showing all" hint. With
+	// the flag off ToolFilter is false and the dialog ignores the other fields.
+	ToolFilter         bool     `json:"toolFilter"`
+	VisibleTools       []string `json:"visibleTools"`
+	ToolFilterFallback bool     `json:"toolFilterFallback"`
+
+	// hidden_tools denylist from [ui]. HiddenTools is the configured list;
+	// PickerTools is the ordered new-session picker after hidden_tools and
+	// show_only_installed_tools ("" mapped to "shell" for web).
+	HiddenTools []string `json:"hiddenTools"`
+	PickerTools []string `json:"pickerTools"`
 }
 
 // ProfilesResponse is returned by GET /api/profiles.

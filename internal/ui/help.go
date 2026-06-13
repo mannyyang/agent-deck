@@ -185,6 +185,7 @@ func (h *HelpOverlay) View() string {
 	pluginKey := h.key(hotkeyPluginManager, "L")
 	skillsKey := h.key(hotkeySkillsManager, "s")
 	previewKey := h.key(hotkeyTogglePreview, "v")
+	groupViewKey := h.key(hotkeyCycleGroupView, "t")
 	unreadKey := h.key(hotkeyMarkUnread, "u")
 	quickApproveKey := h.key(hotkeyQuickApprove, "a")
 	copyKey := h.key(hotkeyCopyOutput, "c")
@@ -196,6 +197,7 @@ func (h *HelpOverlay) View() string {
 	}
 	editPathsKey := h.key(hotkeyEditPaths, "p")
 	editSessionKey := h.key(hotkeyEditSession, "P")
+	worktreeSetupKey := h.key(hotkeyWorktreeSetup, "b")
 	worktreeKey := h.key(hotkeyWorktreeFinish, "W")
 	watcherPanelKey := h.key(hotkeyWatcherPanel, "w")
 	groupKey := h.key(hotkeyCreateGroup, "g")
@@ -243,7 +245,7 @@ func (h *HelpOverlay) View() string {
 				{closeKey, "Close session process"},
 				{undoKey, "Undo delete"},
 				{moveKey, "Move to group"},
-				{mcpKey, "MCP Manager (Claude/Gemini)"},
+				{mcpKey, "MCP Manager (Claude/Gemini/Cursor)"},
 				{pluginKey, "Plugin Manager (Claude — RFC PLUGIN_ATTACH.md)"},
 				{skillsKey, "Skills Manager"},
 				{"$", "Cost Dashboard"},
@@ -254,7 +256,7 @@ func (h *HelpOverlay) View() string {
 				{reorderUpKeys, "Reorder up (auto-promote at edge)"},
 				{reorderDownKeys, "Reorder down (auto-promote at edge)"},
 				{indentKeys, "Indent / outdent (in group)"},
-				{forkKeys, "Fork session (Claude only)"},
+				{forkKeys, "Fork session (Claude/Pi)"},
 				{copyKey, "Copy output to clipboard"},
 				{"C", "Copy preview info (Repo / Path / Branch)"},
 				{sendKey, "Send output to session"},
@@ -267,6 +269,7 @@ func (h *HelpOverlay) View() string {
 		{
 			title: "WORKTREES",
 			items: [][2]string{
+				{worktreeSetupKey, "Re-run worktree setup script"},
 				{worktreeKey, "Finish worktree (merge + cleanup)"},
 				{"n → w", "Create session in worktree"},
 				{"F → w", "Fork session into worktree"},
@@ -294,6 +297,7 @@ func (h *HelpOverlay) View() string {
 				{"/waiting", "Filter waiting"},
 				{"/running", "Filter running"},
 				{"/idle", "Filter idle"},
+				{groupViewKey, "Cycle view: active-on-top / populated-on-top"},
 			},
 		},
 		{
@@ -303,6 +307,7 @@ func (h *HelpOverlay) View() string {
 				{reloadKey, "Reload from disk"},
 				{importKey, "Import tmux sessions"},
 				{"Ctrl+Q", "Detach from session"},
+				{"Ctrl+S", "Switch session (here or attached)"},
 				{quitKey, "Quit"},
 				{helpKey, "This help"},
 			},

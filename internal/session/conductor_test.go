@@ -3,7 +3,9 @@ package session
 import (
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -649,8 +651,11 @@ func TestConductorHeartbeatScript_InjectsHeartbeatRules(t *testing.T) {
 	if !strings.Contains(conductorHeartbeatScript, "{PROFILE}/HEARTBEAT_RULES.md") {
 		t.Fatal("heartbeat script should look up per-profile HEARTBEAT_RULES.md")
 	}
+	if !strings.Contains(conductorHeartbeatScript, "$CONDUCTOR_ROOT/HEARTBEAT_RULES.md") {
+		t.Fatal("heartbeat script should look up global HEARTBEAT_RULES.md under the effective conductor root")
+	}
 	if !strings.Contains(conductorHeartbeatScript, "/.agent-deck/conductor/HEARTBEAT_RULES.md") {
-		t.Fatal("heartbeat script should fall back to the global HEARTBEAT_RULES.md")
+		t.Fatal("heartbeat script should fall back to the legacy global HEARTBEAT_RULES.md")
 	}
 	// The rendered (not raw) script should carry the bridge-style prefix so the
 	// idle-pause matcher (IsConductorHeartbeatMessage) can recognise heartbeat
@@ -658,6 +663,26 @@ func TestConductorHeartbeatScript_InjectsHeartbeatRules(t *testing.T) {
 	rendered := renderConductorHeartbeatScript("alpha", "default")
 	if !strings.Contains(rendered, ConductorBridgeHeartbeatPrefix) {
 		t.Fatalf("rendered heartbeat script should emit %q prefix (matches bridge.py)", ConductorBridgeHeartbeatPrefix)
+	}
+}
+
+func TestRenderConductorHeartbeatScript_UsesXDGConductorRoot(t *testing.T) {
+	home := t.TempDir()
+	xdgData := filepath.Join(home, "xdg data")
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_DATA_HOME", xdgData)
+
+	wantRoot := filepath.Join(xdgData, "agent-deck", "conductor")
+	script := renderConductorHeartbeatScript("alpha", "work")
+
+	if !strings.Contains(script, `CONDUCTOR_ROOT="`+wantRoot+`"`) {
+		t.Fatalf("heartbeat script should render XDG conductor root %q:\n%s", wantRoot, script)
+	}
+	if !strings.Contains(script, `"$CONDUCTOR_ROOT/alpha/HEARTBEAT_RULES.md"`) {
+		t.Fatalf("heartbeat script should check per-conductor rules under XDG root:\n%s", script)
+	}
+	if !strings.Contains(script, `"$HOME/.agent-deck/conductor/alpha/HEARTBEAT_RULES.md"`) {
+		t.Fatalf("heartbeat script should retain legacy fallback:\n%s", script)
 	}
 }
 
@@ -698,22 +723,17 @@ func TestConductorStatusJSON_ZeroActivityOmitted(t *testing.T) {
 // --- Symlink-based CLAUDE.md tests ---
 
 func TestInstallSharedClaudeMD_Default(t *testing.T) {
-	// Use actual conductor directory (cleanup after test)
-	homeDir, _ := os.UserHomeDir()
-	conductorDir := filepath.Join(homeDir, ".agent-deck", "conductor")
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_DATA_HOME", filepath.Join(home, "xdg-data"))
+	conductorDir, err := ConductorDir()
+	if err != nil {
+		t.Fatalf("ConductorDir: %v", err)
+	}
 	claudeMDPath := filepath.Join(conductorDir, "CLAUDE.md")
 
-	// Backup existing file if present
-	var backup []byte
-	if content, err := os.ReadFile(claudeMDPath); err == nil {
-		backup = content
-		defer func() { _ = os.WriteFile(claudeMDPath, backup, 0o644) }()
-	} else {
-		defer os.Remove(claudeMDPath)
-	}
-
 	// Test installing default template
-	err := InstallSharedClaudeMD("")
+	err = InstallSharedClaudeMD("")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -755,6 +775,9 @@ func TestInstallSharedClaudeMD_Default(t *testing.T) {
 }
 
 func TestInstallSharedClaudeMD_CustomSymlink(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_DATA_HOME", filepath.Join(home, "xdg-data"))
 	tmpDir := t.TempDir()
 	customPath := filepath.Join(tmpDir, "my-shared-claude.md")
 
@@ -763,30 +786,14 @@ func TestInstallSharedClaudeMD_CustomSymlink(t *testing.T) {
 		t.Fatalf("failed to create custom file: %v", err)
 	}
 
-	// Use actual conductor directory (cleanup after test)
-	homeDir, _ := os.UserHomeDir()
-	conductorDir := filepath.Join(homeDir, ".agent-deck", "conductor")
+	conductorDir, err := ConductorDir()
+	if err != nil {
+		t.Fatalf("ConductorDir: %v", err)
+	}
 	claudeMDPath := filepath.Join(conductorDir, "CLAUDE.md")
 
-	// Backup existing file/symlink if present
-	var backupContent []byte
-	var backupLink string
-	if linkDest, err := os.Readlink(claudeMDPath); err == nil {
-		backupLink = linkDest
-	} else if content, err := os.ReadFile(claudeMDPath); err == nil {
-		backupContent = content
-	}
-	t.Cleanup(func() {
-		os.Remove(claudeMDPath) // Remove whatever the test created (symlink or file)
-		if backupLink != "" {
-			_ = os.Symlink(backupLink, claudeMDPath)
-		} else if backupContent != nil {
-			_ = os.WriteFile(claudeMDPath, backupContent, 0o644)
-		}
-	})
-
 	// Test installing with custom path (creates symlink)
-	err := InstallSharedClaudeMD(customPath)
+	err = InstallSharedClaudeMD(customPath)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -812,6 +819,7 @@ func TestInstallSharedClaudeMD_CustomSymlink(t *testing.T) {
 func TestInstallSharedClaudeMD_CustomSymlinkCreatesConductorDir(t *testing.T) {
 	tmpHome := t.TempDir()
 	t.Setenv("HOME", tmpHome)
+	t.Setenv("XDG_DATA_HOME", filepath.Join(tmpHome, "xdg-data"))
 
 	customPath := filepath.Join(t.TempDir(), "my-shared-claude.md")
 	if err := os.WriteFile(customPath, []byte("# shared rules\n"), 0o644); err != nil {
@@ -822,7 +830,11 @@ func TestInstallSharedClaudeMD_CustomSymlinkCreatesConductorDir(t *testing.T) {
 		t.Fatalf("InstallSharedClaudeMD returned error: %v", err)
 	}
 
-	target := filepath.Join(tmpHome, ".agent-deck", "conductor", "CLAUDE.md")
+	conductorDir, err := ConductorDir()
+	if err != nil {
+		t.Fatalf("ConductorDir: %v", err)
+	}
+	target := filepath.Join(conductorDir, "CLAUDE.md")
 	linkDest, err := os.Readlink(target)
 	if err != nil {
 		t.Fatalf("expected symlink at %q: %v", target, err)
@@ -832,15 +844,37 @@ func TestInstallSharedClaudeMD_CustomSymlinkCreatesConductorDir(t *testing.T) {
 	}
 }
 
+func TestGenerateTransitionNotifierDaemons_SurfaceLogPathErrors(t *testing.T) {
+	home := t.TempDir()
+	badXDGDataHome := filepath.Join(home, "xdg-data-file")
+	if err := os.WriteFile(badXDGDataHome, []byte("not a directory"), 0o600); err != nil {
+		t.Fatalf("WriteFile(%q): %v", badXDGDataHome, err)
+	}
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_DATA_HOME", badXDGDataHome)
+
+	if _, err := GenerateTransitionNotifierLaunchdPlist(); err == nil {
+		t.Fatal("GenerateTransitionNotifierLaunchdPlist() error = nil, want log path lookup error")
+	}
+	if _, err := GenerateSystemdTransitionNotifierService(); err == nil {
+		t.Fatal("GenerateSystemdTransitionNotifierService() error = nil, want log path lookup error")
+	}
+}
+
 func TestInstallSharedConductorInstructions_CodexDefault(t *testing.T) {
 	tmpHome := t.TempDir()
 	t.Setenv("HOME", tmpHome)
+	t.Setenv("XDG_DATA_HOME", filepath.Join(tmpHome, "xdg-data"))
 
 	if err := InstallSharedConductorInstructions(ConductorAgentCodex, ""); err != nil {
 		t.Fatalf("InstallSharedConductorInstructions returned error: %v", err)
 	}
 
-	target := filepath.Join(tmpHome, ".agent-deck", "conductor", "AGENTS.md")
+	conductorDir, err := ConductorDir()
+	if err != nil {
+		t.Fatalf("ConductorDir: %v", err)
+	}
+	target := filepath.Join(conductorDir, "AGENTS.md")
 	content, err := os.ReadFile(target)
 	if err != nil {
 		t.Fatalf("failed to read AGENTS.md: %v", err)
@@ -856,6 +890,7 @@ func TestInstallSharedConductorInstructions_CodexDefault(t *testing.T) {
 func TestInstallSharedConductorInstructions_AgentsCoexist(t *testing.T) {
 	tmpHome := t.TempDir()
 	t.Setenv("HOME", tmpHome)
+	t.Setenv("XDG_DATA_HOME", filepath.Join(tmpHome, "xdg-data"))
 
 	if err := InstallSharedConductorInstructions(ConductorAgentClaude, ""); err != nil {
 		t.Fatalf("InstallSharedConductorInstructions(claude) returned error: %v", err)
@@ -864,7 +899,10 @@ func TestInstallSharedConductorInstructions_AgentsCoexist(t *testing.T) {
 		t.Fatalf("InstallSharedConductorInstructions(codex) returned error: %v", err)
 	}
 
-	base := filepath.Join(tmpHome, ".agent-deck", "conductor")
+	base, err := ConductorDir()
+	if err != nil {
+		t.Fatalf("ConductorDir: %v", err)
+	}
 	for _, file := range []string{"CLAUDE.md", "AGENTS.md"} {
 		if _, err := os.Stat(filepath.Join(base, file)); err != nil {
 			t.Fatalf("%s should exist: %v", file, err)
@@ -1292,7 +1330,7 @@ func TestBuildDaemonPath(t *testing.T) {
 			name:          "custom path included",
 			agentDeckPath: "/custom/tools/bin/agent-deck",
 			wantPrefix:    "/custom/tools/bin",
-			wantContains:  "/opt/homebrew/bin",
+			wantContains:  "/usr/local/bin",
 		},
 	}
 
@@ -1310,6 +1348,21 @@ func TestBuildDaemonPath(t *testing.T) {
 				t.Errorf("buildDaemonPath(%q) = %q, contains double colon", tt.agentDeckPath, result)
 			}
 		})
+	}
+}
+
+// TestBuildDaemonPath_HomebrewDarwinOnly verifies that /opt/homebrew/bin is
+// only injected into the daemon PATH base entries on macOS. On Linux the path
+// does not exist, so generated systemd units must not reference it.
+func TestBuildDaemonPath_HomebrewDarwinOnly(t *testing.T) {
+	// Use a non-homebrew agent-deck path so the only way /opt/homebrew/bin can
+	// appear is via the base entries.
+	result := buildDaemonPath("/custom/tools/bin/agent-deck")
+	hasHomebrew := strings.Contains(result, "/opt/homebrew/bin")
+	wantHomebrew := runtime.GOOS == "darwin"
+	if hasHomebrew != wantHomebrew {
+		t.Errorf("buildDaemonPath on GOOS=%q = %q; homebrew present=%v, want %v",
+			runtime.GOOS, result, hasHomebrew, wantHomebrew)
 	}
 }
 
@@ -1331,9 +1384,10 @@ func TestCreateSymlinkWithExpansion_MissingSourceError(t *testing.T) {
 // --- Policy MD tests ---
 
 func TestInstallPolicyMD_Default(t *testing.T) {
-	// Use actual conductor directory (cleanup after test)
-	homeDir, _ := os.UserHomeDir()
-	conductorDir := filepath.Join(homeDir, ".agent-deck", "conductor")
+	conductorDir, err := ConductorDir()
+	if err != nil {
+		t.Fatalf("ConductorDir: %v", err)
+	}
 	policyPath := filepath.Join(conductorDir, "POLICY.md")
 
 	// Backup existing file if present
@@ -1346,8 +1400,7 @@ func TestInstallPolicyMD_Default(t *testing.T) {
 	}
 
 	// Test installing default template
-	err := InstallPolicyMD("")
-	if err != nil {
+	if err := InstallPolicyMD(""); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
@@ -1389,8 +1442,10 @@ func TestInstallPolicyMD_CustomSymlink(t *testing.T) {
 	}
 
 	// Use actual conductor directory (cleanup after test)
-	homeDir, _ := os.UserHomeDir()
-	conductorDir := filepath.Join(homeDir, ".agent-deck", "conductor")
+	conductorDir, err := ConductorDir()
+	if err != nil {
+		t.Fatalf("ConductorDir: %v", err)
+	}
 	policyPath := filepath.Join(conductorDir, "POLICY.md")
 
 	// Backup existing file/symlink if present
@@ -1411,7 +1466,7 @@ func TestInstallPolicyMD_CustomSymlink(t *testing.T) {
 	})
 
 	// Test installing with custom path (creates symlink)
-	err := InstallPolicyMD(customPath)
+	err = InstallPolicyMD(customPath)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1447,8 +1502,9 @@ func TestSetupConductor_PolicyOverride(t *testing.T) {
 	profile := "default"
 
 	// Clean up after test
-	homeDir, _ := os.UserHomeDir()
-	defer os.RemoveAll(filepath.Join(homeDir, ".agent-deck", "conductor", name))
+	if conductorDir, err := ConductorDir(); err == nil {
+		defer os.RemoveAll(filepath.Join(conductorDir, name))
+	}
 
 	// Setup with custom policy path (creates per-conductor symlink)
 	err := SetupConductor(name, profile, true, true, "test description", "", customPolicyPath, "", nil, "")
@@ -1614,13 +1670,18 @@ func TestMigrateConductorPolicySplit_PreservesCustomClaudeMD(t *testing.T) {
 func TestInstallLearningsMD(t *testing.T) {
 	tmpHome := t.TempDir()
 	t.Setenv("HOME", tmpHome)
+	t.Setenv("XDG_DATA_HOME", filepath.Join(tmpHome, ".local", "share"))
 
 	err := InstallLearningsMD()
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	learningsPath := filepath.Join(tmpHome, ".agent-deck", "conductor", "LEARNINGS.md")
+	conductorDir, err := ConductorDir()
+	if err != nil {
+		t.Fatalf("ConductorDir: %v", err)
+	}
+	learningsPath := filepath.Join(conductorDir, "LEARNINGS.md")
 	content, err := os.ReadFile(learningsPath)
 	if err != nil {
 		t.Fatalf("LEARNINGS.md not created: %v", err)
@@ -2047,7 +2108,7 @@ func TestBridgeTemplate_DiscordConfigLoading(t *testing.T) {
 		`dc_bot_token = _resolve_secret(dc.get("bot_token", ""))`,
 		`dc_guild_id = dc.get("guild_id", 0)`,
 		`dc_channel_id = dc.get("channel_id", 0)`,
-		`dc_user_id = dc.get("user_id", 0)`,
+		`dc_user_id = _resolve_secret(str(dc.get("user_id", "") or ""))`,
 		`dc_listen_mode = dc.get("listen_mode", "all")`,
 		`dc_ignore_replies_to_others = dc.get("ignore_replies_to_others", False)`,
 		`"listen_mode": dc_listen_mode,`,
@@ -2057,6 +2118,86 @@ func TestBridgeTemplate_DiscordConfigLoading(t *testing.T) {
 	for _, pattern := range patterns {
 		if !strings.Contains(template, pattern) {
 			t.Errorf("template should contain Discord config pattern: %q", pattern)
+		}
+	}
+}
+
+// TestBridgeTemplate_UserIDResolvedViaSecret asserts that the bridge template
+// resolves telegram/discord user_id through _resolve_secret (so it accepts an
+// env-var reference like "$TELEGRAM_USER_ID"), mirroring the bot-token style,
+// while still coercing the resolved value to int in the returned config.
+func TestBridgeTemplate_UserIDResolvedViaSecret(t *testing.T) {
+	template := conductorBridgePy
+	patterns := []string{
+		`tg_user_id = _resolve_secret(str(tg.get("user_id", "") or ""))`,
+		`dc_user_id = _resolve_secret(str(dc.get("user_id", "") or ""))`,
+		`"user_id": int(tg_user_id) if tg_user_id else 0,`,
+		`"user_id": int(dc_user_id) if dc_user_id else 0,`,
+	}
+	for _, pattern := range patterns {
+		if !strings.Contains(template, pattern) {
+			t.Errorf("template should contain user_id resolution pattern: %q", pattern)
+		}
+	}
+}
+
+// TestBridgeTemplate_UserIDResolutionBehavior exercises the real _resolve_secret
+// function (sliced from the shipped template) against the exact user_id
+// resolution expression, covering: string env ref -> int, literal int unchanged,
+// and unset/empty -> 0. Skips if python3 is unavailable.
+func TestBridgeTemplate_UserIDResolutionBehavior(t *testing.T) {
+	py, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("python3 not available; skipping behavioral test")
+	}
+
+	template := conductorBridgePy
+	start := strings.Index(template, "def _resolve_secret")
+	end := strings.Index(template, "def load_config")
+	if start < 0 || end < 0 || end <= start {
+		t.Fatal("could not slice _resolve_secret from template")
+	}
+	resolveSecretSrc := template[start:end]
+
+	// Harness reuses the real _resolve_secret and mirrors the template's
+	// user_id resolution line exactly (asserted statically above).
+	harness := `import os
+class _Log:
+    def warning(self, *a, **k):
+        pass
+log = _Log()
+` + resolveSecretSrc + `
+def resolve_user_id(cfg):
+    user_id = _resolve_secret(str(cfg.get("user_id", "") or ""))
+    return int(user_id) if user_id else 0
+
+os.environ["TELEGRAM_USER_ID"] = "123456"
+os.environ.pop("NOPE_UNSET", None)
+print(resolve_user_id({"user_id": "$TELEGRAM_USER_ID"}))  # string env ref -> int
+print(resolve_user_id({"user_id": "${TELEGRAM_USER_ID}"}))  # braced env ref -> int
+print(resolve_user_id({"user_id": 123456}))                 # literal int unchanged
+print(resolve_user_id({}))                                  # missing -> 0
+print(resolve_user_id({"user_id": "$NOPE_UNSET"}))          # unset env ref -> 0
+`
+	dir := t.TempDir()
+	scriptPath := filepath.Join(dir, "harness.py")
+	if err := os.WriteFile(scriptPath, []byte(harness), 0o644); err != nil {
+		t.Fatalf("failed to write harness: %v", err)
+	}
+
+	out, err := exec.Command(py, scriptPath).CombinedOutput()
+	if err != nil {
+		t.Fatalf("python harness failed: %v\noutput:\n%s", err, out)
+	}
+
+	got := strings.Fields(strings.TrimSpace(string(out)))
+	want := []string{"123456", "123456", "123456", "0", "0"}
+	if len(got) != len(want) {
+		t.Fatalf("expected %d output lines, got %d: %q", len(want), len(got), string(out))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("case %d: got %q, want %q", i, got[i], want[i])
 		}
 	}
 }
@@ -2183,12 +2324,16 @@ func TestBridgeTemplate_DiscordImageUploadSupport(t *testing.T) {
 }
 
 func TestConductorClearOnCompact(t *testing.T) {
-	// Override HOME so LoadConductorMeta reads from our temp dir
+	// Override HOME/XDG data so LoadConductorMeta reads from our temp dir
 	tmpHome := t.TempDir()
 	t.Setenv("HOME", tmpHome)
+	t.Setenv("XDG_DATA_HOME", filepath.Join(tmpHome, ".local", "share"))
 
 	// Create conductor meta with clear_on_compact = true (default)
-	condDir := filepath.Join(tmpHome, ".agent-deck", "conductor", "main")
+	condDir, err := ConductorNameDir("main")
+	if err != nil {
+		t.Fatalf("ConductorNameDir: %v", err)
+	}
 	if err := os.MkdirAll(condDir, 0755); err != nil {
 		t.Fatal(err)
 	}
@@ -2649,5 +2794,261 @@ func TestConductorMeta_InactivityPauseJSON(t *testing.T) {
 	}
 	if loaded.HeartbeatIdleMinutes != 30 {
 		t.Errorf("HeartbeatIdleMinutes after unmarshal = %d, want 30", loaded.HeartbeatIdleMinutes)
+	}
+}
+
+// --- Issue #1350: bridge.py XDG path resolution ---
+
+// TestBridgeTemplate_DoesNotHardcodeLegacyAgentDeckRoot guards against the
+// embedded conductorBridgePy const drifting back to the hardcoded
+// ~/.agent-deck roots that broke conductor routing on fresh XDG installs
+// (issue #1350). The bridge must resolve CONDUCTOR_DIR / CONFIG_PATH through
+// XDG-with-legacy-fallback resolvers that mirror internal/agentpaths.
+func TestBridgeTemplate_DoesNotHardcodeLegacyAgentDeckRoot(t *testing.T) {
+	template := conductorBridgePy
+
+	// The old hardcoded root assignment must be gone.
+	if strings.Contains(template, `AGENT_DECK_DIR = Path.home() / ".agent-deck"`) {
+		t.Error("template must not hardcode AGENT_DECK_DIR = Path.home() / \".agent-deck\" (issue #1350)")
+	}
+	if strings.Contains(template, `CONFIG_PATH = AGENT_DECK_DIR / "config.toml"`) {
+		t.Error("template must not derive CONFIG_PATH from a hardcoded legacy root (issue #1350)")
+	}
+	if strings.Contains(template, `CONDUCTOR_DIR = AGENT_DECK_DIR / "conductor"`) {
+		t.Error("template must not derive CONDUCTOR_DIR from a hardcoded legacy root (issue #1350)")
+	}
+
+	// The XDG-aware resolvers must be present.
+	if !strings.Contains(template, "XDG_DATA_HOME") {
+		t.Error("template must reference XDG_DATA_HOME for data path resolution (issue #1350)")
+	}
+	if !strings.Contains(template, "XDG_CONFIG_HOME") {
+		t.Error("template must reference XDG_CONFIG_HOME for config path resolution (issue #1350)")
+	}
+
+	// Legacy fallback must be preserved so existing installs keep working.
+	if !strings.Contains(template, `.agent-deck`) {
+		t.Error("template must retain a legacy ~/.agent-deck fallback (issue #1350)")
+	}
+
+	// CONDUCTOR_DIR / CONFIG_PATH must be computed via the resolvers.
+	if !strings.Contains(template, `CONDUCTOR_DIR = resolve_data_dir("conductor")`) {
+		t.Error("template must compute CONDUCTOR_DIR via resolve_data_dir (issue #1350)")
+	}
+	if !strings.Contains(template, `CONFIG_PATH = resolve_config_path("config.toml")`) {
+		t.Error("template must compute CONFIG_PATH via resolve_config_path (issue #1350)")
+	}
+}
+
+// TestBridgeTemplate_ResolverMirrorsRealBridgeFile ensures the embedded value
+// and the canonical on-disk bridge source share a byte-identical resolver
+// region. There is now a single canonical file
+// (internal/session/conductor_bridge.py) embedded directly, so this also guards
+// that the #1350 resolver markers remain present in the deployed bytes.
+func TestBridgeTemplate_ResolverMirrorsRealBridgeFile(t *testing.T) {
+	const marker = "# --- issue #1350: XDG path resolution (mirror of internal/agentpaths) ---"
+	const endMarker = "# --- end issue #1350 resolver ---"
+
+	extract := func(src, where string) string {
+		start := strings.Index(src, marker)
+		if start < 0 {
+			t.Fatalf("%s: resolver start marker not found", where)
+		}
+		end := strings.Index(src[start:], endMarker)
+		if end < 0 {
+			t.Fatalf("%s: resolver end marker not found", where)
+		}
+		return src[start : start+end+len(endMarker)]
+	}
+
+	embedded := extract(conductorBridgePy, "embedded value")
+
+	// Locate the canonical internal/session/conductor_bridge.py next to this test.
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	bridgePath := filepath.Join(filepath.Dir(thisFile), "conductor_bridge.py")
+	data, err := os.ReadFile(bridgePath)
+	if err != nil {
+		t.Fatalf("read %s: %v", bridgePath, err)
+	}
+	onDisk := extract(string(data), "conductor_bridge.py")
+
+	if embedded != onDisk {
+		t.Errorf("resolver region drift between embedded value and conductor_bridge.py:\n--- embedded ---\n%s\n--- on disk ---\n%s", embedded, onDisk)
+	}
+}
+
+// TestGenerateSystemdBridgeService_InjectsXDGEnv verifies the systemd bridge
+// unit propagates the effective XDG dirs so the bridge daemon's XDG branch
+// resolves to the same place the Go side wrote the conductors (issue #1350).
+func TestGenerateSystemdBridgeService_InjectsXDGEnv(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("systemd not used on windows")
+	}
+	home := t.TempDir()
+	xdgData := filepath.Join(home, "xdgdata")
+	xdgConfig := filepath.Join(home, "xdgconfig")
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_DATA_HOME", xdgData)
+	t.Setenv("XDG_CONFIG_HOME", xdgConfig)
+	// Ensure a python3 is discoverable so generation does not error.
+	if findPython3() == "" {
+		t.Skip("python3 not found; cannot generate bridge unit")
+	}
+
+	unit, err := GenerateSystemdBridgeService()
+	if err != nil {
+		t.Fatalf("GenerateSystemdBridgeService: %v", err)
+	}
+	if !strings.Contains(unit, "Environment=XDG_DATA_HOME="+xdgData) {
+		t.Errorf("systemd unit must inject XDG_DATA_HOME=%q:\n%s", xdgData, unit)
+	}
+	if !strings.Contains(unit, "Environment=XDG_CONFIG_HOME="+xdgConfig) {
+		t.Errorf("systemd unit must inject XDG_CONFIG_HOME=%q:\n%s", xdgConfig, unit)
+	}
+}
+
+// TestGenerateLaunchdPlist_InjectsXDGEnv verifies the launchd plist propagates
+// the effective XDG dirs to the bridge daemon (issue #1350).
+func TestGenerateLaunchdPlist_InjectsXDGEnv(t *testing.T) {
+	home := t.TempDir()
+	xdgData := filepath.Join(home, "xdgdata")
+	xdgConfig := filepath.Join(home, "xdgconfig")
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_DATA_HOME", xdgData)
+	t.Setenv("XDG_CONFIG_HOME", xdgConfig)
+	if findPython3() == "" {
+		t.Skip("python3 not found; cannot generate bridge plist")
+	}
+
+	plist, err := GenerateLaunchdPlist()
+	if err != nil {
+		t.Fatalf("GenerateLaunchdPlist: %v", err)
+	}
+	if !strings.Contains(plist, "<key>XDG_DATA_HOME</key>") || !strings.Contains(plist, "<string>"+xdgData+"</string>") {
+		t.Errorf("launchd plist must inject XDG_DATA_HOME=%q:\n%s", xdgData, plist)
+	}
+	if !strings.Contains(plist, "<key>XDG_CONFIG_HOME</key>") || !strings.Contains(plist, "<string>"+xdgConfig+"</string>") {
+		t.Errorf("launchd plist must inject XDG_CONFIG_HOME=%q:\n%s", xdgConfig, plist)
+	}
+}
+
+// TestBridgeXDGEnv_AgreesWithConductorDir verifies the XDG base injected into
+// the bridge daemon, combined with the bridge's resolver formula
+// (<XDG_DATA_HOME>/agent-deck/conductor), points at exactly the directory the Go
+// side computes via ConductorDir() for the same env (issue #1350). This is the
+// path-agreement guarantee: the Go writer and the Python reader land together.
+func TestBridgeXDGEnv_AgreesWithConductorDir(t *testing.T) {
+	home := t.TempDir()
+	xdgData := filepath.Join(home, "xdgdata")
+	xdgConfig := filepath.Join(home, "xdgconfig")
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_DATA_HOME", xdgData)
+	t.Setenv("XDG_CONFIG_HOME", xdgConfig)
+
+	// Create the conductor marker so EffectiveDataDir selects XDG (as it would
+	// on a fresh XDG install after conductor setup).
+	if err := os.MkdirAll(filepath.Join(xdgData, "agent-deck", "conductor"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	dataBase, configBase, err := bridgeXDGBaseDirs()
+	if err != nil {
+		t.Fatalf("bridgeXDGBaseDirs: %v", err)
+	}
+	if dataBase != xdgData {
+		t.Errorf("dataBase = %q, want %q", dataBase, xdgData)
+	}
+	if configBase != xdgConfig {
+		t.Errorf("configBase = %q, want %q", configBase, xdgConfig)
+	}
+
+	condDir, err := ConductorDir()
+	if err != nil {
+		t.Fatalf("ConductorDir: %v", err)
+	}
+	// The bridge computes resolve_data_dir("conductor") / "conductor" where
+	// resolve_data_dir returns <XDG_DATA_HOME>/agent-deck. That must equal
+	// ConductorDir().
+	bridgeComputed := filepath.Join(dataBase, "agent-deck", "conductor")
+	if bridgeComputed != condDir {
+		t.Errorf("bridge-computed conductor dir %q != ConductorDir() %q", bridgeComputed, condDir)
+	}
+
+	// Config agreement. The bridge reads config.toml (the user config), which
+	// the Go side resolves via GetUserConfigPath -> EffectiveConfigPath.
+	bridgeCfg := filepath.Join(configBase, "agent-deck", "config.toml")
+	// EffectiveConfigPath returns the XDG path only if it exists; create it to
+	// match the fresh-XDG-install scenario.
+	if err := os.MkdirAll(filepath.Join(configBase, "agent-deck"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(bridgeCfg, []byte("[telegram]\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfgPath, err := GetUserConfigPath()
+	if err != nil {
+		t.Fatalf("GetUserConfigPath: %v", err)
+	}
+	if bridgeCfg != cfgPath {
+		t.Errorf("bridge-computed config path %q != GetUserConfigPath() %q", bridgeCfg, cfgPath)
+	}
+}
+
+// conductorTrustEntry reads the root ~/.claude.json and returns the trust
+// entry for dir, or nil if there is none.
+func conductorTrustEntry(t *testing.T, dir string) map[string]any {
+	t.Helper()
+	data, err := os.ReadFile(GetUserMCPRootPath())
+	if err != nil {
+		return nil
+	}
+	var cfg map[string]any
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatalf("unmarshal ~/.claude.json: %v", err)
+	}
+	projects, _ := cfg["projects"].(map[string]any)
+	entry, _ := projects[dir].(map[string]any)
+	return entry
+}
+
+// Issue #1359: setting up a Claude conductor must pre-accept the trust dialog
+// for the just-created conductor directory, so first boot (and heartbeat) does
+// not stall on Claude Code's "do you trust the files in this folder?" prompt.
+func TestSetupConductorWithAgent_PreAcceptsClaudeTrust(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	name := "trust-claude"
+	if err := SetupConductorWithAgent(name, "default", ConductorAgentClaude, true, true, "", "", "", "", nil, ""); err != nil {
+		t.Fatalf("SetupConductorWithAgent: %v", err)
+	}
+
+	dir, _ := ConductorNameDir(name)
+	entry := conductorTrustEntry(t, dir)
+	if entry == nil {
+		t.Fatalf("no trust entry for conductor dir %q in %s", dir, GetUserMCPRootPath())
+	}
+	if entry["hasTrustDialogAccepted"] != true {
+		t.Fatalf("hasTrustDialogAccepted = %v, want true", entry["hasTrustDialogAccepted"])
+	}
+}
+
+// Non-Claude conductors (e.g. Codex) must not get a Claude trust entry — the
+// pre-accept is Claude-specific.
+func TestSetupConductorWithAgent_NoClaudeTrustForCodex(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	name := "trust-codex"
+	if err := SetupConductorWithAgent(name, "default", ConductorAgentCodex, true, true, "", "", "", "", nil, ""); err != nil {
+		t.Fatalf("SetupConductorWithAgent: %v", err)
+	}
+
+	dir, _ := ConductorNameDir(name)
+	if entry := conductorTrustEntry(t, dir); entry != nil {
+		t.Fatalf("unexpected Claude trust entry for Codex conductor dir %q: %v", dir, entry)
 	}
 }

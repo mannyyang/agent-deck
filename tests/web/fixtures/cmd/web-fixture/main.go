@@ -64,7 +64,13 @@ func main() {
 		MenuData:     store,
 	})
 	server.SetMutator(store)
-	server.SetMCPManager(newFixtureMCPManager())
+	// Hold the MCP manager on the store so /__fixture/reset clears its
+	// in-memory attachments too. Without this, attachments leak across the
+	// serially-run mcps.spec.js cases (and across Playwright retries, which
+	// re-run the whole serial block), breaking the "fresh fixture" and
+	// "un-attached → 404" assertions.
+	store.mcpMgr = newFixtureMCPManager()
+	server.SetMCPManager(store.mcpMgr)
 	// Without this, GET /api/skills falls back to defaultSkillsService, which
 	// scans the host's real ~/.agent-deck/skills + ~/.claude/skills via
 	// session.ListAvailableSkills() — so the seeded alpha/beta/gamma catalog is
@@ -124,6 +130,7 @@ type fixtureStore struct {
 	startupToken string // echoed at /__fixture/whoami for spawn verification
 	catalog      []session.SkillCandidate
 	attached     map[string][]session.ProjectSkillAttachment // by projectPath
+	mcpMgr       *fixtureMCPManager                          // reset alongside the store on /__fixture/reset
 
 	// undoStack tracks recently-deleted sessions for ctrl+z undo. Capped
 	// at 10 entries (FIFO eviction) to match the TUI Home.undoStack.
@@ -255,11 +262,13 @@ func (s *fixtureStore) LoadMenuSnapshot() (*web.MenuSnapshot, error) {
 		})
 		idx++
 	}
+	active := 0
 	for _, id := range s.order {
 		sess, ok := s.sessions[id]
-		if !ok {
+		if !ok || !sess.ArchivedAt.IsZero() {
 			continue
 		}
+		active++
 		items = append(items, web.MenuItem{
 			Index: idx, Type: web.MenuItemTypeSession, Session: sess, Level: 1,
 		})
@@ -270,7 +279,34 @@ func (s *fixtureStore) LoadMenuSnapshot() (*web.MenuSnapshot, error) {
 		Profile:       s.profile,
 		GeneratedAt:   s.now(),
 		TotalGroups:   len(s.groups),
-		TotalSessions: len(s.sessions),
+		TotalSessions: active,
+		Items:         items,
+	}, nil
+}
+
+// LoadArchivedMenuSnapshot implements the optional archived-only menu loader.
+func (s *fixtureStore) LoadArchivedMenuSnapshot() (*web.MenuSnapshot, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	items := make([]web.MenuItem, 0)
+	idx := 0
+	archived := 0
+	for _, id := range s.order {
+		sess, ok := s.sessions[id]
+		if !ok || sess.ArchivedAt.IsZero() {
+			continue
+		}
+		archived++
+		items = append(items, web.MenuItem{
+			Index: idx, Type: web.MenuItemTypeSession, Session: sess, Level: 0,
+		})
+		idx++
+	}
+	return &web.MenuSnapshot{
+		Profile:       s.profile,
+		GeneratedAt:   s.now(),
+		TotalSessions: archived,
 		Items:         items,
 	}, nil
 }
@@ -333,6 +369,32 @@ func (s *fixtureStore) CloseSession(id string) error {
 	return s.transition(id, session.StatusStopped)
 }
 
+func (s *fixtureStore) ArchiveSession(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sess, ok := s.sessions[id]
+	if !ok {
+		return fmt.Errorf("session %q not found", id)
+	}
+	sess.Status = session.StatusStopped
+	sess.ArchivedAt = s.now()
+	return nil
+}
+
+func (s *fixtureStore) UnarchiveSession(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sess, ok := s.sessions[id]
+	if !ok {
+		return fmt.Errorf("session %q not found", id)
+	}
+	if sess.ArchivedAt.IsZero() {
+		return fmt.Errorf("session is not archived: %s", id)
+	}
+	sess.ArchivedAt = time.Time{}
+	return nil
+}
+
 // UndoDelete restores the most-recently deleted session if its delete
 // was within s.undoWindow (default web.DefaultUndoWindow).
 func (s *fixtureStore) UndoDelete() (string, error) {
@@ -355,6 +417,49 @@ func (s *fixtureStore) UndoDelete() (string, error) {
 	s.sessions[restored.ID] = &restored
 	s.order = append(s.order, restored.ID)
 	return restored.ID, nil
+}
+
+// UpdateSession implements web.SessionMutator. Mirrors the production path:
+// validates field names against a small allowlist and applies the value to
+// the in-memory MenuSession DTO. Restart-required fields are tracked with
+// the same policy as session.RestartPolicyFor so e2e tests can assert the
+// restartRequired flag without booting a real session.
+func (s *fixtureStore) UpdateSession(id string, updates map[string]string) ([]string, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sess, ok := s.sessions[id]
+	if !ok {
+		return nil, false, fmt.Errorf("session not found: %s", id)
+	}
+	changed := make([]string, 0, len(updates))
+	restartRequired := false
+	for field, value := range updates {
+		var oldValue string
+		switch field {
+		case session.FieldTitle:
+			oldValue = sess.Title
+			sess.Title = value
+		case session.FieldTool:
+			oldValue = sess.Tool
+			sess.Tool = value
+		case session.FieldNotes, session.FieldColor, session.FieldExtraArgs,
+			session.FieldPlugins, session.FieldChannels,
+			session.FieldSkipPermissions, session.FieldAutoMode:
+			// Fixture DTO doesn't carry these; treat as accepted no-op so
+			// tests can verify the round-trip without expanding MenuSession.
+			oldValue = value
+		default:
+			return nil, false, fmt.Errorf("invalid field: %s", field)
+		}
+		if oldValue == value {
+			continue
+		}
+		changed = append(changed, field)
+		if session.RestartPolicyFor(field) == session.FieldRestartRequired {
+			restartRequired = true
+		}
+	}
+	return changed, restartRequired, nil
 }
 
 func (s *fixtureStore) ForkSession(parentID string) (string, error) {
@@ -487,6 +592,9 @@ func (s *fixtureStore) adminHandler() http.Handler {
 			return
 		}
 		s.seed()
+		if s.mcpMgr != nil {
+			s.mcpMgr.Reset()
+		}
 		w.WriteHeader(http.StatusNoContent)
 	})
 	mux.HandleFunc("/__fixture/snapshot", func(w http.ResponseWriter, r *http.Request) {

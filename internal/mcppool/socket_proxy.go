@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/asheshgoplani/agent-deck/internal/agentpaths"
 	"github.com/asheshgoplani/agent-deck/internal/childenv"
 	"github.com/asheshgoplani/agent-deck/internal/logging"
 )
@@ -58,6 +59,11 @@ type SocketProxy struct {
 	// can be routed back to the correct session with the original ID restored.
 	// Key type: int64; value type: idMapping.
 	idMap sync.Map
+
+	// stdinMu serializes writes to mcpStdin. Each request must be written as
+	// a complete JSON line (payload + newline) atomically; without this, concurrent
+	// handleClient goroutines can interleave their writes and corrupt the framing.
+	stdinMu sync.Mutex
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -150,11 +156,11 @@ var dangerousEnvVars = map[string]bool{
 
 // mcpSocketDir returns a user-private directory for MCP sockets instead of /tmp.
 func mcpSocketDir() string {
-	home, err := os.UserHomeDir()
+	dir, err := agentpaths.EffectiveDataPath("sockets", "sockets")
 	if err != nil {
 		return filepath.Join(os.TempDir(), fmt.Sprintf("agentdeck-%d", os.Getuid()))
 	}
-	return filepath.Join(home, ".agent-deck", "sockets")
+	return dir
 }
 
 func NewSocketProxy(ctx context.Context, name, command string, args []string, env map[string]string) (*SocketProxy, error) {
@@ -215,7 +221,10 @@ func (p *SocketProxy) Start() error {
 		return err
 	}
 
-	logDir := filepath.Join(os.Getenv("HOME"), ".agent-deck", "logs", "mcppool")
+	logDir, err := agentpaths.EffectiveDataPath(filepath.Join("logs", "mcppool"), "logs")
+	if err != nil {
+		logDir = filepath.Join(os.TempDir(), "agent-deck", "logs", "mcppool")
+	}
 	_ = os.MkdirAll(logDir, 0700)
 	p.logFile = filepath.Join(logDir, fmt.Sprintf("%s_socket.log", p.name))
 
@@ -409,8 +418,10 @@ func (p *SocketProxy) handleClient(sessionID string, conn net.Conn) {
 			}
 		}
 
+		p.stdinMu.Lock()
 		_, _ = p.mcpStdin.Write(line)
 		_, _ = p.mcpStdin.Write([]byte("\n"))
+		p.stdinMu.Unlock()
 
 		logging.Aggregate(logging.CompPool, "mcp_request",
 			slog.String("mcp", p.name),

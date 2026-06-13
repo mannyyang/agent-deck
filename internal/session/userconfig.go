@@ -18,6 +18,8 @@ import (
 
 	dark "github.com/thiagokokada/dark-mode-go"
 
+	"github.com/asheshgoplani/agent-deck/internal/agentpaths"
+	"github.com/asheshgoplani/agent-deck/internal/atomicfile"
 	"github.com/asheshgoplani/agent-deck/internal/logging"
 	"github.com/asheshgoplani/agent-deck/internal/platform"
 	"github.com/asheshgoplani/agent-deck/internal/tmux"
@@ -26,12 +28,29 @@ import (
 // UserConfigFileName is the TOML config file for user preferences
 const UserConfigFileName = "config.toml"
 
+// ErrRefusingConfigSectionDrop is returned by SaveUserConfig when the config it
+// is asked to write would empty an entire top-level section ([mcps] or [groups])
+// that currently has entries on disk. These are the exact sections lost in the
+// 2026-06-04 data-loss incident: a partially-constructed config saved over the
+// live file silently dropped the whole MCP catalog and group overrides.
+//
+// S3 data-loss safeguard: a save that zeroes a populated section is almost
+// always a bug in the caller (it built a config without loading the existing
+// one), not a deliberate "clear everything". Refuse it. A caller that genuinely
+// means to clear all MCPs/groups must go through SaveUserConfigWithIntent with
+// allowSectionDrop=true so the destructive intent is explicit and greppable.
+var ErrRefusingConfigSectionDrop = fmt.Errorf("session: refusing to save config.toml that would drop a populated [mcps] or [groups] section to empty (use SaveUserConfigWithIntent to intentionally clear)")
+
 // UserConfig represents user-facing configuration in TOML format
 type UserConfig struct {
 	// DefaultTool is the pre-selected AI tool when creating new sessions
 	// Valid values: "claude", "gemini", "opencode", "codex", "pi", or any custom tool name
 	// If empty or invalid, defaults to "shell" (no pre-selection)
 	DefaultTool string `toml:"default_tool"`
+
+	// DefaultPath is the global fallback project directory for `agent-deck add`
+	// when no explicit path or group default_path is provided.
+	DefaultPath string `toml:"default_path"`
 
 	// Hotkeys overrides default keyboard shortcuts in the TUI.
 	// Keys are action names, values are key bindings (e.g., "delete" = "backspace").
@@ -53,6 +72,13 @@ type UserConfig struct {
 	// when you manage that file manually or via another tool.
 	// Default: true (nil = true)
 	ManageMCPJson *bool `toml:"manage_mcp_json"`
+
+	// SyncTitle controls whether agent-deck overwrites a session's Title with the
+	// agent's own session-name (e.g. Claude's `--name` / `/rename`, issues #572/#697).
+	// Tool-agnostic, global switch. Set false to keep the title you gave the session.
+	// The per-session TitleLocked flag remains available as a finer-grained override.
+	// Default: true (nil = true)
+	SyncTitle *bool `toml:"sync_title"`
 
 	// MCPs defines available MCP servers for the MCP Manager
 	// These can be attached/detached per-project via the MCP Manager (M key)
@@ -153,6 +179,9 @@ type UserConfig struct {
 	// Docker defines Docker sandbox settings for containerized sessions
 	Docker DockerSettings `toml:"docker"`
 
+	// Fork defines quick-fork (f) and fork-dialog (Shift+F) default behavior.
+	Fork ForkSettings `toml:"fork"`
+
 	// Remotes defines named SSH remote agent-deck instances
 	Remotes map[string]RemoteConfig `toml:"remotes"`
 
@@ -213,6 +242,88 @@ type UISettings struct {
 	// cadence that reconciles the list. Valid range: 5-300. Default: 15s,
 	// tightening the visibility latency reported on v1.9.30.
 	RemoteSessionRefreshSecs int `toml:"remote_session_refresh_secs"`
+
+	// ShowOnlyInstalledTools, when true, hides tools from the new-session
+	// dialogs (TUI + web) whose command does not resolve on the host PATH
+	// (issue #1259). Default false: no PATH probing happens and the dialogs are
+	// byte-identical to before. shell is always shown; if nothing else resolves
+	// the dialog falls back to showing all tools plus a one-line hint. This is a
+	// display filter only — `agent-deck launch -c <tool>` still spawns a hidden
+	// tool.
+	ShowOnlyInstalledTools bool `toml:"show_only_installed_tools"`
+
+	// HiddenTools lists tool names to hide from the new-session picker (TUI + web).
+	// Denylist: absent or empty shows every tool (subject to show_only_installed_tools).
+	// shell is always shown and cannot be hidden.
+	HiddenTools []string `toml:"hidden_tools"`
+
+	// Footer controls the style of the bottom hint bar. Valid values:
+	//   "full" (default)    — the historic verbose bar: filled key chips,
+	//                         width-adaptive, advertising every action. This is
+	//                         today's behavior and stays the default so the look
+	//                         never changes without an explicit opt-in.
+	//   "curated"           — lighter, dim inline text advertising only the
+	//                         actions relevant to the selected row, with the
+	//                         settings and help keys always last (opt-in).
+	//   "compact"           — force the abbreviated chip tier regardless of width.
+	//   "minimal"           — force the keys-only tier regardless of width.
+	// Empty or unknown values fall back to "full". This is purely a
+	// rendering preference (TUI UX initiative, item 1): no keybinding is
+	// added, removed, or changed — only what the footer advertises. Every
+	// action remains reachable by its key and is fully listed under help (?).
+	Footer string `toml:"footer"`
+
+	// NewSessionEnterAdvances controls what Enter does on the free-text
+	// Name/Branch fields of the new-session dialog. As of the UX top-3 pass this
+	// is ON BY DEFAULT (the mechanism shipped opt-in in PR #1295): Enter advances
+	// focus to the next field, so typing a name and pressing Enter no longer
+	// silently creates a session with all defaults — the #1 reported new-session
+	// trap. Ctrl+S is the explicit submit shortcut and submits in BOTH modes;
+	// Enter still submits from non-text rows (tool/checkboxes). The pointer lets
+	// us distinguish "unset" (nil → default true) from an explicit opt-OUT
+	// (`new_session_enter_advances = false` → restores the legacy Enter-submits
+	// behavior). Set `= true` (or leave unset) to keep the new default.
+	NewSessionEnterAdvances *bool `toml:"new_session_enter_advances"`
+}
+
+// normalizeUIHiddenTools lowercases, dedupes, and drops unknown entries from
+// [ui].hidden_tools. shell cannot be hidden. Unknown names log a warning.
+func normalizeUIHiddenTools(ui *UISettings, customTools map[string]ToolDef) {
+	if ui == nil || len(ui.HiddenTools) == 0 {
+		return
+	}
+	known := make(map[string]bool, len(builtinTools())+len(customTools))
+	for _, bt := range builtinTools() {
+		known[strings.ToLower(strings.TrimSpace(bt.Name))] = true
+	}
+	for name := range customTools {
+		n := strings.ToLower(strings.TrimSpace(name))
+		if n != "" {
+			known[n] = true
+		}
+	}
+
+	seen := make(map[string]bool, len(ui.HiddenTools))
+	out := make([]string, 0, len(ui.HiddenTools))
+	for _, raw := range ui.HiddenTools {
+		name := strings.ToLower(strings.TrimSpace(raw))
+		if name == "" || name == "shell" {
+			continue
+		}
+		if !known[name] {
+			registryLog.Warn("ignored unknown hidden_tools entry",
+				"name", raw,
+				"hint", "use a built-in or custom tool name from config.toml")
+			continue
+		}
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	ui.HiddenTools = out
 }
 
 // DefaultPreviewPct is the default preview-pane width percentage.
@@ -232,6 +343,36 @@ const (
 	ITermOpenAsWindow  = "window"
 	DefaultITermOpenAs = ITermOpenAsTab
 )
+
+// Footer hint-bar styles. See UISettings.Footer.
+const (
+	FooterCurated = "curated"
+	FooterFull    = "full"
+	FooterCompact = "compact"
+	FooterMinimal = "minimal"
+	// DefaultFooter is the historic verbose bar ("full"). Keeping it as the
+	// default preserves today's look; curated/compact/minimal are opt-in via
+	// config.toml [ui] footer.
+	DefaultFooter = FooterFull
+)
+
+// GetFooter returns the configured footer style, normalized to one of the
+// known values. Empty or unknown input falls back to DefaultFooter
+// ("full"). Matching is case-insensitive so users may write "Full" or
+// "MINIMAL" in TOML.
+func (u UISettings) GetFooter() string {
+	switch strings.ToLower(strings.TrimSpace(u.Footer)) {
+	case FooterFull:
+		return FooterFull
+	case FooterCompact:
+		return FooterCompact
+	case FooterMinimal:
+		return FooterMinimal
+	case FooterCurated:
+		return FooterCurated
+	}
+	return DefaultFooter
+}
 
 // GetPreviewPct returns the configured preview percentage, clamped to
 // [MinPreviewPct, MaxPreviewPct]. Falls back to DefaultPreviewPct when
@@ -287,6 +428,19 @@ func (u UISettings) GetRemoteSessionRefreshSecs() int {
 		return MaxRemoteSessionRefreshSecs
 	}
 	return val
+}
+
+// GetNewSessionEnterAdvances reports whether Enter on the new-session dialog's
+// free-text Name/Branch fields should advance focus (true) instead of
+// submitting the form (false). Defaults to true when unset: Enter-advances is
+// the default so typing a name + Enter no longer silently submits with all
+// defaults. A literal `new_session_enter_advances = false` opts out and
+// restores the legacy Enter-submits behavior. Ctrl+S submits in both modes.
+func (u UISettings) GetNewSessionEnterAdvances() bool {
+	if u.NewSessionEnterAdvances == nil {
+		return true // Default: ON (Enter advances; Ctrl+S submits).
+	}
+	return *u.NewSessionEnterAdvances
 }
 
 // GetRemoteLatencyRefreshSecs returns the remote latency refresh interval
@@ -398,6 +552,8 @@ type ProfileCodexSettings struct {
 type GroupSettings struct {
 	// Claude defines Claude Code overrides for a specific group.
 	Claude GroupClaudeSettings `toml:"claude"`
+	// Hermes defines Hermes overrides for a specific group.
+	Hermes GroupHermesSettings `toml:"hermes"`
 }
 
 // GroupClaudeSettings defines group-specific Claude overrides.
@@ -407,6 +563,16 @@ type GroupClaudeSettings struct {
 
 	// EnvFile overrides [claude].env_file for sessions in this group.
 	EnvFile string `toml:"env_file"`
+}
+
+// GroupHermesSettings defines group-specific Hermes overrides.
+type GroupHermesSettings struct {
+	Command      string `toml:"command"`
+	EnvFile      string `toml:"env_file"`
+	YoloMode     bool   `toml:"yolo_mode"`
+	GatewayURL   string `toml:"gateway_url"`
+	DashboardURL string `toml:"dashboard_url"`
+	APITokenEnv  string `toml:"api_token_env"`
 }
 
 // ConductorOverrides defines per-conductor configuration overrides.
@@ -421,6 +587,8 @@ type GroupClaudeSettings struct {
 type ConductorOverrides struct {
 	// Claude defines Claude Code overrides for a specific conductor.
 	Claude ConductorClaudeSettings `toml:"claude"`
+	// Hermes defines Hermes overrides for a specific conductor.
+	Hermes ConductorHermesSettings `toml:"hermes"`
 }
 
 // ConductorClaudeSettings defines conductor-specific Claude overrides.
@@ -434,6 +602,16 @@ type ConductorClaudeSettings struct {
 	// EnvFile is sourced before claude exec for this conductor.
 	// Matches CFG-03 semantics — missing file logs a warning, does not block.
 	EnvFile string `toml:"env_file"`
+}
+
+// ConductorHermesSettings defines conductor-specific Hermes overrides.
+type ConductorHermesSettings struct {
+	Command      string `toml:"command"`
+	EnvFile      string `toml:"env_file"`
+	YoloMode     bool   `toml:"yolo_mode"`
+	GatewayURL   string `toml:"gateway_url"`
+	DashboardURL string `toml:"dashboard_url"`
+	APITokenEnv  string `toml:"api_token_env"`
 }
 
 // MCPPoolSettings defines HTTP MCP pool configuration
@@ -636,9 +814,12 @@ func (n NotificationsConfig) GetTransitionEventsEnabled() bool {
 
 // InstanceSettings configures multiple agent-deck instance behavior
 type InstanceSettings struct {
-	// AllowMultiple allows running multiple agent-deck TUI instances for the same profile
-	// When true (default), multiple instances can run, but only the first (primary) manages the notification bar
-	// When false, only one instance can run per profile
+	// AllowMultiple allows running multiple agent-deck TUI instances for the same profile.
+	// When false (default), only one instance can run per profile — a safe default that
+	// prevents concurrent reviver/restart loops from tearing down each other's live
+	// sessions (issue #1246). When true (explicit opt-in), multiple instances can run,
+	// but only the first (primary) manages the notification bar — useful for multi-pane
+	// workflows (e.g. PC + phone-over-SSH).
 	AllowMultiple *bool `toml:"allow_multiple"`
 
 	// FollowCwdOnAttach updates the session's ProjectPath from tmux pane_current_path
@@ -647,10 +828,14 @@ type InstanceSettings struct {
 	FollowCwdOnAttach *bool `toml:"follow_cwd_on_attach"`
 }
 
-// GetAllowMultiple returns whether multiple instances are allowed, defaulting to true
+// GetAllowMultiple returns whether multiple instances are allowed, defaulting to false.
+// Single-instance-per-profile is the safe default: it engages the primary-election gate
+// so a second instance is rejected, preventing concurrent reviver/restart loops from
+// tearing down each other's live sessions (issue #1246). Multi-instance is an explicit
+// opt-in via allow_multiple = true.
 func (i *InstanceSettings) GetAllowMultiple() bool {
 	if i.AllowMultiple == nil {
-		return true // Default: allow multiple instances (better UX for multi-pane workflows)
+		return false // Default: single instance per profile (prevents concurrent tear-down)
 	}
 	return *i.AllowMultiple
 }
@@ -688,6 +873,15 @@ type ShellSettings struct {
 	// Default: false (opt-in). Issue #1161, design doc
 	// docs/decisions/1161-exit-to-shell-then-resume.md.
 	ExitToShell *bool `toml:"exit_to_shell"`
+
+	// LaunchShell, when true, wraps agent spawn commands with an interactive
+	// shell invocation so that environment variables from ~/.zshrc, ~/.bashrc
+	// etc. are available to the agent process. This solves the issue where
+	// OpenCode MCP configs with {env:VAR} references fail when launched from
+	// the TUI because the agent doesn't inherit the interactive shell's
+	// environment.
+	// Default: false (opt-in). Issue #1218.
+	LaunchShell *bool `toml:"launch_shell"`
 }
 
 // GetIgnoreMissingEnvFiles returns whether to ignore missing env files, defaulting to true
@@ -705,6 +899,16 @@ func (s *ShellSettings) GetExitToShell() bool {
 		return false // Default: OFF (preserve current exit/resume behavior)
 	}
 	return *s.ExitToShell
+}
+
+// GetLaunchShell returns whether agent commands should be wrapped with a shell
+// invocation that loads startup files before launch, defaulting to false
+// (opt-in). Issue #1218.
+func (s *ShellSettings) GetLaunchShell() bool {
+	if s.LaunchShell == nil {
+		return false // Default: OFF (preserve current direct spawn behavior)
+	}
+	return *s.LaunchShell
 }
 
 // GetShowAnalytics returns whether to show analytics, defaulting to false
@@ -805,6 +1009,16 @@ func (c *UserConfig) GetShowNotes() bool {
 	return c.Preview.GetShowNotes()
 }
 
+// GetSyncTitle returns whether agent-deck may overwrite a session Title with the
+// agent's own session-name. Tool-agnostic. Defaults to true (nil = true) so
+// existing installs keep the current behavior; set sync_title = false to opt out.
+func (c *UserConfig) GetSyncTitle() bool {
+	if c.SyncTitle == nil {
+		return true
+	}
+	return *c.SyncTitle
+}
+
 // ClaudeSettings defines Claude Code configuration
 type ClaudeSettings struct {
 	// Command is the Claude CLI command or alias to use (e.g., "claude", "cdw", "cdp")
@@ -868,6 +1082,24 @@ type ClaudeSettings struct {
 	// otherwise sit frozen on the picker forever (closes #67).
 	// Default: true (nil = use default true, set false to disable).
 	AutoResumeSummary *bool `toml:"auto_resume_summary"`
+
+	// VimMode tells agent-deck the inner Claude Code prompt uses vim keybindings
+	// ("editorMode": "vim"). When true, every message send guarantees the
+	// composer is in insert mode (Escape + `i`) before delivering text/Enter, so
+	// a message sent while the prompt sits in vim NORMAL mode (the default state
+	// after a turn finishes) actually submits instead of being typed-but-unsent
+	// (issue #1264). Off by default — only enable for sessions running Claude
+	// Code with vim editor mode. Other tools and non-vim Claude are unaffected.
+	VimMode bool `toml:"vim_mode"`
+}
+
+// GetVimMode reports whether vim-mode insert-guard sends are enabled. Off by
+// default (issue #1264).
+func (c *ClaudeSettings) GetVimMode() bool {
+	if c == nil {
+		return false
+	}
+	return c.VimMode
 }
 
 // GetProfileClaudeConfigDir returns the profile-specific Claude config directory, if configured.
@@ -915,6 +1147,21 @@ func (c *UserConfig) GetGroupClaudeEnvFile(groupPath string) string {
 	return ""
 }
 
+// GetGroupHermesEnvFile returns the group-specific Hermes env file, walking
+// ancestor groups when the exact path has no override. Mirrors
+// GetGroupClaudeEnvFile's inheritance semantics.
+func (c *UserConfig) GetGroupHermesEnvFile(groupPath string) string {
+	if c == nil || groupPath == "" || c.Groups == nil {
+		return ""
+	}
+	for p := groupPath; p != ""; p = getParentPath(p) {
+		if groupCfg, ok := c.Groups[p]; ok && groupCfg.Hermes.EnvFile != "" {
+			return groupCfg.Hermes.EnvFile
+		}
+	}
+	return ""
+}
+
 // GetConductorClaudeConfigDir returns the conductor-specific Claude config
 // directory, if configured. Keyed by conductor name (Instance.Title minus
 // "conductor-" prefix — single source of truth is conductorNameFromInstance
@@ -944,6 +1191,19 @@ func (c *UserConfig) GetConductorClaudeEnvFile(name string) string {
 		return ""
 	}
 	return conductorCfg.Claude.EnvFile
+}
+
+// GetConductorHermesEnvFile returns the conductor-specific Hermes env_file,
+// if configured. Mirrors GetConductorClaudeEnvFile.
+func (c *UserConfig) GetConductorHermesEnvFile(name string) string {
+	if c == nil || name == "" || c.Conductors == nil {
+		return ""
+	}
+	conductorCfg, ok := c.Conductors[name]
+	if !ok || conductorCfg.Hermes.EnvFile == "" {
+		return ""
+	}
+	return conductorCfg.Hermes.EnvFile
 }
 
 // GetDangerousMode returns whether dangerous mode is enabled, defaulting to true
@@ -1084,6 +1344,18 @@ type HermesSettings struct {
 	// YoloMode enables --yolo flag for Hermes sessions (auto-approve all tool calls).
 	// Default: false
 	YoloMode bool `toml:"yolo_mode"`
+	// GatewayURL is the WebSocket URL of the Hermes gateway for health checks.
+	// Default: "" (no gateway health check)
+	GatewayURL string `toml:"gateway_url"`
+	// DashboardURL is the Hermes dashboard API endpoint.
+	// Default: "" (dashboard integration disabled)
+	DashboardURL string `toml:"dashboard_url"`
+	// APITokenEnv is the environment variable name containing the Hermes API token.
+	// Default: "" (uses HERMES_API_TOKEN if set)
+	APITokenEnv string `toml:"api_token_env"`
+	// WorkspaceDir is the base directory for Hermes shared workspace sessions.
+	// Default: "" (uses os.TempDir()/hermes-workspaces)
+	WorkspaceDir string `toml:"workspace_dir"`
 }
 
 // CrushSettings defines charmbracelet/crush CLI configuration (Issue #940).
@@ -1751,9 +2023,116 @@ func (d DockerSettings) GetAutoCleanup() bool {
 	return *d.AutoCleanup
 }
 
+// ForkSettings controls quick-fork (f) and fork-dialog (Shift+F) defaults.
+// Unset structural toggles default to the comprehensive built-in (ON); these
+// defaults are independent of [worktree]/[docker] default_enabled, which govern
+// non-fork session creation. *bool is required so "absent" reads as ON.
+type ForkSettings struct {
+	// InheritFromParent, when true, makes the fork mirror the parent session and
+	// ignores the structural keys below. See Resolve.
+	InheritFromParent bool `toml:"inherit_from_parent"`
+
+	// Worktree creates a new worktree + branch. nil => true.
+	Worktree *bool `toml:"worktree"`
+	// WithState carries the parent's tracked uncommitted changes. nil => true.
+	WithState *bool `toml:"with_state"`
+	// WithIgnored also copies gitignored files (implies WithState). nil => false:
+	// the gitignored tree is unbounded (data sets, virtual envs, node_modules)
+	// and may carry secrets (.env), so copying it is opt-in. See GetWithIgnored.
+	WithIgnored *bool `toml:"with_ignored"`
+	// Docker selects sandbox behavior: "auto" (match parent) | "on" | "off".
+	// nil/unknown => "auto". Mirrors the [tmux].launch_as string-enum convention.
+	Docker *string `toml:"docker"`
+	// BranchPrefix is the auto branch-name prefix. "" => "fork/".
+	BranchPrefix string `toml:"branch_prefix"`
+}
+
+// GetWorktree reports whether forks create a worktree (default ON).
+func (f ForkSettings) GetWorktree() bool { return f.Worktree == nil || *f.Worktree }
+
+// GetWithState reports whether forks carry tracked state (default ON).
+func (f ForkSettings) GetWithState() bool { return f.WithState == nil || *f.WithState }
+
+// GetWithIgnored reports whether forks copy gitignored files (default OFF).
+// Off by default because the gitignored tree is unbounded (data sets, virtual
+// envs, node_modules) and can carry secrets (.env); copying it silently blocks
+// the fork with no size cap or progress. Opt in per fork via the Shift+F
+// dialog, globally via [fork].with_ignored = true, or wholesale via
+// inherit_from_parent.
+func (f ForkSettings) GetWithIgnored() bool { return f.WithIgnored != nil && *f.WithIgnored }
+
+// GetDocker returns the canonical docker mode: "auto" | "on" | "off".
+// Mirrors GetLaunchAs: lowercase/trim, unknown/nil -> "auto".
+func (f ForkSettings) GetDocker() string {
+	if f.Docker == nil {
+		return "auto"
+	}
+	switch v := strings.ToLower(strings.TrimSpace(*f.Docker)); v {
+	case "auto", "on", "off":
+		return v
+	default:
+		return "auto"
+	}
+}
+
+// GetBranchPrefix returns the auto branch-name prefix (default "fork/").
+func (f ForkSettings) GetBranchPrefix() string {
+	prefix := strings.TrimSpace(f.BranchPrefix)
+	if prefix == "" {
+		return "fork/"
+	}
+	return prefix
+}
+
+// ResolvedForkPlan is the effective set of structural fork toggles after
+// applying [fork] config + parent context.
+type ResolvedForkPlan struct {
+	Worktree    bool
+	WithState   bool
+	WithIgnored bool
+	Sandbox     bool
+}
+
+// Resolve turns ForkSettings + the parent's Docker state into a concrete plan.
+// parentSandboxed is source.IsSandboxed(). When InheritFromParent is set, the
+// fork mirrors the parent: worktree+state+gitignored ON (the parent is a real
+// working tree) and Sandbox matches the parent, ignoring the structural keys.
+func (f ForkSettings) Resolve(parentSandboxed bool) ResolvedForkPlan {
+	if f.InheritFromParent {
+		return ResolvedForkPlan{Worktree: true, WithState: true, WithIgnored: true, Sandbox: parentSandboxed}
+	}
+	sandbox := parentSandboxed
+	switch f.GetDocker() {
+	case "on":
+		sandbox = true
+	case "off":
+		sandbox = false
+	}
+	withIgnored := f.GetWithIgnored()
+	withState := f.GetWithState() || withIgnored
+	return ResolvedForkPlan{
+		Worktree:    f.GetWorktree(),
+		WithState:   withState,
+		WithIgnored: withIgnored,
+		Sandbox:     sandbox,
+	}
+}
+
 type StatusSettings struct {
 	// Reserved for future status detection settings.
 	// Control mode pipes are always enabled (no longer configurable).
+
+	// ShellRunningIndicator promotes "shell" tool sessions from idle to
+	// running when the pane's foreground command is a genuine non-interactive
+	// process (e.g. "node" from `yarn dev`, "java" from `mvn spring-boot:run`).
+	// Opt-in (default false): the interactive-program denylist is necessarily
+	// incomplete, so a shell sitting at a psql/REPL/fzf prompt would otherwise
+	// read "running" while the user is idle. Users who want dev-server
+	// detection accept that tradeoff explicitly:
+	//
+	//	[status]
+	//	shell_running_indicator = true
+	ShellRunningIndicator bool `toml:"shell_running_indicator"`
 }
 
 // MaintenanceSettings controls the automatic maintenance worker
@@ -1792,6 +2171,22 @@ type DisplaySettings struct {
 	// Valid statuses: "running", "waiting", "idle", "error", "starting",
 	// "stopped".
 	ActiveFilterExcludes []string `toml:"active_filter_excludes"`
+
+	// IncludeCwdPrefix controls whether the terminal/pane title is prefixed
+	// with "[<cwd-basename>]" (e.g. "[my-project] feature work"). Default true
+	// preserves the historical format; set false to show only the session
+	// title. Consumed by the tmux set-titles-string builder.
+	IncludeCwdPrefix *bool `toml:"include_cwd_prefix"`
+
+	// ShowSessionTimestamps appends a dim "Nm ago" badge to every session row.
+	// Default: false — opt-in to avoid crowding existing badges. See
+	// renderSessionItem for the timestamp source.
+	ShowSessionTimestamps bool `toml:"show_session_timestamps"`
+
+	// ShowPaneTitles shows the dim tmux pane-title (task description) suffix on
+	// every session row, not just the selected one. Default: false — opt-in to
+	// avoid crowding narrow sidebars. See renderSessionItem for the source.
+	ShowPaneTitles bool `toml:"show_pane_titles"`
 }
 
 // GetActiveFilterExcludes returns the resolved set of statuses the % filter
@@ -1848,6 +2243,15 @@ func (d DisplaySettings) GetFullRepaint() bool {
 	return d.FullRepaint
 }
 
+// GetIncludeCwdPrefix reports whether the "[<cwd-basename>]" title prefix is
+// shown. Defaults to true to preserve the historical title format.
+func (d DisplaySettings) GetIncludeCwdPrefix() bool {
+	if d.IncludeCwdPrefix == nil {
+		return true
+	}
+	return *d.IncludeCwdPrefix
+}
+
 // Default user config (empty maps)
 var defaultUserConfig = UserConfig{
 	Tools:   make(map[string]ToolDef),
@@ -1889,11 +2293,7 @@ var (
 
 // GetUserConfigPath returns the path to the user config file
 func GetUserConfigPath() (string, error) {
-	dir, err := GetAgentDeckDir()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(dir, UserConfigFileName), nil
+	return agentpaths.EffectiveConfigPath(UserConfigFileName)
 }
 
 // LoadUserConfig loads the user configuration from TOML file.
@@ -1964,6 +2364,8 @@ func LoadUserConfig() (*UserConfig, error) {
 		config.Plugins = make(map[string]PluginDef)
 	}
 
+	normalizeUIHiddenTools(&config.UI, config.Tools)
+
 	userConfigCache = &config
 	userConfigCacheMtime = currentMtime
 	return userConfigCache, nil
@@ -1977,9 +2379,28 @@ func ReloadUserConfig() (*UserConfig, error) {
 	return LoadUserConfig()
 }
 
-// SaveUserConfig writes the config to config.toml using atomic write pattern
-// This clears the cache so next LoadUserConfig() reads fresh values
+// SaveUserConfig writes the config to config.toml using atomic write pattern.
+// This clears the cache so next LoadUserConfig() reads fresh values.
+//
+// Guarded path: it backs up the existing config.toml to config.toml.bak before
+// overwriting (S2) and REFUSES a save that would drop a populated [mcps] or
+// [groups] section to empty (S3, ErrRefusingConfigSectionDrop). Both are
+// data-loss safeguards from the 2026-06-04 incident. Callers that genuinely
+// intend to clear all MCPs/groups must use SaveUserConfigWithIntent.
 func SaveUserConfig(config *UserConfig) error {
+	return SaveUserConfigWithIntent(config, false)
+}
+
+// SaveUserConfigWithIntent is SaveUserConfig with an explicit opt-out of the S3
+// section-drop guard. Pass allowSectionDrop=true only when the user genuinely
+// wants to clear all [mcps] or [groups] entries; the default false path refuses
+// such a save (ErrRefusingConfigSectionDrop) because zeroing a populated section
+// is almost always a partially-built-config bug, not deliberate intent.
+//
+// The S2 config.toml.bak backup is taken on BOTH paths: the atomic rename
+// prevents torn writes but not semantic clobbering, so the .bak is the recovery
+// net regardless of intent.
+func SaveUserConfigWithIntent(config *UserConfig, allowSectionDrop bool) error {
 	configPath, err := GetUserConfigPath()
 	if err != nil {
 		return fmt.Errorf("failed to get config path: %w", err)
@@ -2009,30 +2430,41 @@ func SaveUserConfig(config *UserConfig) error {
 	}
 
 	// ═══════════════════════════════════════════════════════════════════
-	// ATOMIC WRITE PATTERN: Prevents data corruption on crash/power loss
-	// 1. Write to temporary file with 0600 permissions
-	// 2. fsync the temp file (ensures data reaches disk)
-	// 3. Atomic rename temp to final
+	// S3 data-loss safeguard (2026-06-04 incident): refuse a save that would
+	// drop a populated [mcps] or [groups] section to empty. We round-trip the
+	// content we are ABOUT to write (decode buf) and compare its section counts
+	// against what is currently on disk. The guard fires ONLY when disk had
+	// entries and the new content has zero — a normal edit that loads the
+	// config, removes ONE group, and saves still carries the rest of the map,
+	// so its count stays > 0 and is unaffected. allowSectionDrop=true (the
+	// explicit-intent path) skips the refusal but still backs up.
+	// ═══════════════════════════════════════════════════════════════════
+	if !allowSectionDrop {
+		if err := guardConfigSectionDrop(configPath, buf.Bytes()); err != nil {
+			return err
+		}
+	}
+
+	// S2 data-loss safeguard: copy the existing config.toml to config.toml.bak
+	// BEFORE the atomic rename. Atomic rename prevents torn writes but NOT
+	// semantic clobbering (e.g. saving a config missing whole sections); the
+	// .bak is the recovery net. Best-effort: a failed backup is logged, never
+	// fatal — the caller asked to save, and the insurance copy must not become
+	// a new failure mode. No-op when config.toml does not exist yet.
+	if err := backupConfigFile(configPath); err != nil {
+		slog.Warn("session: pre-save config backup failed (continuing with save)",
+			"path", configPath, "err", err)
+	}
+
+	// ═══════════════════════════════════════════════════════════════════
+	// ATOMIC + DURABLE WRITE: Prevents data corruption on crash/power loss
+	// and preserves a dotfiles-managed config.toml symlink. The temp file is
+	// fsync'd before the rename and the parent dir is fsync'd after (see
+	// internal/atomicfile.WriteFileDurable). A symlinked config.toml is written
+	// through to its real target rather than replaced with a regular file.
 	// ═══════════════════════════════════════════════════════════════════
 
-	tmpPath := configPath + ".tmp"
-
-	// Step 1: Write to temporary file (0600 = owner read/write only for security)
-	if err := os.WriteFile(tmpPath, buf.Bytes(), 0o600); err != nil {
-		return fmt.Errorf("failed to write temp file: %w", err)
-	}
-
-	// Step 2: fsync the temp file to ensure data reaches disk before rename
-	if err := syncConfigFile(tmpPath); err != nil {
-		// Log but don't fail - atomic rename still provides some safety
-		// Note: We don't have access to log package here, so we just continue
-		_ = err
-	}
-
-	// Step 3: Atomic rename (this is atomic on POSIX systems)
-	if err := os.Rename(tmpPath, configPath); err != nil {
-		// Clean up temp file on failure
-		os.Remove(tmpPath)
+	if err := atomicfile.WriteFileDurable(configPath, buf.Bytes(), 0o600); err != nil {
 		return fmt.Errorf("failed to finalize config save: %w", err)
 	}
 
@@ -2042,14 +2474,62 @@ func SaveUserConfig(config *UserConfig) error {
 	return nil
 }
 
-// syncConfigFile calls fsync on a file to ensure data is written to disk
-func syncConfigFile(path string) error {
-	f, err := os.Open(path)
+// guardConfigSectionDrop implements the S3 refusal: it decodes the on-disk
+// config and the about-to-be-written content, and returns
+// ErrRefusingConfigSectionDrop if either [mcps] or [groups] had entries on disk
+// but would become empty. A missing/unparseable on-disk file means there is
+// nothing populated to protect, so the guard passes (first write, or a file the
+// loader would have replaced with defaults anyway).
+func guardConfigSectionDrop(configPath string, newContent []byte) error {
+	// Nothing on disk yet → nothing to lose.
+	if _, statErr := os.Stat(configPath); os.IsNotExist(statErr) {
+		return nil
+	}
+
+	var onDisk UserConfig
+	if _, err := toml.DecodeFile(configPath, &onDisk); err != nil {
+		// Can't read the old file to know what's populated; don't block the
+		// save (the loader treats an unparseable file as defaults anyway).
+		return nil
+	}
+
+	var next UserConfig
+	if _, err := toml.Decode(string(newContent), &next); err != nil {
+		// We just encoded this from a *UserConfig, so a decode failure is
+		// unexpected — surface it rather than silently writing.
+		return fmt.Errorf("session: failed to round-trip new config for section-drop guard: %w", err)
+	}
+
+	if len(onDisk.MCPs) > 0 && len(next.MCPs) == 0 {
+		return fmt.Errorf("%w: [mcps] had %d entries on disk, new config has none", ErrRefusingConfigSectionDrop, len(onDisk.MCPs))
+	}
+	if len(onDisk.Groups) > 0 && len(next.Groups) == 0 {
+		return fmt.Errorf("%w: [groups] had %d entries on disk, new config has none", ErrRefusingConfigSectionDrop, len(onDisk.Groups))
+	}
+	return nil
+}
+
+// backupConfigFile copies config.toml to config.toml.bak (write-temp + rename
+// so the .bak is never torn). No-op when the source does not exist yet (first
+// save). Part of the S2 data-loss safeguard.
+func backupConfigFile(configPath string) error {
+	src, err := os.ReadFile(configPath)
 	if err != nil {
+		if os.IsNotExist(err) {
+			return nil // nothing to back up yet
+		}
 		return err
 	}
-	defer f.Close()
-	return f.Sync()
+	bak := configPath + ".bak"
+	tmp := bak + ".tmp"
+	if err := os.WriteFile(tmp, src, 0o600); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, bak); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 // ClearUserConfigCache clears the cached user config, allowing tests to reset state.
@@ -2077,6 +2557,18 @@ func IsClaudeCompatible(toolName string) bool {
 	return false
 }
 
+// UsesClaudeDeliveryVerify reports whether the Claude-tuned post-send delivery
+// verification (issue #876) should be applied for this tool. That verify keys
+// off Claude-specific TUI signals — an "active" status transition, the composer
+// glyph, and unsent-paste markers. Only Claude-compatible tools surface those;
+// every other tool (codex #1205, codewhale/deepseek #1238, gemini #876,
+// opencode, and custom CLIs) would false-negative the verify and be reported as
+// a silent drop despite successful delivery. Those tools therefore skip the
+// Claude-tuned verify. This is the general superset of #1228's codex-only skip.
+func UsesClaudeDeliveryVerify(toolName string) bool {
+	return IsClaudeCompatible(toolName)
+}
+
 // IsCodexCompatible returns true if the tool is "codex" or a custom tool
 // whose underlying command is "codex". Use this for capability gates
 // where custom tools wrapping Codex should get full Codex functionality
@@ -2087,6 +2579,44 @@ func IsCodexCompatible(toolName string) bool {
 	}
 	if def := GetToolDef(toolName); def != nil {
 		return strings.EqualFold(strings.TrimSpace(def.CompatibleWith), "codex") || isCodexCommand(def.Command)
+	}
+	return false
+}
+
+// isShellBinary returns true if cmd is a known interactive shell process name.
+// Used to distinguish "shell at a prompt" from "shell running a foreground command"
+// (e.g. "node" from "yarn dev", "java" from "mvn spring-boot:run").
+func isShellBinary(cmd string) bool {
+	switch strings.ToLower(cmd) {
+	case "bash", "zsh", "sh", "fish", "dash", "ksh", "tcsh", "csh", "nu", "nushell", "pwsh", "powershell":
+		return true
+	}
+	return false
+}
+
+// isInteractiveForegroundProgram returns true for foreground commands that are
+// interactive and effectively waiting for the user rather than doing background
+// work: editors, pagers, system monitors, remote shells, and terminal
+// multiplexers. A shell session sitting in one of these should NOT show a
+// "running" indicator (an idle ssh prompt or an open editor is not busy work).
+//
+// REPLs and interpreters (node, python, ruby, …) are deliberately NOT listed:
+// they share a process name with the long-running servers this feature targets
+// (`yarn dev` runs as "node", `python manage.py runserver` runs as "python"),
+// so denylisting them would defeat the primary use case. The rare REPL false
+// positive is the lesser evil versus failing to flag a running dev server.
+func isInteractiveForegroundProgram(cmd string) bool {
+	switch strings.ToLower(cmd) {
+	case
+		// remote shells / terminal multiplexers
+		"ssh", "mosh", "mosh-client", "et", "tmux", "screen", "zellij",
+		// editors
+		"vi", "vim", "nvim", "nano", "emacs", "emacsclient", "helix", "hx", "micro", "kak",
+		// pagers / viewers
+		"less", "more", "most", "man", "bat",
+		// system monitors
+		"top", "htop", "btop", "btm", "glances", "atop":
+		return true
 	}
 	return false
 }
@@ -2159,37 +2689,18 @@ func isShellEnvAssignment(token string) bool {
 // GetToolDef returns a tool definition from user config
 // Returns nil if tool is not defined
 func GetToolDef(toolName string) *ToolDef {
-	config, err := LoadUserConfig()
-	if err != nil || config == nil {
-		return nil
-	}
-
-	if def, ok := config.Tools[toolName]; ok {
-		return &def
-	}
-	return nil
+	// Delegates to the registry's custom-tool lookup. GetCustom returns nil for
+	// built-in names (their shadowing custom entries are rejected at registry
+	// init), preserving this function's long-standing "nil for built-ins"
+	// contract that callers branch on. See Registry.GetCustom / Registry.Get.
+	return currentRegistry().GetCustom(toolName)
 }
 
 // GetCustomToolNames returns sorted custom tool names from config.toml,
 // excluding names that shadow built-in tools (claude, gemini, opencode, codex, pi, shell, cursor, aider).
 // Returns nil if no custom tools are configured.
 func GetCustomToolNames() []string {
-	config, err := LoadUserConfig()
-	if err != nil || config == nil || len(config.Tools) == 0 {
-		return nil
-	}
-
-	var names []string
-	for name := range config.Tools {
-		if !isBuiltinToolName(name) {
-			names = append(names, name)
-		}
-	}
-	if len(names) == 0 {
-		return nil
-	}
-	sort.Strings(names)
-	return names
+	return currentRegistry().CustomNames()
 }
 
 // GetToolCommand returns the configured command override for a builtin tool,
@@ -2229,12 +2740,7 @@ func GetToolCommand(toolName string) string {
 }
 
 func isBuiltinToolName(toolName string) bool {
-	switch toolName {
-	case "claude", "gemini", "opencode", "codex", "copilot", "crush", "cursor", "hermes", "pi", "shell", "aider":
-		return true
-	default:
-		return false
-	}
+	return currentRegistry().IsBuiltin(toolName)
 }
 
 // GetToolIcon returns the icon for a tool (custom or built-in)
@@ -2762,9 +3268,20 @@ func CreateExampleConfig() error {
 # restart = "R"
 # detach = "ctrl+d"   # PTY-attach detach key, default ctrl+q (issue #434).
                       # Alias [tmux].detach_key exists; [hotkeys].detach wins.
+# In-attach session switcher (cycle sessions without first detaching to the list):
+# switch_session = "ctrl+s"   # opens the switcher while attached. Tap again to cycle
+#                             # forward (Shift+Tab / Up to go back); it auto-attaches
+#                             # ~1s after you stop, Enter attaches now, Esc cancels.
+#                             # Must be a "ctrl+<letter>" chord.
 
-# Attach-return project path sync (optional)
+# Instance behavior (optional)
 # [instances]
+# allow_multiple = false   # Default: one agent-deck per profile (single-instance gate).
+                           # A second instance is rejected to prevent concurrent
+                           # reviver/restart loops from tearing down each other's live
+                           # sessions (issue #1246). Set true to opt in to multiple
+                           # instances (e.g. PC + phone-over-SSH); the first instance
+                           # (primary) owns the notification bar.
 # follow_cwd_on_attach = true
 
 # Preview settings (optional)

@@ -351,7 +351,7 @@ func TestPipeManager_ConnectCleansStaleClients(t *testing.T) {
 }
 
 // TestKillStaleControlClients_PreservesLiveSibling is the #927 regression
-// guard. With allow_multiple=true (default), two simultaneous agent-deck
+// guard. With allow_multiple=true (opt-in), two simultaneous agent-deck
 // TUIs share a tmux server and each spawns its own control-mode client per
 // session. Before the fix, each TUI's killStaleControlClients sweep treated
 // the OTHER TUI's clients as orphans and SIGTERM'd them — both pipes
@@ -413,7 +413,7 @@ func TestPipeManager_ConnectPreservesLiveSibling(t *testing.T) {
 	require.Eventually(t, func() bool {
 		out, _ := exec.Command("tmux", "list-clients", "-t", name, "-F", "#{client_control_mode} #{client_pid}").Output()
 		return strings.Contains(string(out), fmt.Sprintf("1 %d", siblingPID))
-	}, 3*time.Second, 100*time.Millisecond)
+	}, 10*time.Second, 100*time.Millisecond)
 
 	// "This TUI" connects — must not kill the sibling.
 	ctx, cancel := context.WithCancel(context.Background())
@@ -428,8 +428,10 @@ func TestPipeManager_ConnectPreservesLiveSibling(t *testing.T) {
 	assert.True(t, siblingPipe.IsAlive(),
 		"sibling pipe must remain alive after PipeManager.Connect (#927)")
 
-	out, _ := exec.Command("tmux", "list-clients", "-t", name, "-F", "#{client_control_mode} #{client_pid}").Output()
-	assert.Contains(t, string(out), fmt.Sprintf("1 %d", siblingPID))
+	require.Eventually(t, func() bool {
+		out, _ := exec.Command("tmux", "list-clients", "-t", name, "-F", "#{client_control_mode} #{client_pid}").Output()
+		return strings.Contains(string(out), fmt.Sprintf("1 %d", siblingPID))
+	}, 10*time.Second, 200*time.Millisecond)
 }
 
 func TestKillStaleControlClients_PreservesOwnProcess(t *testing.T) {

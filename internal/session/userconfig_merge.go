@@ -87,6 +87,15 @@ func MergePanelConfigOntoDisk(panel *UserConfig) (*UserConfig, error) {
 		merged.Preview.NotesOutputSplit = panel.Preview.NotesOutputSplit
 	}
 
+	// ── Display subset (panel manages ShowSessionTimestamps; FullRepaint
+	//    and filter prefs stay from disk) ───────────────────────────────
+	merged.Display.ShowSessionTimestamps = panel.Display.ShowSessionTimestamps
+	merged.Display.ShowPaneTitles = panel.Display.ShowPaneTitles
+
+	// ── UI subset (panel manages show_only_installed_tools; hidden_tools
+	//    is edited via ToolVisibilityPanel) ─────────────────────────────
+	merged.UI.ShowOnlyInstalledTools = panel.UI.ShowOnlyInstalledTools
+
 	// ── SystemStats subset ─────────────────────────────────────────────
 	if panel.SystemStats.Enabled != nil {
 		merged.SystemStats.Enabled = panel.SystemStats.Enabled

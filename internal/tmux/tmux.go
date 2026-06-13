@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -23,6 +24,7 @@ import (
 	"golang.org/x/sync/singleflight"
 
 	"github.com/BurntSushi/toml"
+	"github.com/asheshgoplani/agent-deck/internal/agentpaths"
 	"github.com/asheshgoplani/agent-deck/internal/logging"
 	"github.com/asheshgoplani/agent-deck/internal/platform"
 	dark "github.com/thiagokokada/dark-mode-go"
@@ -53,10 +55,9 @@ func resolvedAgentDeckTheme() string {
 	type cfg struct {
 		Theme string `toml:"theme"`
 	}
-	home, err := os.UserHomeDir()
-	if err == nil {
+	if configPath, err := agentpaths.EffectiveConfigPath("config.toml"); err == nil {
 		var c cfg
-		if _, err := toml.DecodeFile(filepath.Join(home, ".agent-deck", "config.toml"), &c); err == nil {
+		if _, err := toml.DecodeFile(configPath, &c); err == nil {
 			switch c.Theme {
 			case "light", "dark":
 				return c.Theme
@@ -115,7 +116,7 @@ func currentTmuxThemeStyle() tmuxThemeStyle {
 }
 
 func (s *Session) themedStatusRight(themeStyle tmuxThemeStyle) string {
-	return fmt.Sprintf("#[fg=%s]ctrl+q detach#[default] │ 📁 %s | %s ", themeStyle.hintColor, s.DisplayName, s.projectDisplayName())
+	return fmt.Sprintf("#[fg=%s]ctrl+q detach#[default] · #[fg=%s]ctrl+s switch#[default] │ 📁 %s | %s ", themeStyle.hintColor, themeStyle.hintColor, s.DisplayName, s.projectDisplayName())
 }
 
 func (s *Session) projectDisplayName() string {
@@ -678,6 +679,8 @@ type StateTracker struct {
 	activityCheckStart  time.Time // When we started tracking for sustained activity
 	activityChangeCount int       // How many timestamp changes seen in current window
 
+	realActivityConfirmed bool // true once a real busy spike has been observed (not just tracker init)
+
 	// Spinner activity tracking: grace period between tool calls
 	spinnerTracker *SpinnerActivityTracker
 }
@@ -822,6 +825,20 @@ type Session struct {
 	// process instead of sending it via SendKeysAndEnter after session creation.
 	// Sandbox sessions enable this so pane-dead detection can restart exited tools.
 	RunCommandAsInitialProcess bool
+
+	// VimMode guarantees the inner agent's input composer is in insert mode
+	// before any text/Enter is delivered. When the inner tool (Claude Code with
+	// `"editorMode": "vim"`) leaves its prompt in vim NORMAL mode — the default
+	// state after a turn finishes — a bracketed paste still lands in the input
+	// widget, but the trailing Enter is interpreted as a navigation keystroke
+	// instead of submit, so the message is typed but never sent (issue #1264).
+	// When true, SendEnter and SendKeysAndEnter prepend an Escape + `i` sequence
+	// so the prompt is guaranteed to be in insert mode. The sequence is
+	// idempotent: Escape always lands in normal mode and `i` always enters
+	// insert, so it is safe even when the prompt is already in insert mode.
+	// Off by default (zero value) — non-vim sessions and other tools are
+	// unaffected. Populated at session-creation time from [claude].vim_mode.
+	VimMode bool
 
 	// LaunchInUserScope starts the tmux server through systemd-run --user --scope
 	// so the server is owned by the user's systemd manager instead of the current
@@ -1306,23 +1323,18 @@ func (s *Session) SetClearOnRestart(clear bool) {
 }
 
 // LogFile returns the path to this session's log file
-// Logs are stored in ~/.agent-deck/logs/<session-name>.log
+// Logs are stored under the XDG data directory, falling back to legacy logs.
 func (s *Session) LogFile() string {
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
-		homeDir = "/tmp"
-	}
-	logDir := filepath.Join(homeDir, ".agent-deck", "logs")
-	return filepath.Join(logDir, s.Name+".log")
+	return filepath.Join(LogDir(), s.Name+".log")
 }
 
 // LogDir returns the directory containing all session logs
 func LogDir() string {
-	homeDir, err := os.UserHomeDir()
+	logDir, err := agentpaths.EffectiveDataPath("logs", "logs")
 	if err != nil {
-		homeDir = "/tmp"
+		return filepath.Join(os.TempDir(), "agent-deck", "logs")
 	}
-	return filepath.Join(homeDir, ".agent-deck", "logs")
+	return logDir
 }
 
 // NewSession creates a new Session instance with a unique name
@@ -1922,6 +1934,7 @@ func (s *Session) Start(command string) error {
 	// Note: history-limit is NOT set here — the user's tmux.conf value is respected.
 	// Users can override via [tmux] options = { "history-limit" = "50000" } in config.toml.
 	// - extended-keys on: Forward Shift+Enter and other modified keys to apps (tmux 3.2+)
+	// - extended-keys-format csi-u: Deliver them as ESC[13;2u (kitty form Claude Code reads), not xterm ESC[27;2;13~ (tmux 3.4+)
 	// - terminal-features hyperlinks+extkeys: Track hyperlinks and enable extended key reporting (tmux 3.4+, server-wide)
 	//
 	// Note: remain-on-exit is NOT set here — it is only enabled for sandbox sessions
@@ -1946,6 +1959,11 @@ func (s *Session) Start(command string) error {
 		"set-option", "-t", s.Name, "set-clipboard", "on", ";",
 		"set-option", "-t", s.Name, "escape-time", "10", ";",
 		"set", "-sq", "extended-keys", "on", ";",
+		// csi-u so modified keys reach the pane as ESC[13;2u (the kitty
+		// keyboard-protocol form Claude Code reads) rather than the default
+		// xterm modifyOtherKeys ESC[27;2;13~, which Claude Code ignores —
+		// otherwise Shift+Enter collapses to a bare Enter and submits.
+		"set", "-sq", "extended-keys-format", "csi-u", ";",
 		"set", "-asq", "terminal-features", ",*:hyperlinks:extkeys")
 	// Multi-client size negotiation. Web's xterm.js connects via a tmux -C
 	// control client (controlpipe.go) at the same time as native `tmux attach`
@@ -2039,6 +2057,14 @@ func (s *Session) Start(command string) error {
 	return nil
 }
 
+// hasSessionProbeTimeout bounds a `tmux has-session` existence probe. A tmux
+// server that is briefly busy (e.g. tearing down another session) can make the
+// probe hang; rather than block a status poll — or, worse, mistake the stall
+// for a dead session — we cap it and treat a timeout as indeterminate (assume
+// the session still exists and let a later poll resolve it). Overridable in
+// tests.
+var hasSessionProbeTimeout = 2 * time.Second
+
 // Exists checks if the tmux session exists
 // Uses cached session list when available (refreshed by RefreshExistingSessions)
 // Falls back to direct tmux call if cache is stale
@@ -2061,9 +2087,18 @@ func (s *Session) Exists() bool {
 	}
 
 	// Cache is stale (or skipped for an isolated socket): fall back to a
-	// direct tmux check on the session's own socket.
-	cmd := s.tmuxCmd("has-session", "-t", s.Name)
-	return cmd.Run() == nil
+	// direct tmux check on the session's own socket. Bound it: a server that
+	// is briefly busy can make the probe hang, and a probe that never answers
+	// is indeterminate — assume the session still exists rather than reporting
+	// it dead (which would flip a live session to StatusError). Only a probe
+	// that actually completes with a non-success status means "gone".
+	ctx, cancel := context.WithTimeout(context.Background(), hasSessionProbeTimeout)
+	defer cancel()
+	err := s.tmuxCmdContext(ctx, "has-session", "-t", s.Name).Run()
+	if ctx.Err() == context.DeadlineExceeded {
+		return true // probe timed out: indeterminate, assume still alive
+	}
+	return err == nil
 }
 
 // IsPaneDead returns true if the session's pane process has exited.
@@ -2102,7 +2137,7 @@ func (s *Session) buildStatusBarArgs() []string {
 		{"status-style", themeStyle.statusStyle},
 		{"status-left-length", "120"},
 		{"status-right", rightStatus},
-		{"status-right-length", "80"},
+		{"status-right-length", "100"},
 	}
 
 	var args []string
@@ -2122,6 +2157,19 @@ func (s *Session) buildStatusBarArgs() []string {
 	return args
 }
 
+// hideCwdPrefixInTitle, when true, drops the "[<project>] " prefix from the
+// terminal title (set-titles-string). Default false preserves the historical
+// "[<project>] <name>" format. Set once at startup from the user config's
+// [display] include_cwd_prefix via SetHideCwdPrefixInTitle.
+var hideCwdPrefixInTitle atomic.Bool
+
+// SetHideCwdPrefixInTitle configures whether the terminal title includes the
+// "[<cwd-basename>]" prefix. Pass true to drop it (display.include_cwd_prefix =
+// false). Safe to call concurrently; intended to run once at startup.
+func SetHideCwdPrefixInTitle(hide bool) {
+	hideCwdPrefixInTitle.Store(hide)
+}
+
 // buildTerminalTitleArgs returns the tmux command args for configuring the outer
 // terminal title shown by clients such as iTerm2. Session metadata user options
 // are always refreshed so custom title formats can reuse them.
@@ -2139,7 +2187,11 @@ func (s *Session) buildTerminalTitleArgs() []string {
 		defaults = append(defaults, option{key: "set-titles", value: "on"})
 	}
 	if _, overridden := s.OptionOverrides["set-titles-string"]; !overridden {
-		defaults = append(defaults, option{key: "set-titles-string", value: "[#{@agentdeck_project_name}] #{@agentdeck_display_name}"})
+		titleStr := "[#{@agentdeck_project_name}] #{@agentdeck_display_name}"
+		if hideCwdPrefixInTitle.Load() {
+			titleStr = "#{@agentdeck_display_name}"
+		}
+		defaults = append(defaults, option{key: "set-titles-string", value: titleStr})
 	}
 
 	args := make([]string, 0, len(defaults)*6)
@@ -2212,6 +2264,7 @@ func (s *Session) EnableMouseMode() error {
 	// - set-clipboard on: OSC 52 clipboard integration (Warp, iTerm2, kitty, etc.)
 	// - allow-passthrough on: OSC 8 hyperlinks, advanced escape sequences (tmux 3.2+)
 	// - extended-keys on: Forward Shift+Enter and other modified keys to apps (tmux 3.2+)
+	// - extended-keys-format csi-u: Deliver them as ESC[13;2u (kitty form Claude Code reads), not xterm ESC[27;2;13~ (tmux 3.4+)
 	// - terminal-features hyperlinks+extkeys: Track hyperlinks and enable extended key reporting (tmux 3.4+)
 	// - escape-time 10: Fast Vim/editor responsiveness (default 500ms is too slow)
 	//
@@ -2221,6 +2274,11 @@ func (s *Session) EnableMouseMode() error {
 		"set-option", "-t", s.Name, "-q", "allow-passthrough", "on", ";",
 		"set-option", "-t", s.Name, "escape-time", "10", ";",
 		"set", "-sq", "extended-keys", "on", ";",
+		// csi-u so modified keys reach the pane as ESC[13;2u (the kitty
+		// keyboard-protocol form Claude Code reads) rather than the default
+		// xterm modifyOtherKeys ESC[27;2;13~, which Claude Code ignores —
+		// otherwise Shift+Enter collapses to a bare Enter and submits.
+		"set", "-sq", "extended-keys-format", "csi-u", ";",
 		"set", "-asq", "terminal-features", ",*:hyperlinks:extkeys")
 	// Ignore errors - all these are non-fatal enhancements
 	// Older tmux versions may not support some options
@@ -2858,6 +2916,7 @@ func (s *Session) GetStatus() (string, error) {
 			s.mu.Lock()
 			s.ensureStateTrackerLocked()
 			s.stateTracker.lastChangeTime = time.Now()
+			s.stateTracker.realActivityConfirmed = true
 			s.stateTracker.acknowledged = false
 			s.resetPromptNoBusyHoldLocked()
 			s.stateTracker.spinnerTracker.MarkBusy()
@@ -2954,6 +3013,7 @@ func (s *Session) GetStatus() (string, error) {
 			// false "waiting" detection during tool transitions.
 			if isExplicitlyBusy {
 				s.stateTracker.lastChangeTime = time.Now()
+				s.stateTracker.realActivityConfirmed = true
 				s.stateTracker.acknowledged = false
 				s.resetPromptNoBusyHoldLocked()
 				s.stateTracker.lastActivityTimestamp = currentTS
@@ -3100,6 +3160,7 @@ func (s *Session) GetStatus() (string, error) {
 					// terminal redraws, and status bar updates can cause hash changes
 					if isExplicitlyBusy {
 						s.stateTracker.lastChangeTime = now
+						s.stateTracker.realActivityConfirmed = true
 						s.stateTracker.acknowledged = false
 						s.resetPromptNoBusyHoldLocked()
 						s.stateTracker.activityCheckStart = time.Time{} // Reset window
@@ -3301,6 +3362,7 @@ func (s *Session) getStatusFallback() (string, error) {
 		defer s.mu.Unlock()
 		s.ensureStateTrackerLocked()
 		s.stateTracker.lastChangeTime = time.Now()
+		s.stateTracker.realActivityConfirmed = true
 		s.stateTracker.acknowledged = false
 		s.resetPromptNoBusyHoldLocked()
 		s.lastStableStatus = "active"
@@ -3490,6 +3552,21 @@ func (s *Session) GetLastActivityTime() time.Time {
 		return time.Time{}
 	}
 	return s.stateTracker.lastChangeTime
+}
+
+// LastObservedActivity returns the last time a real busy spike was
+// observed for this tracker, plus a bool reporting whether such a spike
+// has ever happened in this tracker's lifetime. When the bool is false
+// the time is the zero value, so callers that miss the bool check still
+// get a sentinel they can detect.
+func (s *Session) LastObservedActivity() (time.Time, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.stateTracker == nil || !s.stateTracker.realActivityConfirmed {
+		return time.Time{}, false
+	}
+	return s.stateTracker.lastChangeTime, true
 }
 
 // GetWaitingSince returns when the session transitioned to waiting status
@@ -3952,22 +4029,82 @@ func (s *Session) hashContent(content string) string {
 	return hex.EncodeToString(h[:])
 }
 
+// keySenderExec is a swappable seam for the tmux subprocesses spawned by the
+// SendKeys / SendEnter / SendNamedKey key-delivery primitives. It defaults to
+// tmuxExec (the real `tmux` binary) in production; tests override it to record
+// the exact key sequence emitted without standing up a real tmux server. See
+// the vim-mode regression test in tmux_vim_mode_test.go (issue #1264).
+var keySenderExec = tmuxExec
+
 // SendKeys sends keys to the tmux session
 // Uses -l flag to treat keys as literal text, preventing tmux special key interpretation
 func (s *Session) SendKeys(keys string) error {
+	return s.sendKeysToTarget(s.Name, keys)
+}
+
+// windowTarget returns the tmux target addressing a specific window index
+// within this session (e.g. "agentdeck_foo_ab12:2"), mirroring the format used
+// by CaptureWindowFullHistory.
+func (s *Session) windowTarget(windowIndex int) string {
+	return fmt.Sprintf("%s:%d", s.Name, windowIndex)
+}
+
+// sendKeysToTarget sends literal text to an explicit tmux target — either the
+// session name (active window) or a "<session>:<windowIndex>" window target.
+// SendKeys delegates here against the active window.
+func (s *Session) sendKeysToTarget(target, keys string) error {
 	s.invalidateCache()
 	// The -l flag makes tmux treat the string as literal text, not key names
 	// This prevents issues like "Enter" being interpreted as the Enter key
 	// and provides a layer of safety against tmux special sequences
-	cmd := s.tmuxCmd("send-keys", "-l", "-t", s.Name, "--", keys)
+	cmd := keySenderExec(s.SocketName, "send-keys", "-l", "-t", target, "--", keys)
 	return cmd.Run()
 }
 
-// SendEnter sends an Enter key to the tmux session
-func (s *Session) SendEnter() error {
+// ensureInsertMode prepends an Escape + `i` sequence so a vim-mode composer
+// (Claude Code with "editorMode": "vim") is guaranteed to be in insert mode
+// before text or Enter is delivered. No-op unless VimMode is set. The sequence
+// is idempotent — Escape lands in normal mode, `i` enters insert — so it is
+// safe to call when the prompt is already in insert mode. See issue #1264.
+func (s *Session) ensureInsertMode() {
+	s.ensureInsertModeOnTarget(s.Name)
+}
+
+// ensureInsertModeOnTarget is ensureInsertMode against an explicit tmux target.
+func (s *Session) ensureInsertModeOnTarget(target string) {
+	if !s.VimMode {
+		return
+	}
+	// Escape: guarantee normal mode regardless of current state.
+	_ = keySenderExec(s.SocketName, "send-keys", "-t", target, "Escape").Run()
+	// i: enter insert mode so the following paste/Enter are taken literally.
+	_ = keySenderExec(s.SocketName, "send-keys", "-t", target, "i").Run()
+}
+
+// sendEnterRaw emits a single Enter keystroke without the vim-mode insert
+// guard. Used internally by SendKeysAndEnter, which has already guaranteed
+// insert mode before the paste — re-escaping before the trailing Enter would
+// drop the prompt back to normal mode and swallow the submit.
+func (s *Session) sendEnterRaw() error {
+	return s.sendEnterRawToTarget(s.Name)
+}
+
+// sendEnterRawToTarget is sendEnterRaw against an explicit tmux target.
+func (s *Session) sendEnterRawToTarget(target string) error {
 	s.invalidateCache()
-	cmd := s.tmuxCmd("send-keys", "-t", s.Name, "Enter")
+	cmd := keySenderExec(s.SocketName, "send-keys", "-t", target, "Enter")
 	return cmd.Run()
+}
+
+// SendEnter sends an Enter key to the tmux session. When VimMode is set it
+// first guarantees the composer is in insert mode (issue #1264) so the Enter
+// submits the message instead of being consumed as a vim normal-mode motion.
+// This covers the bare-Enter nudges the send-verify retry loop fires against a
+// detected unsent prompt (cmd/agent-deck/session_cmd.go), which would
+// otherwise all no-op in normal mode.
+func (s *Session) SendEnter() error {
+	s.ensureInsertMode()
+	return s.sendEnterRaw()
 }
 
 // OpenKeySender opens a persistent tmux control-mode client bound to this
@@ -3986,7 +4123,7 @@ func (s *Session) OpenKeySender() (KeySender, error) {
 // Backspace, arrow keys, Tab, and Ctrl-{C,D} from the TUI to the focused pane.
 func (s *Session) SendNamedKey(key string) error {
 	s.invalidateCache()
-	cmd := s.tmuxCmd("send-keys", "-t", s.Name, key)
+	cmd := keySenderExec(s.SocketName, "send-keys", "-t", s.Name, key)
 	return cmd.Run()
 }
 
@@ -3996,32 +4133,58 @@ func (s *Session) SendNamedKey(key string) error {
 // Without the delay, Enter arrives in the same PTY buffer as the paste-end
 // marker and gets swallowed by async TUI frameworks (Ink/Node.js, curses).
 func (s *Session) SendKeysAndEnter(keys string) error {
+	return s.sendKeysAndEnterToTarget(s.Name, keys)
+}
+
+// SendKeysAndEnterToWindow is SendKeysAndEnter aimed at a specific tmux window
+// index rather than the session's active window. Quick-approve (#1369) uses it
+// to deliver "1"+Enter to the exact window showing a Claude prompt, which is
+// often not the active one in a multi-window session.
+func (s *Session) SendKeysAndEnterToWindow(windowIndex int, keys string) error {
+	return s.sendKeysAndEnterToTarget(s.windowTarget(windowIndex), keys)
+}
+
+// sendKeysAndEnterToTarget is the shared implementation behind SendKeysAndEnter
+// (active window) and SendKeysAndEnterToWindow (explicit window).
+func (s *Session) sendKeysAndEnterToTarget(target, keys string) error {
 	s.invalidateCache()
+	// Guarantee the composer is in insert mode BEFORE the paste so a vim
+	// normal-mode prompt doesn't interpret the message body as motion/command
+	// keystrokes (issue #1264). No-op unless VimMode is set.
+	s.ensureInsertModeOnTarget(target)
 	// Use chunked sending for large messages to avoid tmux buffer limits
-	if err := s.SendKeysChunked(keys); err != nil {
+	if err := s.sendKeysChunkedToTarget(target, keys); err != nil {
 		return err
 	}
 	// Delay for TUI apps (Ink, curses) to finish processing bracketed paste
 	// before Enter arrives. Without this, tmux 3.2+ paste sequences cause
 	// the immediately-following Enter to be swallowed by the paste handler.
 	time.Sleep(100 * time.Millisecond)
-	return s.SendEnter()
+	// sendEnterRaw (not SendEnter): we already guaranteed insert mode above and
+	// the paste keeps us in insert; re-escaping here would drop back to normal
+	// mode and swallow the submit.
+	return s.sendEnterRawToTarget(target)
 }
 
 // SendKeysChunked sends large content to the tmux session in chunks to avoid
 // tmux/OS buffer limits. Content ≤4KB is sent directly via SendKeys.
 // Larger content is split at newline boundaries with a short delay between chunks.
 func (s *Session) SendKeysChunked(content string) error {
+	return s.sendKeysChunkedToTarget(s.Name, content)
+}
+
+// sendKeysChunkedToTarget is SendKeysChunked against an explicit tmux target.
+func (s *Session) sendKeysChunkedToTarget(target, content string) error {
 	const chunkSize = 4096
 	const chunkDelay = 50 * time.Millisecond
 
 	if len(content) <= chunkSize {
-		return s.SendKeys(content)
+		return s.sendKeysToTarget(target, content)
 	}
 
 	chunks := splitIntoChunks(content, chunkSize)
 	for i, chunk := range chunks {
-		if err := s.SendKeys(chunk); err != nil {
+		if err := s.sendKeysToTarget(target, chunk); err != nil {
 			return fmt.Errorf("failed to send chunk %d/%d: %w", i+1, len(chunks), err)
 		}
 		if i < len(chunks)-1 {
@@ -4664,26 +4827,60 @@ func BindSwitchKeyWithAck(key, targetSession, sessionID string) error {
 		return BindSwitchKey(key, targetSession)
 	}
 
-	// Create a compound command that:
-	// 1. Writes the session ID to a signal file (for agent-deck to acknowledge)
-	// 2. Switches to the target session
-	//
-	// The inner `tmux switch-client` runs inside the tmux server that fired
-	// the run-shell hook, so it targets the correct socket automatically —
-	// no need to thread -L through the shell string.
-	script := fmt.Sprintf("echo '%s' > '%s' && tmux switch-client -t '%s'",
-		sessionID, signalFile, targetSession)
+	// Ensure the signal directory exists at bind time as defense-in-depth.
+	// On the XDG layout the data dir (~/.local/share/agent-deck) may not exist
+	// yet, unlike the legacy ~/.agent-deck which was always present.
+	_ = os.MkdirAll(filepath.Dir(signalFile), 0o700)
+
+	script := buildAckSwitchScript(signalFile, sessionID, targetSession)
 	cmd := tmuxExec(DefaultSocketName(), "bind-key", key, "run-shell", script)
 	return cmd.Run()
 }
 
+// buildAckSwitchScript builds the run-shell command bound to a quick-switch key.
+//
+// It must:
+//  1. Ensure the signal directory exists. On the XDG layout the data dir
+//     (~/.local/share/agent-deck) may not exist when the key fires, unlike the
+//     legacy ~/.agent-deck which was always present. Without this mkdir the
+//     echo below fails and the `&&` short-circuits, so `tmux switch-client`
+//     never runs and the user sees "...returned 1" with no switch (#1327).
+//  2. Write the session ID to the signal file (for agent-deck to acknowledge).
+//  3. Switch to the target session.
+//
+// The inner `tmux switch-client` runs inside the tmux server that fired the
+// run-shell hook, so it targets the correct socket automatically — no need to
+// thread -L through the shell string.
+//
+// Every interpolated value is shell-escaped via shellescape.Quote. targetSession
+// derives from the user-controlled session title, so raw single-quote wrapping
+// ('%s') would break — or be exploited — by a title containing a quote, space,
+// or shell metacharacter. The dir is created 0700 (matching the bind-time
+// os.MkdirAll) so the ack-signal dir/file is not exposed to other local users.
+func buildAckSwitchScript(signalFile, sessionID, targetSession string) string {
+	return fmt.Sprintf("mkdir -p -m 700 %s && echo %s > %s && tmux switch-client -t %s",
+		shellescape.Quote(filepath.Dir(signalFile)),
+		shellescape.Quote(sessionID),
+		shellescape.Quote(signalFile),
+		shellescape.Quote(targetSession))
+}
+
+const ackSignalLegacyMarker = ".ack-signal-legacy"
+
 // GetAckSignalPath returns the path to the acknowledgment signal file
 func GetAckSignalPath() (string, error) {
-	homeDir, err := os.UserHomeDir()
+	return agentpaths.EffectiveDataPath("ack-signal", "ack-signal", ackSignalLegacyMarker)
+}
+
+func preserveLegacyAckSignalPath(signalFile string) {
+	legacyDir, err := agentpaths.LegacyDir()
 	if err != nil {
-		return "", err
+		return
 	}
-	return filepath.Join(homeDir, ".agent-deck", "ack-signal"), nil
+	if filepath.Clean(signalFile) != filepath.Join(legacyDir, "ack-signal") {
+		return
+	}
+	_ = os.WriteFile(filepath.Join(legacyDir, ackSignalLegacyMarker), []byte{}, 0o600)
 }
 
 // ReadAndClearAckSignal reads the session ID from the signal file and deletes it.
@@ -4700,6 +4897,7 @@ func ReadAndClearAckSignal() string {
 	}
 
 	// Delete the file immediately after reading
+	preserveLegacyAckSignalPath(signalFile)
 	_ = os.Remove(signalFile)
 
 	return strings.TrimSpace(string(data))

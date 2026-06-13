@@ -22,6 +22,7 @@ const (
 	SettingClaudeConfigDir
 	SettingGeminiYoloMode
 	SettingCodexYoloMode
+	SettingHermesYoloMode
 	SettingCheckForUpdates
 	SettingAutoUpdate
 	SettingLogMaxSize
@@ -44,10 +45,15 @@ const (
 	SettingStatsShowNetwork
 	SettingStatsShowGPU
 	SettingStatsShowLoad
+	SettingSyncTitle
+	SettingShowSessionTimestamps
+	SettingShowPaneTitles
+	SettingShowOnlyInstalledTools
+	SettingVisibleTools
 )
 
 // Total number of navigable settings.
-const settingsCount = 28
+const settingsCount = 34
 
 // SettingsPanel displays and edits user configuration
 type SettingsPanel struct {
@@ -70,6 +76,7 @@ type SettingsPanel struct {
 	claudeConfigIsScope bool // true = profile override, false = global [claude]
 	geminiYoloMode      bool
 	codexYoloMode       bool
+	hermesYoloMode      bool
 	checkForUpdates     bool
 	autoUpdate          bool
 	logMaxSizeMB        int
@@ -81,7 +88,8 @@ type SettingsPanel struct {
 	showOutput          bool
 	showAnalytics       bool
 	showNotes           bool
-	notesOutputSplit    int // percentage 10-90 (displayed as %, stored as 0.10-0.90)
+	syncTitle           bool // global: let the agent rename the session (off = keep your title)
+	notesOutputSplit    int  // percentage 10-90 (displayed as %, stored as 0.10-0.90)
 	maintenanceEnabled  bool
 	statsEnabled        bool
 	statsRefreshSecs    int
@@ -92,6 +100,11 @@ type SettingsPanel struct {
 	statsShowNetwork    bool
 	statsShowGPU        bool
 	statsShowLoad       bool
+
+	showSessionTimestamps  bool
+	showPaneTitles         bool
+	showOnlyInstalledTools bool
+	pendingToolVisibility  bool
 
 	// Text input state
 	editingText bool
@@ -142,6 +155,7 @@ func NewSettingsPanel() *SettingsPanel {
 		recentDays:          90,
 		showOutput:          true,  // Default: output ON (shows launch animation)
 		showAnalytics:       false, // Default: analytics OFF (opt-in)
+		syncTitle:           true,  // Default: title sync ON (matches GetSyncTitle default)
 		notesOutputSplit:    33,    // Default: 33%
 		statsEnabled:        true,  // Default: stats ON
 		statsRefreshSecs:    5,     // Default: 5 seconds
@@ -250,6 +264,9 @@ func (s *SettingsPanel) LoadConfig(config *session.UserConfig) {
 	// Codex settings
 	s.codexYoloMode = config.Codex.YoloMode
 
+	// Hermes settings
+	s.hermesYoloMode = config.Hermes.YoloMode
+
 	// Update settings
 	s.checkForUpdates = config.Updates.CheckEnabled
 	s.autoUpdate = config.Updates.AutoUpdate
@@ -283,6 +300,9 @@ func (s *SettingsPanel) LoadConfig(config *session.UserConfig) {
 	s.showOutput = config.GetShowOutput()
 	s.showAnalytics = config.GetShowAnalytics()
 	s.showNotes = config.GetShowNotes()
+
+	// Session settings
+	s.syncTitle = config.GetSyncTitle()
 	split := config.Preview.GetNotesOutputSplit()
 	s.notesOutputSplit = int(split * 100)
 	if s.notesOutputSplit < 10 {
@@ -314,6 +334,13 @@ func (s *SettingsPanel) LoadConfig(config *session.UserConfig) {
 	s.statsShowNetwork = showSet["network"]
 	s.statsShowGPU = showSet["gpu"]
 	s.statsShowLoad = showSet["load"]
+
+	// Display settings
+	s.showSessionTimestamps = config.Display.ShowSessionTimestamps
+	s.showPaneTitles = config.Display.ShowPaneTitles
+
+	// UI tool picker settings
+	s.showOnlyInstalledTools = config.UI.ShowOnlyInstalledTools
 }
 
 func (s *SettingsPanel) buildToolLists(config *session.UserConfig) {
@@ -324,7 +351,7 @@ func (s *SettingsPanel) buildToolLists(config *session.UserConfig) {
 		builtins := map[string]bool{
 			"claude": true, "gemini": true, "opencode": true,
 			"codex": true, "pi": true, "crush": true, "copilot": true,
-			"shell": true, "cursor": true, "aider": true,
+			"shell": true, "cursor": true, "aider": true, "hermes": true,
 		}
 		var custom []string
 		for name := range config.Tools {
@@ -378,6 +405,9 @@ func (s *SettingsPanel) GetConfig() *session.UserConfig {
 	// Codex settings
 	config.Codex.YoloMode = s.codexYoloMode
 
+	// Hermes settings
+	config.Hermes.YoloMode = s.hermesYoloMode
+
 	// Update settings
 	config.Updates.CheckEnabled = s.checkForUpdates
 	config.Updates.AutoUpdate = s.autoUpdate
@@ -402,6 +432,10 @@ func (s *SettingsPanel) GetConfig() *session.UserConfig {
 	showNotes := s.showNotes
 	config.Preview.ShowNotes = &showNotes
 	config.Preview.NotesOutputSplit = float64(s.notesOutputSplit) / 100.0
+
+	// Session settings
+	syncTitle := s.syncTitle
+	config.SyncTitle = &syncTitle
 
 	// Maintenance settings.
 	config.Maintenance.Enabled = s.maintenanceEnabled
@@ -434,6 +468,13 @@ func (s *SettingsPanel) GetConfig() *session.UserConfig {
 	}
 	config.SystemStats.Show = showStats
 
+	// Display settings
+	config.Display.ShowSessionTimestamps = s.showSessionTimestamps
+	config.Display.ShowPaneTitles = s.showPaneTitles
+
+	// UI tool picker settings
+	config.UI.ShowOnlyInstalledTools = s.showOnlyInstalledTools
+
 	// Preserve original MCPs, Tools, and Docker settings.
 	if s.originalConfig != nil {
 		config.MCPs = s.originalConfig.MCPs
@@ -448,6 +489,9 @@ func (s *SettingsPanel) GetConfig() *session.UserConfig {
 		// (inject_status_line, launch_in_user_scope, detach_key, options …)
 		// vanishes on save. Same class of bug as #584 (Worktree).
 		config.Tmux = s.originalConfig.Tmux
+		// Fork settings are not exposed in SettingsPanel; preserve the whole
+		// [fork] table so saving visible settings cannot reset quick-fork defaults.
+		config.Fork = s.originalConfig.Fork
 		// Keep global Claude config when editing profile-specific override.
 		if s.claudeConfigIsScope {
 			config.Claude.ConfigDir = s.originalConfig.Claude.ConfigDir
@@ -508,10 +552,23 @@ func (s *SettingsPanel) Update(msg tea.KeyMsg) (*SettingsPanel, tea.Cmd, bool) {
 	case "enter":
 		if s.isTextSetting() {
 			s.startTextEdit()
+		} else if SettingType(s.cursor) == SettingVisibleTools {
+			s.pendingToolVisibility = true
+			s.Hide()
 		}
 	}
 
 	return s, nil, valueChanged
+}
+
+// ConsumeToolVisibilityRequest reports whether the user chose "Visible tools…"
+// and clears the latch.
+func (s *SettingsPanel) ConsumeToolVisibilityRequest() bool {
+	if !s.pendingToolVisibility {
+		return false
+	}
+	s.pendingToolVisibility = false
+	return true
 }
 
 // adjustValue changes a radio or number value by delta
@@ -610,6 +667,10 @@ func (s *SettingsPanel) toggleValue() bool {
 		s.codexYoloMode = !s.codexYoloMode
 		return true
 
+	case SettingHermesYoloMode:
+		s.hermesYoloMode = !s.hermesYoloMode
+		return true
+
 	case SettingCheckForUpdates:
 		s.checkForUpdates = !s.checkForUpdates
 		return true
@@ -637,6 +698,10 @@ func (s *SettingsPanel) toggleValue() bool {
 
 	case SettingShowNotes:
 		s.showNotes = !s.showNotes
+		return true
+
+	case SettingSyncTitle:
+		s.syncTitle = !s.syncTitle
 		return true
 
 	case SettingMaintenanceEnabled:
@@ -669,6 +734,18 @@ func (s *SettingsPanel) toggleValue() bool {
 
 	case SettingStatsShowLoad:
 		s.statsShowLoad = !s.statsShowLoad
+		return true
+
+	case SettingShowSessionTimestamps:
+		s.showSessionTimestamps = !s.showSessionTimestamps
+		return true
+
+	case SettingShowPaneTitles:
+		s.showPaneTitles = !s.showPaneTitles
+		return true
+
+	case SettingShowOnlyInstalledTools:
+		s.showOnlyInstalledTools = !s.showOnlyInstalledTools
 		return true
 	}
 
@@ -841,6 +918,17 @@ func (s *SettingsPanel) View() string {
 	}
 	content.WriteString("  " + labelStyle.Render(line) + "\n\n")
 
+	// HERMES
+	content.WriteString(sectionStyle.Render("HERMES"))
+	content.WriteString("\n")
+
+	// YOLO mode checkbox
+	line = s.renderCheckbox("YOLO mode", s.hermesYoloMode) + " - Auto-approve all tool calls"
+	if s.cursor == int(SettingHermesYoloMode) {
+		line = highlightStyle.Render(line)
+	}
+	content.WriteString("  " + labelStyle.Render(line) + "\n\n")
+
 	// UPDATES
 	content.WriteString(sectionStyle.Render("UPDATES"))
 	content.WriteString("\n")
@@ -1009,16 +1097,64 @@ func (s *SettingsPanel) View() string {
 
 	content.WriteString(netCol + gpuCol + loadCol + "\n\n")
 
+	// SESSIONS
+	content.WriteString(sectionStyle.Render("SESSIONS"))
+	content.WriteString("\n")
+
+	line = s.renderCheckbox(
+		"Sync session title",
+		s.syncTitle,
+	) + " - Let the agent rename the session (off = keep your title)"
+	if s.cursor == int(SettingSyncTitle) {
+		line = highlightStyle.Render(line)
+	}
+	content.WriteString("  " + labelStyle.Render(line) + "\n\n")
+
+	// DISPLAY
+	content.WriteString(sectionStyle.Render("DISPLAY"))
+	content.WriteString("\n")
+
+	line = s.renderCheckbox("Show session timestamps", s.showSessionTimestamps) + " - Last activity per row"
+	if s.cursor == int(SettingShowSessionTimestamps) {
+		line = highlightStyle.Render(line)
+	}
+	content.WriteString("  " + labelStyle.Render(line) + "\n")
+
+	line = s.renderCheckbox("Show pane titles", s.showPaneTitles) + " - Task description per row"
+	if s.cursor == int(SettingShowPaneTitles) {
+		line = highlightStyle.Render(line)
+	}
+	content.WriteString("  " + labelStyle.Render(line) + "\n\n")
+
+	// UI / TOOL PICKER
+	content.WriteString(sectionStyle.Render("TOOL PICKER"))
+	content.WriteString("\n")
+
+	line = s.renderCheckbox(
+		"Show only installed tools",
+		s.showOnlyInstalledTools,
+	) + " - Hide tools whose command is not on PATH"
+	if s.cursor == int(SettingShowOnlyInstalledTools) {
+		line = highlightStyle.Render(line)
+	}
+	content.WriteString("  " + labelStyle.Render(line) + "\n")
+
+	line = "Visible tools…  (Enter to edit checklist)"
+	if s.cursor == int(SettingVisibleTools) {
+		line = highlightStyle.Render(line)
+	}
+	content.WriteString("  " + labelStyle.Render(line) + "\n\n")
+
 	// MCP & TOOLS
 	content.WriteString(sectionStyle.Render("MCP SERVERS & CUSTOM TOOLS"))
 	content.WriteString("\n")
-	content.WriteString(dimStyle.Render("  Edit ~/.agent-deck/config.toml to configure MCPs and tools."))
+	content.WriteString(dimStyle.Render("  Edit " + userConfigPathForDisplay() + " to configure MCPs and tools."))
 	content.WriteString("\n")
 	hotkeys := resolveHotkeys(session.GetHotkeyOverrides())
 	mcpKey := actionHotkey(hotkeys, hotkeyMCPManager)
 	mcpHint := "  MCP Manager hotkey is unbound."
 	if mcpKey != "" {
-		mcpHint = fmt.Sprintf("  Press %s on any Claude/Gemini session to attach MCPs.", mcpKey)
+		mcpHint = fmt.Sprintf("  Press %s on any Claude, Gemini, or Cursor session to attach MCPs.", mcpKey)
 	}
 	content.WriteString(dimStyle.Render(mcpHint))
 	content.WriteString("\n\n")
@@ -1048,28 +1184,34 @@ func (s *SettingsPanel) View() string {
 			12, // SettingClaudeConfigDir
 			15, // SettingGeminiYoloMode
 			18, // SettingCodexYoloMode
-			21, // SettingCheckForUpdates
-			22, // SettingAutoUpdate
-			25, // SettingLogMaxSize
-			25, // SettingLogMaxLines (shares line with LogMaxSize)
-			26, // SettingRemoveOrphans
-			29, // SettingGlobalSearchEnabled
-			30, // SettingSearchTier
-			31, // SettingRecentDays
-			34, // SettingShowOutput
-			35, // SettingShowAnalytics
-			36, // SettingShowNotes
-			37, // SettingNotesOutputSplit
-			40, // SettingMaintenanceEnabled
-			43, // SettingStatsEnabled
-			44, // SettingStatsRefresh
-			45, // SettingStatsFormat
-			47, // SettingStatsShowCPU (row with RAM, Disk)
-			47, // SettingStatsShowRAM
-			47, // SettingStatsShowDisk
-			48, // SettingStatsShowNetwork (row with GPU, Load)
-			48, // SettingStatsShowGPU
-			48, // SettingStatsShowLoad
+			21, // SettingHermesYoloMode
+			24, // SettingCheckForUpdates
+			25, // SettingAutoUpdate
+			28, // SettingLogMaxSize
+			28, // SettingLogMaxLines (shares line with LogMaxSize)
+			29, // SettingRemoveOrphans
+			32, // SettingGlobalSearchEnabled
+			33, // SettingSearchTier
+			34, // SettingRecentDays
+			37, // SettingShowOutput
+			38, // SettingShowAnalytics
+			39, // SettingShowNotes
+			40, // SettingNotesOutputSplit
+			43, // SettingMaintenanceEnabled
+			46, // SettingStatsEnabled
+			47, // SettingStatsRefresh
+			48, // SettingStatsFormat
+			50, // SettingStatsShowCPU (row with RAM, Disk)
+			50, // SettingStatsShowRAM
+			50, // SettingStatsShowDisk
+			51, // SettingStatsShowNetwork (row with GPU, Load)
+			51, // SettingStatsShowGPU
+			51, // SettingStatsShowLoad
+			54, // SettingSyncTitle (SESSIONS section, after stats)
+			57, // SettingShowSessionTimestamps (DISPLAY section, after SESSIONS)
+			58, // SettingShowPaneTitles (DISPLAY section, after timestamps)
+			61, // SettingShowOnlyInstalledTools (TOOL PICKER section)
+			62, // SettingVisibleTools
 		}
 		cursorLine := cursorToLine[s.cursor]
 
