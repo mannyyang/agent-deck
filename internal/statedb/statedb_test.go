@@ -107,6 +107,61 @@ func TestSaveLoadInstances(t *testing.T) {
 	}
 }
 
+func TestSaveInstancesPreservesFreshAutoNameFieldsFromStaleSnapshot(t *testing.T) {
+	db := newTestDB(t)
+	now := time.Now()
+	row := &InstanceRow{
+		ID:          "auto-1",
+		Title:       "lively-fjord",
+		ProjectPath: "/tmp/project",
+		GroupPath:   "grp",
+		Tool:        "claude",
+		Status:      "idle",
+		CreatedAt:   now,
+		ToolData:    json.RawMessage("{}"),
+		AutoName:    true,
+	}
+	if err := db.SaveInstances([]*InstanceRow{row}); err != nil {
+		t.Fatalf("seed SaveInstances: %v", err)
+	}
+
+	if err := db.WriteAutoNameDescription(row.ID, "Review SketchUp house models"); err != nil {
+		t.Fatalf("WriteAutoNameDescription: %v", err)
+	}
+
+	stale := *row
+	stale.AutoNameDescription = ""
+	if err := db.SaveInstances([]*InstanceRow{&stale}); err != nil {
+		t.Fatalf("stale SaveInstances: %v", err)
+	}
+
+	loaded, err := db.LoadInstances()
+	if err != nil {
+		t.Fatalf("LoadInstances: %v", err)
+	}
+	if len(loaded) != 1 {
+		t.Fatalf("loaded %d rows, want 1", len(loaded))
+	}
+	if got := loaded[0].AutoNameDescription; got != "Review SketchUp house models" {
+		t.Errorf("AutoNameDescription after stale SaveInstances = %q, want fresh DB value", got)
+	}
+
+	if _, err := db.DB().Exec(`UPDATE instances SET auto_name = 0 WHERE id = ?`, row.ID); err != nil {
+		t.Fatalf("clear auto_name directly: %v", err)
+	}
+	stale.AutoName = true
+	if err := db.SaveInstances([]*InstanceRow{&stale}); err != nil {
+		t.Fatalf("stale AutoName SaveInstances: %v", err)
+	}
+	loaded, err = db.LoadInstances()
+	if err != nil {
+		t.Fatalf("LoadInstances after stale AutoName save: %v", err)
+	}
+	if loaded[0].AutoName {
+		t.Error("AutoName resurrected after stale SaveInstances, want cleared DB value preserved")
+	}
+}
+
 func TestSaveLoadGroups(t *testing.T) {
 	db := newTestDB(t)
 
@@ -874,6 +929,54 @@ func TestMigrate_OldSchema_AcknowledgedColumn(t *testing.T) {
 	statuses, _ = db.ReadAllStatuses()
 	if statuses["existing-1"].Acknowledged {
 		t.Error("running status should clear acknowledged flag on migrated DB")
+	}
+}
+
+// TestMigrate_OldSchema_LastSentAtColumn verifies the v13 self-heal migration:
+// upgrading a pre-last_sent_at DB adds the column, defaults legacy rows to 0
+// ("never sent" → deliberate-idle, never a self-heal candidate), preserves the
+// existing row, and the targeted Write/ReadLastSentAt helpers work without
+// touching any other column.
+func TestMigrate_OldSchema_LastSentAtColumn(t *testing.T) {
+	db := createV1SchemaDB(t)
+
+	if err := db.Migrate(); err != nil {
+		t.Fatalf("Migrate() on v1 schema failed: %v", err)
+	}
+
+	// Legacy row survives, and last_sent_at defaults to 0.
+	insts, err := db.LoadInstances()
+	if err != nil {
+		t.Fatalf("LoadInstances after migrate: %v", err)
+	}
+	if len(insts) != 1 || insts[0].ID != "existing-1" {
+		t.Fatalf("legacy row not preserved: %+v", insts)
+	}
+	ts, err := db.ReadLastSentAt("existing-1")
+	if err != nil {
+		t.Fatalf("ReadLastSentAt: %v", err)
+	}
+	if ts != 0 {
+		t.Fatalf("legacy row last_sent_at must default to 0, got %d", ts)
+	}
+
+	// Targeted write round-trips and does not disturb the title/status.
+	const sent = int64(1780000123)
+	if err := db.WriteLastSentAt("existing-1", sent); err != nil {
+		t.Fatalf("WriteLastSentAt: %v", err)
+	}
+	ts, _ = db.ReadLastSentAt("existing-1")
+	if ts != sent {
+		t.Fatalf("ReadLastSentAt = %d, want %d", ts, sent)
+	}
+	insts2, _ := db.LoadInstances()
+	if insts2[0].Title != "My Session" {
+		t.Fatalf("WriteLastSentAt disturbed another column: title=%q", insts2[0].Title)
+	}
+
+	// Unknown id reads 0, not an error (no row).
+	if v, err := db.ReadLastSentAt("nope"); err != nil || v != 0 {
+		t.Fatalf("ReadLastSentAt(unknown) = %d, %v; want 0, nil", v, err)
 	}
 }
 

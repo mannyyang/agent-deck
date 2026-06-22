@@ -16,6 +16,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/asheshgoplani/agent-deck/internal/safeio"
+
 	_ "modernc.org/sqlite"
 )
 
@@ -47,21 +49,11 @@ func (s *StateDB) backupDBFile() error {
 	// doesn't depend on a sidecar -wal that the next write will overwrite.
 	_, _ = s.db.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
 
-	src, err := os.ReadFile(s.path)
-	if err != nil {
-		// Nothing to back up (file not created yet) or unreadable; either way,
-		// don't block the save.
-		return err
-	}
-	bak := s.path + ".bak"
-	// 0600: the db may carry session metadata; keep the backup as private as
-	// the original. Write+rename to avoid leaving a torn .bak.
-	tmp := bak + ".tmp"
-	if err := os.WriteFile(tmp, src, 0o600); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, bak); err != nil {
-		_ = os.Remove(tmp)
+	// safeio.Backup performs the shared read → temp-write → rename copy (no torn
+	// .bak, 0600 to keep the snapshot as private as the original). The
+	// sqlite-specific WAL checkpoint above stays here; the copy itself is the
+	// generic primitive. A missing source returns ("", nil) — a benign no-op.
+	if _, err := safeio.Backup(s.path); err != nil {
 		return err
 	}
 	return nil
@@ -104,7 +96,7 @@ func withBusyRetry(op func() error) error {
 
 // SchemaVersion tracks the current database schema version.
 // Bump this when adding migrations.
-const SchemaVersion = 11
+const SchemaVersion = 13
 
 // StateDB wraps a SQLite database for session/group persistence.
 // Thread-safe for concurrent use from multiple goroutines within one process.
@@ -150,10 +142,16 @@ type InstanceRow struct {
 	// after upgrade.
 	TmuxSocketName string
 	// TitleLocked blocks Claude session-name sync into Title (v1.7.52+, issue #697).
-	TitleLocked    bool
-	WorktreePath   string
-	WorktreeRepo   string
-	WorktreeBranch string
+	TitleLocked bool
+	// AutoName marks Title as a machine-generated quick-session handle (v12).
+	// AutoNameDescription holds the last captured Claude task description so an
+	// auto-named session can show its meaningful name on reopen even when
+	// stopped/idle (no live pane title). Both default to zero for legacy rows.
+	AutoName            bool
+	AutoNameDescription string
+	WorktreePath        string
+	WorktreeRepo        string
+	WorktreeBranch      string
 	// Account is the per-session named account (v1.9.22+, issue #924). Maps to
 	// `[profiles.<account>.claude].config_dir` at spawn time and becomes the
 	// most-specific level in the CLAUDE_CONFIG_DIR resolution chain. Empty
@@ -166,6 +164,34 @@ type InstanceRow struct {
 	ToolData json.RawMessage // JSON blob for tool-specific data
 	// ArchivedAt is non-zero when the session is archived (hidden from active lists).
 	ArchivedAt time.Time
+}
+
+type existingAutoNameFields struct {
+	found       bool
+	autoName    bool
+	description string
+}
+
+func mergeAutoNameFields(inst *InstanceRow, existing existingAutoNameFields) (bool, string) {
+	if !existing.found {
+		return inst.AutoName, inst.AutoNameDescription
+	}
+
+	autoName := inst.AutoName
+	if !existing.autoName && inst.AutoName {
+		// A stale full-row save must not resurrect AutoName after a newer writer
+		// cleared it through an explicit rename/title sync.
+		autoName = false
+	}
+
+	description := inst.AutoNameDescription
+	if description == "" && existing.description != "" {
+		// The capture path writes non-empty descriptions with a targeted UPDATE.
+		// Keep that fresher value when a stale snapshot still has the old empty
+		// column value.
+		description = existing.description
+	}
+	return autoName, description
 }
 
 // WatcherRow represents a watcher row in the database.
@@ -351,7 +377,10 @@ func (s *StateDB) Migrate() error {
 			worktree_branch   TEXT NOT NULL DEFAULT '',
 			account           TEXT NOT NULL DEFAULT '',
 			archived_at       INTEGER NOT NULL DEFAULT 0,
-			pin               TEXT NOT NULL DEFAULT '',
+			auto_name              INTEGER NOT NULL DEFAULT 0,
+			auto_name_description  TEXT NOT NULL DEFAULT '',
+			pin             TEXT NOT NULL DEFAULT '',
+			last_sent_at    INTEGER NOT NULL DEFAULT 0,
 			tool_data       TEXT NOT NULL DEFAULT '{}',
 			acknowledged    INTEGER NOT NULL DEFAULT 0
 		)
@@ -504,11 +533,25 @@ func (s *StateDB) Migrate() error {
 		// the pre-v1.9.22 behavior for legacy rows (fall through to
 		// conductor/group/env/profile/global/default).
 		"ALTER TABLE instances ADD COLUMN account TEXT NOT NULL DEFAULT ''",
-		// v10: user-archived sessions (hidden from active lists; 0 = active).
+		// v10 (archive-sessions): ArchivedAt timestamp. Default 0 means
+		// "not archived" for all pre-existing rows.
 		"ALTER TABLE instances ADD COLUMN archived_at INTEGER NOT NULL DEFAULT 0",
 		// v11 (pin-sessions): per-session pin to top/bottom of group. Default ''
 		// means "not pinned" for all pre-existing rows.
 		"ALTER TABLE instances ADD COLUMN pin TEXT NOT NULL DEFAULT ''",
+		// v12 (quick-session Claude-name display): AutoName flag + the last
+		// captured task description. Defaults (0, '') keep legacy rows showing
+		// their handle until they are recreated as quick sessions.
+		"ALTER TABLE instances ADD COLUMN auto_name INTEGER NOT NULL DEFAULT 0",
+		"ALTER TABLE instances ADD COLUMN auto_name_description TEXT NOT NULL DEFAULT ''",
+		// v13 (self-heal Stage 1, #1457-followup): the "we talked to it" clock.
+		// Set by the keysender on every delivered injection. The self-heal stuck
+		// predicate measures the idle_at_empty_prompt dwell from this timestamp:
+		// a session is only stuck at an empty prompt if WE sent it something and
+		// nothing happened. Default 0 ("never sent") preserves legacy rows as
+		// deliberate-idle (never a self-heal candidate). Additive + targeted-write
+		// only (WriteLastSentAt); never part of a whole-row REPLACE/SaveInstances.
+		"ALTER TABLE instances ADD COLUMN last_sent_at INTEGER NOT NULL DEFAULT 0",
 	}
 	for _, stmt := range alterMigrations {
 		if _, err := tx.Exec(stmt); err != nil {
@@ -583,6 +626,28 @@ func (s *StateDB) Migrate() error {
 				}
 			}
 		}
+		if oldVer < 12 {
+			if _, err := tx.Exec(`ALTER TABLE instances ADD COLUMN auto_name INTEGER NOT NULL DEFAULT 0`); err != nil {
+				if !strings.Contains(err.Error(), "duplicate column") {
+					return fmt.Errorf("statedb: migrate v12 auto_name: %w", err)
+				}
+			}
+			if _, err := tx.Exec(`ALTER TABLE instances ADD COLUMN auto_name_description TEXT NOT NULL DEFAULT ''`); err != nil {
+				if !strings.Contains(err.Error(), "duplicate column") {
+					return fmt.Errorf("statedb: migrate v12 auto_name_description: %w", err)
+				}
+			}
+		}
+		if oldVer < 13 {
+			// Self-heal Stage 1: the last_sent_at clock. Default 0 = "never sent",
+			// so every legacy row reads as deliberate-idle (never a self-heal
+			// candidate) until the keysender stamps it.
+			if _, err := tx.Exec(`ALTER TABLE instances ADD COLUMN last_sent_at INTEGER NOT NULL DEFAULT 0`); err != nil {
+				if !strings.Contains(err.Error(), "duplicate column") {
+					return fmt.Errorf("statedb: migrate v13 last_sent_at: %w", err)
+				}
+			}
+		}
 		if _, err := tx.Exec(`
 			UPDATE metadata SET value = ? WHERE key = 'schema_version'
 		`, schemaVersion); err != nil {
@@ -623,8 +688,14 @@ func (s *StateDB) SaveInstance(inst *InstanceRow) error {
 	// manually-set clear_on_compact). Without this merge, every
 	// INSERT OR REPLACE silently drops user-managed extras.
 	var existingToolData []byte
+	existingAutoName := existingAutoNameFields{}
 	if err := s.db.QueryRow("SELECT tool_data FROM instances WHERE id = ?", inst.ID).Scan(&existingToolData); err == nil {
 		toolData = MergeToolDataExtras(json.RawMessage(existingToolData), toolData)
+	}
+	var existingAutoNameInt int
+	if err := s.db.QueryRow("SELECT auto_name, auto_name_description FROM instances WHERE id = ?", inst.ID).Scan(&existingAutoNameInt, &existingAutoName.description); err == nil {
+		existingAutoName.found = true
+		existingAutoName.autoName = existingAutoNameInt != 0
 	}
 
 	isConductorInt := 0
@@ -639,6 +710,11 @@ func (s *StateDB) SaveInstance(inst *InstanceRow) error {
 	if inst.TitleLocked {
 		titleLockedInt = 1
 	}
+	autoName, autoNameDescription := mergeAutoNameFields(inst, existingAutoName)
+	autoNameInt := 0
+	if autoName {
+		autoNameInt = 1
+	}
 	_, err := s.db.Exec(`
 		INSERT OR REPLACE INTO instances (
 			id, title, project_path, group_path, sort_order,
@@ -646,15 +722,15 @@ func (s *StateDB) SaveInstance(inst *InstanceRow) error {
 			created_at, last_accessed,
 			parent_session_id, is_conductor, no_transition_notify,
 			worktree_path, worktree_repo, worktree_branch, account,
-			archived_at, pin, tool_data, title_locked
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			archived_at, tool_data, title_locked, auto_name, auto_name_description, pin
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		inst.ID, inst.Title, inst.ProjectPath, inst.GroupPath, inst.Order,
 		inst.Command, inst.Wrapper, inst.Tool, inst.Status, inst.TmuxSession, inst.TmuxSocketName,
 		inst.CreatedAt.Unix(), inst.LastAccessed.Unix(),
 		inst.ParentSessionID, isConductorInt, noTransitionNotifyInt,
 		inst.WorktreePath, inst.WorktreeRepo, inst.WorktreeBranch, inst.Account,
-		archivedAtUnix(inst.ArchivedAt), inst.Pin, string(toolData), titleLockedInt,
+		archivedAtUnix(inst.ArchivedAt), string(toolData), titleLockedInt, autoNameInt, autoNameDescription, inst.Pin,
 	)
 	return err
 }
@@ -674,11 +750,9 @@ func (s *StateDB) SaveInstances(insts []*InstanceRow) error {
 }
 
 func (s *StateDB) saveInstancesOnce(insts []*InstanceRow) error {
-	// Pre-fetch existing tool_data per instance ID so we can preserve any
-	// keys not modeled by the typed schema (e.g., manually-set
-	// clear_on_compact). Without this merge, every INSERT OR REPLACE
-	// silently drops user-managed extras. One batch SELECT instead of N
-	// individual reads.
+	// Pre-fetch existing mutable columns per instance ID so we can preserve state
+	// written by targeted UPDATE paths. Without this merge, every INSERT OR
+	// REPLACE can silently drop fresher data from another process.
 	//
 	// IMPORTANT: this read runs OUTSIDE the write transaction below.
 	// In SQLite WAL mode, beginning a transaction with a read and then
@@ -690,6 +764,7 @@ func (s *StateDB) saveInstancesOnce(insts []*InstanceRow) error {
 	// extras keys are rarely-mutated user-managed flags and the worst-case
 	// outcome is one stale-overlay save, recoverable on next save.
 	existingToolData := make(map[string]json.RawMessage, len(insts))
+	existingAutoNames := make(map[string]existingAutoNameFields, len(insts))
 	if len(insts) > 0 {
 		placeholders := make([]string, len(insts))
 		args := make([]any, len(insts))
@@ -699,14 +774,21 @@ func (s *StateDB) saveInstancesOnce(insts []*InstanceRow) error {
 		}
 		// #nosec G202 -- placeholders is a fixed sequence of "?" tokens generated
 		// from len(insts); all values flow through args[], never the SQL string.
-		query := "SELECT id, tool_data FROM instances WHERE id IN (" + strings.Join(placeholders, ",") + ")"
+		query := "SELECT id, tool_data, auto_name, auto_name_description FROM instances WHERE id IN (" + strings.Join(placeholders, ",") + ")"
 		rows, queryErr := s.db.Query(query, args...)
 		if queryErr == nil {
 			for rows.Next() {
 				var id string
 				var td []byte
-				if scanErr := rows.Scan(&id, &td); scanErr == nil {
+				var autoNameInt int
+				var autoNameDescription string
+				if scanErr := rows.Scan(&id, &td, &autoNameInt, &autoNameDescription); scanErr == nil {
 					existingToolData[id] = json.RawMessage(td)
+					existingAutoNames[id] = existingAutoNameFields{
+						found:       true,
+						autoName:    autoNameInt != 0,
+						description: autoNameDescription,
+					}
 				}
 			}
 			_ = rows.Close()
@@ -788,8 +870,8 @@ func (s *StateDB) saveInstancesOnce(insts []*InstanceRow) error {
 			created_at, last_accessed,
 			parent_session_id, is_conductor, no_transition_notify,
 			worktree_path, worktree_repo, worktree_branch, account,
-			archived_at, pin, tool_data, title_locked
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			archived_at, tool_data, title_locked, auto_name, auto_name_description, pin
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`)
 	if err != nil {
 		return err
@@ -816,13 +898,18 @@ func (s *StateDB) saveInstancesOnce(insts []*InstanceRow) error {
 		if inst.TitleLocked {
 			titleLockedInt = 1
 		}
+		autoName, autoNameDescription := mergeAutoNameFields(inst, existingAutoNames[inst.ID])
+		autoNameInt := 0
+		if autoName {
+			autoNameInt = 1
+		}
 		if _, err := stmt.Exec(
 			inst.ID, inst.Title, inst.ProjectPath, inst.GroupPath, inst.Order,
 			inst.Command, inst.Wrapper, inst.Tool, inst.Status, inst.TmuxSession, inst.TmuxSocketName,
 			inst.CreatedAt.Unix(), inst.LastAccessed.Unix(),
 			inst.ParentSessionID, isConductorInt, noTransitionNotifyInt,
 			inst.WorktreePath, inst.WorktreeRepo, inst.WorktreeBranch, inst.Account,
-			archivedAtUnix(inst.ArchivedAt), inst.Pin, string(toolData), titleLockedInt,
+			archivedAtUnix(inst.ArchivedAt), string(toolData), titleLockedInt, autoNameInt, autoNameDescription, inst.Pin,
 		); err != nil {
 			return err
 		}
@@ -851,7 +938,7 @@ func (s *StateDB) LoadInstances() ([]*InstanceRow, error) {
 			created_at, last_accessed,
 			parent_session_id, is_conductor, no_transition_notify,
 			worktree_path, worktree_repo, worktree_branch, account,
-			archived_at, pin, tool_data, title_locked
+			archived_at, tool_data, title_locked, auto_name, auto_name_description, pin
 		FROM instances ORDER BY sort_order
 	`)
 	if err != nil {
@@ -864,14 +951,14 @@ func (s *StateDB) LoadInstances() ([]*InstanceRow, error) {
 		r := &InstanceRow{}
 		var createdUnix, accessedUnix, archivedUnix int64
 		var toolDataStr string
-		var isConductorInt, noTransitionNotifyInt, titleLockedInt int
+		var isConductorInt, noTransitionNotifyInt, titleLockedInt, autoNameInt int
 		if err := rows.Scan(
 			&r.ID, &r.Title, &r.ProjectPath, &r.GroupPath, &r.Order,
 			&r.Command, &r.Wrapper, &r.Tool, &r.Status, &r.TmuxSession, &r.TmuxSocketName,
 			&createdUnix, &accessedUnix,
 			&r.ParentSessionID, &isConductorInt, &noTransitionNotifyInt,
 			&r.WorktreePath, &r.WorktreeRepo, &r.WorktreeBranch, &r.Account,
-			&archivedUnix, &r.Pin, &toolDataStr, &titleLockedInt,
+			&archivedUnix, &toolDataStr, &titleLockedInt, &autoNameInt, &r.AutoNameDescription, &r.Pin,
 		); err != nil {
 			return nil, err
 		}
@@ -885,6 +972,7 @@ func (s *StateDB) LoadInstances() ([]*InstanceRow, error) {
 		r.IsConductor = isConductorInt != 0
 		r.NoTransitionNotify = noTransitionNotifyInt != 0
 		r.TitleLocked = titleLockedInt != 0
+		r.AutoName = autoNameInt != 0
 		r.ToolData = json.RawMessage(toolDataStr)
 		result = append(result, r)
 	}
@@ -1006,6 +1094,56 @@ func (s *StateDB) WriteStatus(id, status, tool string) error {
 		)
 		return err
 	})
+}
+
+// WriteAutoNameDescription persists the latest Claude task description for an
+// auto-named session into the auto_name_description column without a whole-row
+// INSERT OR REPLACE. The background status loop captures the live pane title on
+// its own cadence; none of those ticks run a full Save, so without this targeted
+// write the description would only reach disk on the next user-triggered save —
+// and an app exit before then would lose the name on reopen (the bug this fixes).
+//
+// Wrapped in withBusyRetry for the same reason as WriteStatus: SQLite serializes
+// writers, so under contention a transient SQLITE_BUSY would otherwise silently
+// drop the update.
+func (s *StateDB) WriteAutoNameDescription(id, description string) error {
+	return withBusyRetry(func() error {
+		_, err := s.db.Exec(
+			`UPDATE instances SET auto_name_description = ? WHERE id = ?`,
+			description, id,
+		)
+		return err
+	})
+}
+
+// WriteLastSentAt persists the "we talked to it" clock (Unix seconds) for a
+// session into the last_sent_at column with a targeted single-column UPDATE —
+// never a whole-row INSERT OR REPLACE and never SaveInstances. The keysender
+// stamps this on every delivered injection; the self-heal predicate reads it to
+// measure the idle_at_empty_prompt dwell (#1457-followup, self-heal Stage 1).
+//
+// Like WriteAutoNameDescription this touches ONLY its own column, so a concurrent
+// writer's edits to any other field of the same row are preserved (no data-loss
+// surface), and it is wrapped in withBusyRetry for the same SQLITE_BUSY reason.
+func (s *StateDB) WriteLastSentAt(id string, unixSeconds int64) error {
+	return withBusyRetry(func() error {
+		_, err := s.db.Exec(
+			`UPDATE instances SET last_sent_at = ? WHERE id = ?`,
+			unixSeconds, id,
+		)
+		return err
+	})
+}
+
+// ReadLastSentAt returns the last_sent_at clock (Unix seconds, 0 if never sent)
+// for a session. Read-only; used by the self-heal detection pass.
+func (s *StateDB) ReadLastSentAt(id string) (int64, error) {
+	var ts int64
+	err := s.db.QueryRow(`SELECT last_sent_at FROM instances WHERE id = ?`, id).Scan(&ts)
+	if err == sql.ErrNoRows {
+		return 0, nil
+	}
+	return ts, err
 }
 
 // InstanceStatusUpdate is one targeted status mutation for

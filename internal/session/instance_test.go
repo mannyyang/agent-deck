@@ -299,6 +299,43 @@ func TestInstance_CreateForkedInstance(t *testing.T) {
 	}
 }
 
+func TestInstance_CreateForkedInstance_PreservesCompatibleToolIdentity(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	ClearUserConfigCache()
+	t.Cleanup(ClearUserConfigCache)
+
+	cfg := &UserConfig{
+		Tools: map[string]ToolDef{
+			"my-claude": {
+				Command:        "claude-wrapper",
+				CompatibleWith: "claude",
+			},
+		},
+	}
+	if err := SaveUserConfig(cfg); err != nil {
+		t.Fatalf("SaveUserConfig: %v", err)
+	}
+	ClearUserConfigCache()
+
+	parent := NewInstanceWithTool("cl parent", "/tmp/original", "my-claude")
+	parent.Wrapper = "wrap {command}"
+	parent.ClaudeSessionID = "abc-123"
+	parent.ClaudeDetectedAt = time.Now()
+
+	forked, _, err := parent.CreateForkedInstanceWithOptions("cl parent (fork)", "", nil)
+	if err != nil {
+		t.Fatalf("CreateForkedInstanceWithOptions: %v", err)
+	}
+	if forked.Tool != "my-claude" {
+		t.Fatalf("forked Tool = %q, want custom Claude-compatible tool identity", forked.Tool)
+	}
+	if forked.Wrapper != parent.Wrapper {
+		t.Fatalf("forked Wrapper = %q, want %q", forked.Wrapper, parent.Wrapper)
+	}
+}
+
 // TestInstance_CreateForkedInstance_ExplicitConfig tests CreateForkedInstance with explicit config
 func TestInstance_CreateForkedInstance_ExplicitConfig(t *testing.T) {
 	// Isolate from user's environment (don't pick up their config.toml)
@@ -1740,6 +1777,38 @@ func TestBuildCodexCommand_InlineCodexHomeDropsStaleID(t *testing.T) {
 	}
 	if got := ReadHookSessionAnchor(inst.ID); got != "" {
 		t.Fatalf(".sid anchor should be cleared after stale-id drop, got %q", got)
+	}
+}
+
+func TestCanRestartCursor(t *testing.T) {
+	skipIfNoTmuxBinary(t)
+
+	inst := NewInstanceWithTool("cursor-restart-test", "/tmp", "cursor")
+	inst.Command = "sleep 60"
+	err := inst.Start()
+	if err != nil {
+		t.Fatalf("Failed to start session: %v", err)
+	}
+	defer func() { _ = inst.Kill() }()
+
+	inst.Status = StatusRunning
+
+	if !inst.CanRestart() {
+		t.Fatal("CanRestart() should return true for a running Cursor session with live tmux pane")
+	}
+
+	// Simulate persisted command from a real Cursor session before restart.
+	inst.Command = "cursor agent"
+
+	if err := inst.Restart(); err != nil {
+		t.Fatalf("Restart failed: %v", err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if inst.tmuxSession == nil || !inst.tmuxSession.Exists() {
+		t.Fatal("tmux session should exist after Restart")
+	}
+	if inst.Status == StatusError {
+		t.Fatalf("after Restart, Status = %s; want != error", inst.Status)
 	}
 }
 

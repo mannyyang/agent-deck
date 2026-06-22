@@ -300,22 +300,29 @@ func TestConductorMetaSaveAndLoad(t *testing.T) {
 	}
 }
 
+func intPtr(v int) *int { return &v }
+
 func TestGetHeartbeatInterval(t *testing.T) {
 	tests := []struct {
-		interval int
+		name     string
+		interval *int
 		expected int
 	}{
-		{0, 0},   // zero means disabled
-		{-1, 15}, // negative defaults to 15
-		{10, 10}, // custom
-		{30, 30}, // custom
+		{"nil means disabled", nil, 0},
+		{"zero means disabled", intPtr(0), 0},
+		{"negative means default 15", intPtr(-1), 15},
+		{"setup default 15", intPtr(15), 15},
+		{"custom 10", intPtr(10), 10},
+		{"custom 30", intPtr(30), 30},
 	}
 
 	for _, tt := range tests {
-		settings := &ConductorSettings{HeartbeatInterval: tt.interval}
-		if got := settings.GetHeartbeatInterval(); got != tt.expected {
-			t.Errorf("GetHeartbeatInterval() with %d = %d, want %d", tt.interval, got, tt.expected)
-		}
+		t.Run(tt.name, func(t *testing.T) {
+			settings := &ConductorSettings{HeartbeatInterval: tt.interval}
+			if got := settings.GetHeartbeatInterval(); got != tt.expected {
+				t.Errorf("GetHeartbeatInterval() = %d, want %d", got, tt.expected)
+			}
+		})
 	}
 }
 
@@ -2392,18 +2399,19 @@ func TestConductorHeartbeatScript_GroupScoped(t *testing.T) {
 	}
 }
 
-// TestGetHeartbeatInterval_ZeroMeansDisabled verifies interval=0 means disabled,
-// negative means use default, and positive means use the configured value.
+// TestGetHeartbeatInterval_ZeroMeansDisabled verifies nil and zero mean
+// disabled, negative means default (15), and positive values pass through.
 func TestGetHeartbeatInterval_ZeroMeansDisabled(t *testing.T) {
 	tests := []struct {
 		name     string
-		interval int
+		interval *int
 		expected int
 	}{
-		{"zero means disabled", 0, 0},
-		{"negative means default", -1, 15},
-		{"custom value", 30, 30},
-		{"explicit default", 15, 15},
+		{"nil means disabled", nil, 0},
+		{"negative means default", intPtr(-1), 15},
+		{"zero means disabled", intPtr(0), 0},
+		{"custom value", intPtr(30), 30},
+		{"explicit fifteen", intPtr(15), 15},
 	}
 
 	for _, tt := range tests {
@@ -2411,7 +2419,7 @@ func TestGetHeartbeatInterval_ZeroMeansDisabled(t *testing.T) {
 			settings := ConductorSettings{HeartbeatInterval: tt.interval}
 			got := settings.GetHeartbeatInterval()
 			if got != tt.expected {
-				t.Errorf("GetHeartbeatInterval() with %d = %d, want %d", tt.interval, got, tt.expected)
+				t.Errorf("GetHeartbeatInterval() = %d, want %d", got, tt.expected)
 			}
 		})
 	}
@@ -2817,9 +2825,15 @@ func TestBridgeTemplate_DoesNotHardcodeLegacyAgentDeckRoot(t *testing.T) {
 		t.Error("template must retain a legacy ~/.agent-deck fallback (issue #1350)")
 	}
 
-	// CONDUCTOR_DIR / CONFIG_PATH must be computed via the resolvers.
-	if !strings.Contains(template, `CONDUCTOR_DIR = resolve_data_dir("conductor")`) {
-		t.Error("template must compute CONDUCTOR_DIR via resolve_data_dir (issue #1350)")
+	// CONDUCTOR_DIR / CONFIG_PATH must be computed via the resolvers. CONDUCTOR_DIR
+	// now prefers the AGENT_DECK_CONDUCTOR_DIR override (injected by the Go side
+	// from [conductor].dir) but must still fall back through resolve_data_dir so
+	// the #1350 XDG/legacy behavior is preserved when no override is set.
+	if !strings.Contains(template, `resolve_data_dir("conductor") / "conductor"`) {
+		t.Error("template must retain the resolve_data_dir CONDUCTOR_DIR fallback (issue #1350)")
+	}
+	if !strings.Contains(template, `os.environ.get("AGENT_DECK_CONDUCTOR_DIR"`) {
+		t.Error("template must honor the AGENT_DECK_CONDUCTOR_DIR override before the XDG fallback")
 	}
 	if !strings.Contains(template, `CONFIG_PATH = resolve_config_path("config.toml")`) {
 		t.Error("template must compute CONFIG_PATH via resolve_config_path (issue #1350)")
@@ -2888,11 +2902,12 @@ func TestGenerateSystemdBridgeService_InjectsXDGEnv(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GenerateSystemdBridgeService: %v", err)
 	}
-	if !strings.Contains(unit, "Environment=XDG_DATA_HOME="+xdgData) {
-		t.Errorf("systemd unit must inject XDG_DATA_HOME=%q:\n%s", xdgData, unit)
+	// Values are double-quoted so systemd does not split paths on whitespace.
+	if !strings.Contains(unit, `Environment="XDG_DATA_HOME=`+xdgData+`"`) {
+		t.Errorf("systemd unit must inject quoted XDG_DATA_HOME=%q:\n%s", xdgData, unit)
 	}
-	if !strings.Contains(unit, "Environment=XDG_CONFIG_HOME="+xdgConfig) {
-		t.Errorf("systemd unit must inject XDG_CONFIG_HOME=%q:\n%s", xdgConfig, unit)
+	if !strings.Contains(unit, `Environment="XDG_CONFIG_HOME=`+xdgConfig+`"`) {
+		t.Errorf("systemd unit must inject quoted XDG_CONFIG_HOME=%q:\n%s", xdgConfig, unit)
 	}
 }
 

@@ -37,7 +37,7 @@ import (
 	"github.com/asheshgoplani/agent-deck/internal/web"
 )
 
-var Version = "1.9.58" // overridden at build time via -ldflags "-X main.Version=..."
+var Version = "1.9.74" // overridden at build time via -ldflags "-X main.Version=..."
 
 // Table column widths for list command output
 const (
@@ -58,6 +58,7 @@ func initUpdateSettings() {
 	settings := session.GetUpdateSettings()
 	update.SetCheckInterval(settings.CheckIntervalHours)
 	update.SetBridgeScriptInstaller(session.InstallBridgeScript)
+	update.SetConductorDirResolver(session.ConductorDir)
 }
 
 // writeVersionOutput prints `Agent Deck vX.Y.Z` to `w`, appending
@@ -76,7 +77,7 @@ func writeVersionOutput(w io.Writer, currentVersion string) {
 // Uses cache to avoid API calls - only prints if update was already detected
 func printUpdateNotice() {
 	settings := session.GetUpdateSettings()
-	if !settings.CheckEnabled || !settings.NotifyInCLI {
+	if !settings.GetCheckEnabled() || !settings.GetNotifyInCLI() {
 		return
 	}
 
@@ -93,7 +94,7 @@ func printUpdateNotice() {
 // promptForUpdate checks for updates and prompts user if auto_update is enabled
 func promptForUpdate() bool {
 	settings := session.GetUpdateSettings()
-	if !settings.CheckEnabled {
+	if !settings.GetCheckEnabled() {
 		return false
 	}
 
@@ -346,6 +347,9 @@ func main() {
 		case "hermes-hooks":
 			handleHermesHooks(args[1:])
 			return
+		case "cursor-hooks":
+			handleCursorHooks(args[1:])
+			return
 		case "notify-daemon":
 			handleNotifyDaemon(args[1:])
 			return
@@ -457,9 +461,13 @@ func main() {
 		}
 	}
 
-	// Check if multiple instances are allowed (uses primary election as single-instance gate)
+	// Check if multiple instances are allowed (uses primary election as single-instance gate).
+	// In headless web mode (--no-tui), skip the gate — a headless HTTP server is meant to
+	// coexist with an interactive TUI for the same profile (the whole point of --no-tui), and
+	// the sibling TUI-launch guards above skip the same way. Without this, restarting the web
+	// daemon while a TUI holds the profile primary makes it lose ElectPrimary and exit.
 	instanceSettings := session.GetInstanceSettings()
-	if !instanceSettings.GetAllowMultiple() {
+	if !webHeadless && !instanceSettings.GetAllowMultiple() {
 		if db := statedb.GetGlobal(); db != nil {
 			isFirst, electErr := db.ElectPrimary(30 * time.Second)
 			if electErr == nil && !isFirst {
@@ -531,9 +539,7 @@ func main() {
 			if ls.DebugRetentionDays > 0 {
 				logCfg.MaxAgeDays = ls.DebugRetentionDays
 			}
-			if ls.DebugCompress {
-				logCfg.Compress = ls.DebugCompress
-			}
+			logCfg.Compress = ls.GetDebugCompress()
 			if ls.RingBufferMB > 0 {
 				logCfg.RingBufferSize = ls.RingBufferMB * 1024 * 1024
 			}
@@ -756,6 +762,15 @@ func main() {
 		fallbackMenuData := web.NewSessionDataService(effectiveProfile)
 		liveMenuData := web.NewMemoryMenuData(fallbackMenuData)
 		homeModel.SetWebMenuData(liveMenuData)
+
+		// #1397: in headless mode no bubbletea loop ever populates the Home's
+		// in-memory registry, so the WebMutator must hydrate it from storage on
+		// each mutation. Flag the model so WebMutator.ensureHydrated activates;
+		// otherwise delete/restart/close/group-mutate on pre-existing sessions
+		// fail ("session not found" / empty-sweep guard).
+		if webHeadless {
+			homeModel.SetHeadless(true)
+		}
 
 		server, err := buildWebServer(effectiveProfile, webArgs, liveMenuData, ui.NewWebMutator(homeModel))
 		if err != nil {
@@ -1148,8 +1163,8 @@ func handleAdd(profile string, args []string) {
 	// is an alias for discoverability.
 	titleLock := fs.Bool("title-lock", false, "Lock session title so Claude's session name never overrides it (#697)")
 	noTitleSync := fs.Bool("no-title-sync", false, "Alias for --title-lock")
-	quickCreate := fs.Bool("quick", false, "Auto-generate session name (adjective-noun)")
-	quickCreateShort := fs.Bool("Q", false, "Auto-generate session name (short)")
+	quickCreate := fs.Bool("quick", false, "Create a quick session with a machine-generated handle; TUI shows Claude's live task description when available")
+	quickCreateShort := fs.Bool("Q", false, "Create a quick session (short)")
 	jsonOutput := fs.Bool("json", false, "Output as JSON")
 	quiet := fs.Bool("quiet", false, "Minimal output")
 	quietShort := fs.Bool("q", false, "Minimal output (short)")
@@ -1195,6 +1210,9 @@ func handleAdd(profile string, args []string) {
 	// buildClaudeExtraFlags.
 	var extraArgFlags []string
 	fs.Func("extra-arg", "Extra claude CLI token (can specify multiple times); requires -c claude; persisted plaintext — no secrets", func(s string) error {
+		if err := session.ValidateClaudeExtraArgToken(s); err != nil {
+			return err
+		}
 		extraArgFlags = append(extraArgFlags, s)
 		return nil
 	})
@@ -1231,7 +1249,7 @@ func handleAdd(profile string, args []string) {
 		fmt.Println("Add a new session to Agent Deck.")
 		fmt.Println()
 		fmt.Println("Arguments:")
-		fmt.Println("  [path]    Project directory (defaults to current directory)")
+		fmt.Println("  [path]    Project directory (defaults to the group or global default_path, else current directory)")
 		fmt.Println()
 		fmt.Println("Options:")
 		fs.PrintDefaults()
@@ -1252,7 +1270,7 @@ func handleAdd(profile string, args []string) {
 		fmt.Println("  agent-deck add -c gemini --yolo .")
 		fmt.Println("  agent-deck add -c claude -g work .   # -c is shorthand for --cmd")
 		fmt.Println("  agent-deck add -g ard --no-parent -c claude .")
-		fmt.Println("  agent-deck add --quick -c claude .   # Auto-generated name")
+		fmt.Println("  agent-deck add --quick -c claude .   # Quick session; TUI shows Claude's live task description")
 		fmt.Println()
 		fmt.Println("Worktree Examples:")
 		fmt.Println("  agent-deck add -w feature/login .    # Create worktree for existing branch")
@@ -1321,6 +1339,16 @@ func handleAdd(profile string, args []string) {
 	}
 
 	groupTree := session.NewGroupTreeWithGroups(instances, groups)
+
+	// Seed groups declared in config.toml into the DB before resolving the
+	// new session's group and working directory.
+	if cfg, cfgErr := session.LoadUserConfig(); cfgErr == nil && cfg != nil {
+		if session.ReconcileDeclarativeGroups(groupTree, cfg) {
+			if err := storage.SaveGroupsOnly(groupTree); err != nil {
+				fmt.Fprintf(os.Stderr, "warning: failed to persist declarative groups: %v\n", err)
+			}
+		}
+	}
 
 	// Resolve parent session if specified
 	var parentInstance *session.Instance
@@ -1513,6 +1541,13 @@ func handleAdd(profile string, args []string) {
 		newInstance = session.NewInstanceWithGroup(sessionTitle, path, sessionGroup)
 	} else {
 		newInstance = session.NewInstance(sessionTitle, path)
+	}
+
+	// Quick mode generated a machine-named adjective-noun handle; mark it so the
+	// TUI shows Claude's live task description in place of the random name. This
+	// mirrors the exact condition used above to generate sessionTitle.
+	if isQuick && !userProvidedTitle {
+		newInstance.SetAutoName(true)
 	}
 
 	// Socket-isolation CLI override (issue #687 phase 1, v1.7.50). The
@@ -1870,6 +1905,7 @@ func handleList(profile string, args []string) {
 			Model         string    `json:"model,omitempty"`
 			ModelVersion  string    `json:"model_version,omitempty"`
 			Status        string    `json:"status"`
+			Substate      string    `json:"substate,omitempty"` // Honest Status v2: additive refinement
 			TmuxSession   string    `json:"tmux_session,omitempty"`
 			Profile       string    `json:"profile"`
 			CreatedAt     time.Time `json:"created_at"`
@@ -1893,6 +1929,7 @@ func handleList(profile string, args []string) {
 				Tool:          inst.Tool,
 				Command:       inst.Command,
 				Status:        StatusString(inst.Status),
+				Substate:      string(inst.Substate()),
 				Profile:       storage.Profile(),
 				CreatedAt:     inst.CreatedAt,
 				SSHHost:       inst.SSHHost,
@@ -2365,7 +2402,12 @@ func handleStatus(profile string, args []string) {
 			Model        string `json:"model,omitempty"`
 			ModelVersion string `json:"model_version,omitempty"`
 			Status       string `json:"status"`
-			Path         string `json:"path"`
+			// Substate is the additive Honest-Status-v2 refinement
+			// (model-unavailable, auth-401, idle-at-empty-prompt, running).
+			// ADDED, never renamed: existing fields stay byte-stable; omitempty
+			// so the default "" never appears in output.
+			Substate string `json:"substate,omitempty"`
+			Path     string `json:"path"`
 		}
 		type statusJSON struct {
 			Waiting  int                 `json:"waiting"`
@@ -2390,11 +2432,12 @@ func handleStatus(profile string, args []string) {
 			for _, inst := range instances {
 				_ = inst.UpdateStatus()
 				sj := statusSessionJSON{
-					ID:     inst.ID,
-					Title:  inst.Title,
-					Tool:   inst.Tool,
-					Status: StatusString(inst.Status),
-					Path:   inst.ProjectPath,
+					ID:       inst.ID,
+					Title:    inst.Title,
+					Tool:     inst.Tool,
+					Status:   StatusString(inst.Status),
+					Substate: string(inst.Substate()),
+					Path:     inst.ProjectPath,
 				}
 				if modelInfo := inst.LaunchModelInfo(); modelInfo.ModelID != "" {
 					sj.ModelID = modelInfo.ModelID
@@ -2427,7 +2470,11 @@ func handleStatus(profile string, args []string) {
 				if strings.HasPrefix(path, home) {
 					path = "~" + path[len(home):]
 				}
-				fmt.Printf("  %s %-16s %-10s %-22s %s\n", symbol, inst.Title, inst.Tool, truncate(modelStatusDisplay(inst), 22), path)
+				suffix := ""
+				if lbl := SubstateLabel(inst.Substate()); lbl != "" {
+					suffix = "  [" + lbl + "]"
+				}
+				fmt.Printf("  %s %-16s %-10s %-22s %s%s\n", symbol, inst.Title, inst.Tool, truncate(modelStatusDisplay(inst), 22), path, suffix)
 			}
 			fmt.Println()
 		}
@@ -3015,6 +3062,7 @@ func printHelp() {
 	fmt.Println("  codex-hooks      Manage Codex notify hook integration")
 	fmt.Println("  gemini-hooks     Manage Gemini hook integration")
 	fmt.Println("  hermes-hooks     Manage Hermes Agent hook integration")
+	fmt.Println("  cursor-hooks     Manage Cursor Agent CLI hook integration")
 	fmt.Println("  group            Manage groups")
 	fmt.Println("  worktree, wt     Manage git worktrees")
 	fmt.Println("  web              Start TUI with web UI server running alongside")
@@ -3060,6 +3108,9 @@ func printHelp() {
 	fmt.Println("  hermes-hooks install      Install Hermes Agent hooks")
 	fmt.Println("  hermes-hooks uninstall    Remove Hermes Agent hooks")
 	fmt.Println("  hermes-hooks status       Show Hermes hooks install status")
+	fmt.Println("  cursor-hooks install      Install Cursor hooks")
+	fmt.Println("  cursor-hooks uninstall    Remove Cursor hooks")
+	fmt.Println("  cursor-hooks status       Show Cursor hooks install status")
 	fmt.Println()
 	fmt.Println("Group Commands:")
 	fmt.Println("  group list                List all groups")

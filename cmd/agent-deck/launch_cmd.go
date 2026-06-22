@@ -83,6 +83,9 @@ func handleLaunch(profile string, args []string) {
 	// Persisted plaintext in state.db — do NOT pass secrets like API keys.
 	var extraArgFlags []string
 	fs.Func("extra-arg", "Extra claude CLI token (can specify multiple times); requires -c claude; persisted plaintext — no secrets", func(s string) error {
+		if err := session.ValidateClaudeExtraArgToken(s); err != nil {
+			return err
+		}
 		extraArgFlags = append(extraArgFlags, s)
 		return nil
 	})
@@ -122,6 +125,7 @@ func handleLaunch(profile string, args []string) {
 		fmt.Println("  agent-deck launch . -c claude -m \"Fix bug\" --no-wait")
 		fmt.Println("  agent-deck launch . -c \"codex --dangerously-bypass-approvals-and-sandbox\"")
 		fmt.Println("  agent-deck launch . -g ard --no-parent -c claude -m \"Run review\"")
+		fmt.Println("  agent-deck launch . -c claude -w feature/new -b -m \"Start work\"")
 	}
 
 	// Reorder args: move path to end so flags are parsed correctly
@@ -559,7 +563,7 @@ func handleLaunch(profile string, args []string) {
 	if initialMessage != "" && *noWait {
 		tmuxSess := newInstance.GetTmuxSession()
 		if tmuxSess != nil {
-			if err := sendWithRetryTarget(tmuxSess, initialMessage, skipClaudeDeliveryVerify(newInstance.Tool), sendRetryOptions{
+			if _, err := sendWithRetryTarget(tmuxSess, initialMessage, skipClaudeDeliveryVerify(newInstance.Tool), sendRetryOptions{
 				maxRetries: 8,
 				checkDelay: 150 * time.Millisecond,
 			}); err != nil {

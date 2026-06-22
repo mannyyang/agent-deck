@@ -115,8 +115,45 @@ func currentTmuxThemeStyle() tmuxThemeStyle {
 	}
 }
 
+// Status-bar hint labels. The attach loop's detach/switch keys are configurable
+// ([hotkeys].detach / [hotkeys].switch_session), so the status-right hint must
+// follow the resolved bindings instead of hardcoding them. The UI layer pushes
+// the resolved labels here via SetStatusHints whenever hotkeys are (re)resolved;
+// the defaults keep the hint correct for the default config before that first
+// call. switchHintEnabled is false when the switch key is unbound or collides
+// with detach (the attach loop drops it in those cases), so the hint then omits
+// the switch segment.
+var (
+	statusHintMu      sync.RWMutex
+	detachHintLabel   = "ctrl+q"
+	switchHintLabel   = "ctrl+s"
+	switchHintEnabled = true
+)
+
+// SetStatusHints updates the detach/switch key labels shown in the tmux
+// status-right bar. Empty labels are ignored (the existing value is kept).
+func SetStatusHints(detach, switchKey string, switchEnabled bool) {
+	statusHintMu.Lock()
+	defer statusHintMu.Unlock()
+	if detach != "" {
+		detachHintLabel = detach
+	}
+	if switchKey != "" {
+		switchHintLabel = switchKey
+	}
+	switchHintEnabled = switchEnabled
+}
+
 func (s *Session) themedStatusRight(themeStyle tmuxThemeStyle) string {
-	return fmt.Sprintf("#[fg=%s]ctrl+q detach#[default] · #[fg=%s]ctrl+s switch#[default] │ 📁 %s | %s ", themeStyle.hintColor, themeStyle.hintColor, s.DisplayName, s.projectDisplayName())
+	statusHintMu.RLock()
+	detach, switchKey, switchOn := detachHintLabel, switchHintLabel, switchHintEnabled
+	statusHintMu.RUnlock()
+
+	hints := fmt.Sprintf("#[fg=%s]%s detach#[default]", themeStyle.hintColor, detach)
+	if switchOn {
+		hints += fmt.Sprintf(" · #[fg=%s]%s switch#[default]", themeStyle.hintColor, switchKey)
+	}
+	return fmt.Sprintf("%s │ 📁 %s | %s ", hints, s.DisplayName, s.projectDisplayName())
 }
 
 func (s *Session) projectDisplayName() string {
@@ -235,7 +272,7 @@ func RefreshSessionCache() {
 	// Subprocess fallback: list-windows -a (3s timeout to prevent freeze when server is dead)
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	cmd := tmuxExecContext(ctx, DefaultSocketName(), "list-windows", "-a", "-F", "#{session_name}\t#{window_activity}\t#{window_index}\t#{window_name}")
+	cmd := tmuxExecContext(ctx, DefaultSocketName(), "list-windows", "-a", "-F", tmuxFmt("#{session_name}", "#{window_activity}", "#{window_index}", "#{window_name}"))
 	output, err := cmd.Output()
 	if err != nil {
 		sessionCacheMu.Lock()
@@ -258,8 +295,10 @@ func RefreshSessionCache() {
 	windowCacheMu.Unlock()
 }
 
-// parseListWindowsOutput parses the output of `tmux list-windows -a` with the extended format
-// "#{session_name}\t#{window_activity}\t#{window_index}\t#{window_name}"
+// parseListWindowsOutput parses the output of `tmux list-windows -a` with the
+// extended format tmuxFmt("#{session_name}", "#{window_activity}",
+// "#{window_index}", "#{window_name}"). window_name is last so a tmuxFieldSep
+// inside it survives SplitN.
 // Returns session-level max activity and per-session window info.
 func parseListWindowsOutput(output string) (map[string]int64, map[string][]WindowInfo) {
 	sessionCache := make(map[string]int64)
@@ -269,7 +308,7 @@ func parseListWindowsOutput(output string) (map[string]int64, map[string][]Windo
 		if line == "" {
 			continue
 		}
-		parts := strings.SplitN(line, "\t", 4)
+		parts := strings.SplitN(line, tmuxFieldSep, 4)
 		if len(parts) < 2 {
 			continue
 		}
@@ -810,6 +849,13 @@ type Session struct {
 
 	// Last status returned (for debugging)
 	lastStableStatus string
+
+	// lastSubstate is the additive Honest-Status-v2 refinement computed
+	// alongside the coarse status during GetStatus (model-unavailable,
+	// auth-401, idle-at-empty-prompt, running). Surfaced via GetSubstate so the
+	// CLI/TUI/transition-event layers can report WHY a session is in its status
+	// without changing the byte-stable canonical status string.
+	lastSubstate Substate
 
 	// hashFallbackOnce gates the one-time hash_fallback_used WARN landmark.
 	// See logging_additions.go and logging-review G8.
@@ -2109,8 +2155,15 @@ func (s *Session) IsPaneDead() bool {
 	if info, ok := GetCachedPaneInfo(s.Name); ok {
 		return info.Dead
 	}
-	// Cache miss: direct tmux check targeting the primary pane.
-	out, err := s.tmuxCmd("list-panes", "-t", s.Name+":0.0", "-F", "#{pane_dead}").Output()
+	// Cache miss: direct tmux check targeting the primary pane. Bound it the
+	// same way Exists() bounds has-session — a wedged tmux server must not hang
+	// this probe, since it runs under the notify-daemon's single-threaded poll
+	// loop (via UpdateStatus → GetStatus) where a stall freezes all delivery.
+	// A timed-out (indeterminate) probe is treated as "not dead": reporting a
+	// live pane as dead would flip the session to an error state.
+	ctx, cancel := context.WithTimeout(context.Background(), hasSessionProbeTimeout)
+	defer cancel()
+	out, err := s.tmuxCmdContext(ctx, "list-panes", "-t", s.Name+":0.0", "-F", "#{pane_dead}").Output()
 	if err != nil {
 		return false
 	}
@@ -2891,6 +2944,10 @@ func (s *Session) GetStatus() (string, error) {
 	if !s.Exists() {
 		s.mu.Lock()
 		s.lastStableStatus = "inactive"
+		// No live pane → no live substate; clear it so CachedSubstate (used by
+		// the transition daemon + TUI) cannot emit/show a stale error substate
+		// for a stopped session.
+		s.lastSubstate = SubstateNone
 		s.mu.Unlock()
 		statusLog.Debug("session_inactive", slog.String("session", shortName))
 		return "inactive", nil
@@ -2900,6 +2957,7 @@ func (s *Session) GetStatus() (string, error) {
 	if s.IsPaneDead() {
 		s.mu.Lock()
 		s.lastStableStatus = "inactive"
+		s.lastSubstate = SubstateNone
 		s.mu.Unlock()
 		statusLog.Debug("pane_dead", slog.String("session", shortName))
 		return "inactive", nil
@@ -2990,6 +3048,44 @@ func (s *Session) GetStatus() (string, error) {
 		} else if err == nil {
 			s.ensureStateTrackerLocked()
 
+			// Honest Status v2: compute the additive substate from the content we
+			// already captured (pure string ops; no extra pane capture). This
+			// keeps lastSubstate fresh for the reporting layers.
+			s.lastSubstate = s.classifySubstate(content)
+
+			// Honest Status v2: a model-unavailable no-op loop ("X is currently
+			// unavailable" / "Crunched for 0s") is the Fable-down case that this
+			// feature exists to surface. It must short-circuit to "error" BEFORE
+			// the busy check: the "✶ Crunched for 0s" completion line carries a
+			// decorative asterisk that hasBusyIndicator would otherwise misread
+			// as an active spinner and report "running" — the exact false-alive
+			// this feature fixes. classifySubstate already excluded a real
+			// (non-zero) crunch, so only the genuine no-op reaches here.
+			if s.lastSubstate == SubstateModelUnavailable {
+				s.resetPromptNoBusyHoldLocked()
+				s.lastStableStatus = "error"
+				s.startupAt = time.Time{}
+				statusLog.Debug("model_unavailable_noop", slog.String("session", shortName))
+				return "error", nil
+			}
+
+			// A TERMINAL auth/connection-failure banner (#1400) routes to "error"
+			// BEFORE the busy check: a real 401 stops the spinner, so a stale busy
+			// glyph lingering in the same window must not mask the failure as
+			// "running". hasErrorBannerIndicator already EXCLUDES the in-flight
+			// retry case (rendered behind the "⎿" tool-result connector with a
+			// live spinner), so a session that is genuinely retrying is NOT
+			// matched here and still reaches the busy check below — preserving
+			// #1400's "a retry in progress is still working" intent. The substate
+			// (in s.lastSubstate) names WHICH failure for the TUI glyph.
+			if s.hasErrorBannerIndicator(content) {
+				s.resetPromptNoBusyHoldLocked()
+				s.lastStableStatus = "error"
+				s.startupAt = time.Time{}
+				statusLog.Debug("error_banner_detected", slog.String("session", shortName), slog.String("substate", string(s.lastSubstate)))
+				return "error", nil
+			}
+
 			// Check for explicit busy indicator (spinner, "ctrl+c to interrupt")
 			isExplicitlyBusy := s.hasBusyIndicator(content)
 			// Debug: show last line of content for this session
@@ -3035,6 +3131,10 @@ func (s *Session) GetStatus() (string, error) {
 				// real new work and causes idle -> waiting flapping.
 				s.stateTracker.lastHash = currentHash
 			}
+
+			// (Auth/connection-failure banners and the model-unavailable no-op
+			// already routed to "error" above, before the busy check, so by here
+			// the session is neither wedged nor busy.)
 
 			// Not busy. Check for prompt indicators to distinguish YELLOW vs fall-through.
 			hasPrompt := s.hasPromptIndicator(content)
@@ -3179,6 +3279,17 @@ func (s *Session) GetStatus() (string, error) {
 						s.stateTracker.lastHash = currentHash
 					}
 
+					// Error banner takes precedence over prompt detection (#1400).
+					if s.hasErrorBannerIndicator(content) {
+						s.resetPromptNoBusyHoldLocked()
+						s.stateTracker.activityCheckStart = time.Time{}
+						s.stateTracker.activityChangeCount = 0
+						s.lastStableStatus = "error"
+						s.startupAt = time.Time{}
+						statusLog.Debug("sustained_error_banner", slog.String("session", shortName))
+						return "error", nil
+					}
+
 					if s.hasPromptIndicator(content) {
 						if s.stateTracker.acknowledged {
 							s.resetPromptNoBusyHoldLocked()
@@ -3265,6 +3376,14 @@ func (s *Session) GetStatus() (string, error) {
 			statusLog.Debug("still_busy", slog.String("session", shortName))
 			return "active", nil
 		}
+		// Error banner takes precedence over prompt detection (#1400).
+		if captureErr == nil && s.hasErrorBannerIndicator(content) {
+			s.resetPromptNoBusyHoldLocked()
+			s.lastStableStatus = "error"
+			s.startupAt = time.Time{}
+			statusLog.Debug("error_banner_recheck", slog.String("session", shortName))
+			return "error", nil
+		}
 		if captureErr == nil && s.hasPromptIndicator(content) {
 			// Not busy, but prompt visible. Transition to waiting/idle.
 			if !s.stateTracker.acknowledged {
@@ -3300,6 +3419,15 @@ func (s *Session) GetStatus() (string, error) {
 		s.startupAt = time.Time{}
 		statusLog.Debug("idle_acknowledged", slog.String("session", shortName))
 		return "idle", nil
+	}
+	// Sticky error (#1400): an error-banner verdict persists across polls that
+	// skip the pane capture (no new activity). Without this, the error would
+	// surface for one poll and settle back to "waiting" even though the banner
+	// is still on screen. Cleared by new activity (re-captures and
+	// re-evaluates: busy/prompt/banner) or by user acknowledgment above.
+	if s.lastStableStatus == "error" {
+		statusLog.Debug("error_banner_sticky", slog.String("session", shortName))
+		return "error", nil
 	}
 	if s.inStartupWindowLocked() {
 		s.resetPromptNoBusyHoldLocked()
@@ -3369,6 +3497,18 @@ func (s *Session) getStatusFallback() (string, error) {
 		s.startupAt = time.Time{}
 		statusLog.Debug("fallback_active", slog.String("session", shortName))
 		return "active", nil
+	}
+
+	// Error banner takes precedence over prompt detection (#1400).
+	if s.hasErrorBannerIndicator(content) {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		s.ensureStateTrackerLocked()
+		s.resetPromptNoBusyHoldLocked()
+		s.lastStableStatus = "error"
+		s.startupAt = time.Time{}
+		statusLog.Debug("fallback_error_banner", slog.String("session", shortName))
+		return "error", nil
 	}
 
 	if s.hasPromptIndicator(content) {
@@ -3803,6 +3943,85 @@ func (s *Session) hasPromptIndicator(content string) bool {
 		s.cachedPromptDetectorTool = tool
 	}
 	return s.cachedPromptDetector.HasPrompt(content)
+}
+
+// hasErrorBannerIndicator reports whether the pane shows an error banner the
+// tool itself rendered (auth failure / dead connection — see
+// PromptDetector.HasErrorBanner, issue #1400). Checked AFTER the busy
+// indicator (busy is authoritative: an API-error retry in progress is still
+// working) and BEFORE prompt detection (after a terminal failure the tool
+// redraws its input prompt below the banner, so prompt detection alone would
+// report "waiting" for a session that cannot make progress).
+func (s *Session) hasErrorBannerIndicator(content string) bool {
+	tool := inferToolFromSessionFields(s.detectedTool, s.customToolName, s.Command)
+	if tool == "" {
+		return false
+	}
+	// Reuse cached detector if tool hasn't changed (avoids allocation per call)
+	if s.cachedPromptDetector == nil || s.cachedPromptDetectorTool != tool {
+		s.cachedPromptDetector = NewPromptDetector(tool)
+		s.cachedPromptDetectorTool = tool
+	}
+	return s.cachedPromptDetector.HasErrorBanner(content)
+}
+
+// classifySubstate computes the additive Honest-Status-v2 substate for the
+// pane content (model-unavailable, auth-401, idle-at-empty-prompt, running).
+// Tool is inferred from the session's fields; non-claude tools yield
+// SubstateNone. Pure with respect to session state.
+func (s *Session) classifySubstate(content string) Substate {
+	tool := inferToolFromSessionFields(s.detectedTool, s.customToolName, s.Command)
+	if tool == "" {
+		return SubstateNone
+	}
+	if s.cachedPromptDetector == nil || s.cachedPromptDetectorTool != tool {
+		s.cachedPromptDetector = NewPromptDetector(tool)
+		s.cachedPromptDetectorTool = tool
+	}
+	return s.cachedPromptDetector.ClassifySubstate(content)
+}
+
+// GetSubstate captures the pane once and returns the additive Honest-Status-v2
+// substate (see Substate). It is an independent read used by the status-reporting
+// layers (CLI status --json, TUI label/glyph, transition events); it does NOT
+// influence the canonical status returned by GetStatus, so existing status
+// behavior stays byte-stable. Returns SubstateNone on a dead/absent pane, a
+// capture failure, or a non-claude tool.
+func (s *Session) GetSubstate() Substate {
+	if !s.Exists() || s.IsPaneDead() {
+		// A dead/absent pane has no live substate; clear the cached value so a
+		// stale auth/model-unavailable glyph does not linger on a stopped
+		// session in the TUI.
+		s.mu.Lock()
+		s.lastSubstate = SubstateNone
+		s.mu.Unlock()
+		return SubstateNone
+	}
+	rawContent, err := s.CapturePane()
+	if err != nil {
+		s.mu.Lock()
+		cached := s.lastSubstate
+		s.mu.Unlock()
+		return cached
+	}
+	content := StripANSI(rawContent)
+	// Hold s.mu across classifySubstate: it mutates the shared
+	// cachedPromptDetector, which GetStatus also touches under the same lock.
+	s.mu.Lock()
+	sub := s.classifySubstate(content)
+	s.lastSubstate = sub
+	s.mu.Unlock()
+	return sub
+}
+
+// CachedSubstate returns the last substate computed by GetStatus/GetSubstate
+// WITHOUT capturing the pane. Use it on the TUI render hot path, where the
+// background status loop already keeps the value fresh and a per-row capture
+// would be too expensive.
+func (s *Session) CachedSubstate() Substate {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastSubstate
 }
 
 // lastNLines splits content into lines, trims trailing blank lines, and returns
@@ -4762,31 +4981,76 @@ func InitializeStatusBarOptions() error {
 func RefreshStatusBarImmediate() error {
 	socket := DefaultSocketName()
 	// Get all connected clients, filtering out control mode clients
-	cmd := tmuxExec(socket, "list-clients", "-F", "#{client_name}\t#{client_control_mode}")
+	// client_name is free-text (a pts path) so it goes LAST, after the 0/1
+	// control-mode flag, to stay collision-safe under tmuxFieldSep.
+	cmd := tmuxExec(socket, "list-clients", "-F", tmuxFmt("#{client_control_mode}", "#{client_name}"))
 	output, err := cmd.Output()
 	if err != nil {
 		return nil
 	}
 
 	for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
-		parts := strings.SplitN(line, "\t", 2)
-		if len(parts) != 2 || parts[0] == "" {
+		parts := strings.SplitN(line, tmuxFieldSep, 2)
+		if len(parts) != 2 || parts[1] == "" {
 			continue
 		}
 		// Skip control mode clients (PipeManager pipes)
-		if parts[1] == "1" {
+		if parts[0] == "1" {
 			continue
 		}
-		_ = tmuxExec(socket, "refresh-client", "-S", "-t", parts[0]).Run()
+		_ = tmuxExec(socket, "refresh-client", "-S", "-t", parts[1]).Run()
 	}
 	return nil
 }
 
-// GetAttachedSessions returns the names of tmux sessions that have real clients attached.
-// Used to detect which session the user is currently viewing.
-// Filters out control mode clients (from PipeManager) which are not real user sessions.
+// GetAttachedSessions returns the names of tmux sessions that have real clients
+// attached on the default socket. Used to detect which session the user is
+// currently viewing. Filters out control mode clients (from PipeManager) which
+// are not real user sessions.
 func GetAttachedSessions() ([]string, error) {
-	cmd := tmuxExec(DefaultSocketName(), "list-clients", "-F", "#{session_name}\t#{client_control_mode}")
+	return attachedSessionsOnSocket(DefaultSocketName())
+}
+
+// GetAttachedSessionsOnSockets returns the union of attached (non-control)
+// session names across the given sockets. The default socket is always
+// consulted, then each distinct extra socket; "" denotes the default socket.
+// Sockets with no running server (or any list-clients error) are skipped
+// silently. Order is unspecified and duplicates are removed.
+//
+// This is the socket-aware counterpart to GetAttachedSessions: a session
+// attached on an isolated agent-deck socket (TmuxSocketName != "") is invisible
+// to a default-socket-only query, so callers that must pin every attached
+// session regardless of socket use this instead.
+func GetAttachedSessionsOnSockets(sockets ...string) []string {
+	socketSeen := make(map[string]bool, len(sockets)+1)
+	nameSeen := map[string]bool{}
+	var out []string
+	for _, sock := range append([]string{DefaultSocketName()}, sockets...) {
+		sock = strings.TrimSpace(sock)
+		if socketSeen[sock] {
+			continue
+		}
+		socketSeen[sock] = true
+		names, err := attachedSessionsOnSocket(sock)
+		if err != nil {
+			continue
+		}
+		for _, n := range names {
+			if !nameSeen[n] {
+				nameSeen[n] = true
+				out = append(out, n)
+			}
+		}
+	}
+	return out
+}
+
+// attachedSessionsOnSocket lists the non-control-mode sessions with a client
+// attached on a single tmux socket ("" = default server).
+func attachedSessionsOnSocket(socket string) ([]string, error) {
+	// session_name is sanitized to [A-Za-z0-9-], so it never contains
+	// tmuxFieldSep; no reordering needed here.
+	cmd := tmuxExec(socket, "list-clients", "-F", tmuxFmt("#{session_name}", "#{client_control_mode}"))
 	output, err := cmd.Output()
 	if err != nil {
 		return nil, err
@@ -4794,7 +5058,7 @@ func GetAttachedSessions() ([]string, error) {
 
 	var sessions []string
 	for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
-		parts := strings.SplitN(line, "\t", 2)
+		parts := strings.SplitN(line, tmuxFieldSep, 2)
 		if len(parts) != 2 || parts[0] == "" {
 			continue
 		}
