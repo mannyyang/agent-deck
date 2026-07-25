@@ -9,8 +9,8 @@ LDFLAGS=-ldflags "-X main.Version=$(VERSION)"
 TAILWIND_VERSION=v4.2.2
 TAILWIND_BIN=$(HOME)/.local/bin/tailwindcss
 
-# Pin Go toolchain for reproducible builds
-export GOTOOLCHAIN=go1.25.11
+# Keep local and CI builds on the version required by go.mod.
+export GOTOOLCHAIN=go1.25.12
 
 # Build the binary (requires compiled CSS via `make css`)
 build: css

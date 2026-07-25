@@ -1,16 +1,19 @@
 # Configuration Reference
 
-All options for `~/.agent-deck/config.toml`.
+All options for `$XDG_CONFIG_HOME/agent-deck/config.toml` (default `~/.config/agent-deck/config.toml`; legacy `~/.agent-deck/config.toml` still honored).
 
 ## Table of Contents
 
 - [Top-Level](#top-level)
 - [[shell] Section](#shell-section)
 - [[claude] Section](#claude-section)
+- [Per-group / per-conductor Claude overrides](#per-group--per-conductor-claude-overrides)
+- [[group_defaults] Section](#group_defaults-section)
 - [[gemini] Section](#gemini-section)
 - [[opencode] Section](#opencode-section)
 - [[codex] Section](#codex-section)
 - [[copilot] Section](#copilot-section)
+- [[cursor] Section](#cursor-section)
 - [[hermes] Section](#hermes-section)
 - [[docker] Section](#docker-section)
 - [[worktree] Section](#worktree-section)
@@ -21,6 +24,7 @@ All options for `~/.agent-deck/config.toml`.
 - [[display] Section](#display-section)
 - [[ui] Section](#ui-section)
 - [[global_search] Section](#global_search-section)
+- [[performance] Section](#performance-section)
 - [Skills Registry (Outside config.toml)](#skills-registry-outside-configtoml)
 - [[mcp_pool] Section](#mcp_pool-section)
 - [[mcps.*] Section](#mcps-section)
@@ -31,6 +35,7 @@ All options for `~/.agent-deck/config.toml`.
 
 ```toml
 default_tool = "claude"   # Pre-selected tool when creating sessions
+default_path = ""         # Fallback project directory for add/launch without a path
 sync_title   = true       # Let agents rename sessions from their session-name
 group_sort   = "creation" # within-group order: "creation" (default) or "actionable"
 ```
@@ -38,6 +43,7 @@ group_sort   = "creation" # within-group order: "creation" (default) or "actiona
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
 | `default_tool` | string | `"claude"` | Pre-selected tool when creating sessions. |
+| `default_path` | string | `""` | Fallback project directory for `add` and `launch` when no path argument is given (#1303). Resolution chain: explicit path arg (including `.`, which always means the current directory) → target group's `default_path` (DB-resident, set via `group update` or the TUI) → this key → cwd. Supports `~` and `$VAR` expansion; silently skipped if the directory doesn't exist. |
 | `sync_title` | bool | `true` | When `true`, agent-deck overwrites a session's title with the agent's own session-name (e.g. Claude's `--name` / `/rename`, issues #572/#697). Set `false` to keep the title you gave the session — globally, for every tool. The per-session title-lock (`agent-deck session set-title-lock <id> on`) remains as a finer-grained override. Also toggleable in the TUI Settings panel (`S`) under **SESSIONS**. |
 | `group_sort` | string | `"creation"` | Order of sessions within a group. `"creation"` (default) keeps the order sessions were created in, and respects the `K`/`J` manual reorder. `"actionable"` restores the issue #857 sort that surfaces the most recently actionable sessions (error → waiting → running → idle → stopped, then recency) to the top of each group. Pin and Maestro rows are unaffected by this setting. |
 
@@ -68,8 +74,15 @@ Environment sources are applied in this order (later overrides earlier):
 
 1. Global `[shell].env_files` (in order)
 2. `[shell].init_script`
-3. Tool-specific `env_file` (`[claude].env_file`, `[gemini].env_file`, `[tools.X].env_file`)
-4. Inline env vars from `[tools.X].env` (highest priority)
+3. Tool-specific `env_file` (`[claude].env_file`, `[gemini].env_file`, `[tools.X].env_file` — for Claude, the group/conductor `env_file` overrides the global one; see [Per-group / per-conductor Claude overrides](#per-group--per-conductor-claude-overrides))
+4. Per-group / per-conductor inline env (`[groups.X.claude].env`, `[conductors.X.claude].env`) — exported after the env_file source, so an inline key wins over the same key from the file
+5. Inline env vars from `[tools.X].env` (highest priority)
+
+A configured `env_file` that does not exist at spawn prints an
+`agent-deck: warning: env_file not found: <path>` line in the session pane
+(and a debug-log warning) instead of being silently skipped. A config.toml
+that fails to parse is also surfaced in the pane at spawn — in that state
+every override is inactive and sessions launch on defaults.
 
 ## [claude] Section
 
@@ -103,6 +116,7 @@ config_dir = "~/.claude-team"      # Optional override for profile "work"
 | `vim_mode` | bool | `false` | Set when the inner Claude Code prompt uses vim keybindings (`"editorMode": "vim"`). Each `session send` then prepends an Escape + `i` insert-mode guarantee so a message sent while the prompt is in vim NORMAL mode actually submits instead of being typed-but-unsent (issue #1264). Only affects Claude-compatible tools. |
 | `extra_args` | array of strings | `[]` | Extra Claude CLI flags remembered from the New Session dialog and appended to new/restarted Claude sessions. Do not store secrets here. |
 | `env_file` | string | `""` | A .env file sourced for Claude sessions only. Sourced after global `[shell].env_files`. See [Path Resolution](#path-resolution). |
+| `hooks_enabled` | bool | `true` | Enables Claude Code lifecycle hooks for real-time status detection. Set `false` to opt out of hook-based detection and the TUI install prompt. |
 | `command` | string | `"claude"` | Override the binary/invocation (e.g., `"cdw"` for a wrapper that sets `CLAUDE_CONFIG_DIR`). |
 
 Config resolution order for Claude config dir:
@@ -141,6 +155,59 @@ agent-deck hooks status
 agent-deck hooks status -p work
 agent-deck hooks status -p clientx
 ```
+
+## Per-group / per-conductor Claude overrides
+
+`[groups."<path>".claude]` and `[conductors.<name>.claude]` carry the same
+key surface (the two blocks are deliberate mirrors) and scope Claude
+settings to one group subtree or one conductor:
+
+```toml
+[groups."work".claude]
+config_dir = "~/.claude-work"        # Account isolation for this group subtree
+env_file   = "~/.agent-deck/groups/work.env"
+command    = "claude-wrapper"        # Per-group claude command/wrapper
+model      = "claude-sonnet-4-6"     # Model default for sessions in this group
+env        = { AGENT_ROLE = "work", CLAUDE_CODE_EFFORT_LEVEL = "high" }
+skills     = ["my-store/loom"]       # Managed project-skill symlinks
+plugins    = ["octopus"]             # Top-level [plugins.X] catalog keys
+mcps       = ["memory"]              # Declarative loadout ([mcps.X] catalog names)
+
+[conductors.lilu.claude]
+# identical key surface; conductor beats group on every key
+```
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `config_dir` | string | Overrides `[claude].config_dir` for sessions in this group / this conductor. Ancestor-walking for groups: a child group inherits the nearest ancestor's value. |
+| `env_file` | string | Sourced for these sessions instead of the global `[claude].env_file`. Ancestor-walking. Missing file → pane warning at spawn. |
+| `command` | string | Claude command/wrapper for these sessions. Resolution: conductor > group (ancestor-walking) > `[claude].command` > `"claude"`. Like the global `command`, a non-`"claude"` value suppresses the `CLAUDE_CONFIG_DIR=` spawn prefix (the wrapper is assumed to handle it). |
+| `model` | string | Model default for these sessions. Resolution: explicit per-session model (`--model`, dialog) > conductor > group (ancestor-walking) > no flag (Claude's own default). Empty falls through — the global `default_model` remains a new-session-dialog prefill only. Resolved at every start/restart, so config edits apply without re-creating sessions. |
+| `env` | inline table | Env vars exported in the spawn command AFTER the `env_file` source — an inline key deterministically wins over the same key from the file. Merge order per key: ancestor groups (root-first) → exact group → conductor. Parent-only keys persist through the merge. |
+| `skills` | array | Declarative project skills (`"<source>/<name>"` entries against the skill-source registry). Materialized at session create and re-asserted before every start/restart. Attach-only floor: config removal never detaches and foreign targets are never clobbered. Workspace trust is seeded only after an attachment succeeds. |
+| `plugins` | array | Top-level `[plugins.X]` catalog keys appended to `Instance.Plugins`. Existing manual plugin selections are preserved. Catalog refusal and validation rules remain authoritative. |
+| `mcps` | array | Declarative MCP loadout (`[mcps.X]` catalog names appended to the session's local `.mcp.json`). Same attach-only floor semantics; unknown catalog names skip with a warning. |
+
+Verify what a group actually resolves to — including whether the `env_file`
+exists and whether config.toml parsed at all:
+
+```bash
+agent-deck group show work --resolved
+agent-deck group show work --resolved --json
+```
+
+## [group_defaults] Section
+
+Defaults stamped onto **newly-created** groups. Existing groups are unaffected.
+
+```toml
+[group_defaults]
+max_concurrent = 3   # new groups cap at 3 concurrent sessions
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `max_concurrent` | int | `1` (serial) | `max_concurrent` for new groups created via `group create`, the TUI/web create dialogs, and the launch/session auto-create paths. `0` = unlimited, `1` = serial, `N` = cap. Unset keeps the built-in serial default. An explicit `group create --max-concurrent N` flag overrides this per group; existing groups keep their stored value. |
 
 ## [gemini] Section
 
@@ -213,6 +280,19 @@ command = "copilot"
 |-----|------|---------|-------------|
 | `env_file` | string | `""` | A .env file sourced for Copilot sessions only. See [Path Resolution](#path-resolution). |
 | `command` | string | `"copilot"` | Override the binary/invocation. |
+
+## [cursor] Section
+
+Cursor Agent CLI integration settings.
+
+```toml
+[cursor]
+hooks_enabled = false  # Disable automatic Cursor hook injection on TUI startup
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `hooks_enabled` | bool | `true` | When `true`, TUI startup silently injects agent-deck lifecycle hooks into `~/.cursor/hooks.json` whenever the `cursor` binary is on `PATH` (real-time status detection). Set `false` to durably opt out; `agent-deck cursor-hooks uninstall` writes this automatically so the uninstall survives TUI restarts (issue #1672). Re-enable with `agent-deck cursor-hooks install` or by removing the key. Mirrors `[claude] hooks_enabled`. |
 
 ## [hermes] Section
 
@@ -424,6 +504,7 @@ footer = "full"                               # Footer hint bar: "full", "curate
 hidden_tools = ["gemini", "opencode", "pi"]   # Denylist: hide these from the picker
 show_only_installed_tools = true              # Also hide tools not found on PATH
 new_session_enter_advances = false            # Opt OUT: restore Enter-submits behavior
+attach_on_create = true                       # Opt IN: instantly attach to a newly created session
 ```
 
 | Key | Type | Default | Description |
@@ -432,6 +513,7 @@ new_session_enter_advances = false            # Opt OUT: restore Enter-submits b
 | `hidden_tools` | []string | `[]` | Tool names to hide from the new-session picker. `shell` is always shown and cannot be hidden. Unknown names log a warning and are ignored. Edit via TUI **Settings (`S`) → Visible tools…** or by hand in `config.toml`. |
 | `show_only_installed_tools` | bool | `false` | When `true`, hides built-in and custom tools whose command does not resolve on the host `PATH`. `shell` stays visible. If nothing else resolves, the picker falls back to showing all tools with a one-line hint. Toggle in TUI Settings under **TOOL PICKER**. |
 | `new_session_enter_advances` | bool | `true` | Controls what **Enter** does on the free-text **Name** / **Branch** fields of the new-session dialog. Default `true`: Enter **advances** to the next field, so typing a name and pressing Enter no longer silently creates a session with all defaults. **Ctrl+S** is the explicit "create now" shortcut and submits from any field in both modes. Set `false` to restore the legacy behavior where Enter on Name/Branch submits the form. |
+| `attach_on_create` | bool | `false` | When `true`, creating a session in the TUI (`n` new-session dialog) **immediately attaches** to the new session's pane instead of only moving the cursor to it — "instantly open". Default `false`: today's select-only behavior (press **Enter** to attach). Does not affect the CLI; `agent-deck add` / `session start` attach only with an explicit `--attach`. |
 
 Filters compose: `hidden_tools` is applied first, then `show_only_installed_tools` (when enabled).
 
@@ -456,9 +538,22 @@ index_rate_limit = 20       # Files/second for indexing
 | `recent_days` | int | `90` | Only search recent conversations. |
 | `index_rate_limit` | int | `20` | Indexing speed (reduce for less CPU). |
 
+## [performance] Section
+
+Background-work sharing between concurrent agent-deck instances (e.g. multiple `-g <scope>` TUIs open against the same state.db).
+
+```toml
+[performance]
+claim_polling = true   # Opt-in: dedupe status polling across concurrent instances
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `claim_polling` | bool | `false` | When `true`, each session is actively polled (tmux status scan, live pipe attach) by exactly one instance instead of every open instance polling every session redundantly. Instances take ownership of sessions in their `-g` scope via a `session_claims` table in `state.db`, refreshing a heartbeat each sweep; a session with no live claim (owner heartbeat older than 15s, or no claim row at all) is up for grabs by the next instance that sees it in scope. Every 30s the elected primary instance additionally slow-polls **orphaned** sessions — those no scoped instance currently claims — so their statuses and notifications keep working even with no dedicated owner. Claims for sessions no longer present in the `instances` table (deleted, or archived-then-purged) are pruned periodically so the table cannot grow unbounded over a long-lived process. Default `false` preserves today's behavior: every instance polls every session it can see. |
+
 ## Skills Registry (Outside config.toml)
 
-Skill source discovery and project attachment state are not stored in `~/.agent-deck/config.toml`.
+Skill source discovery and project attachment state are not stored in the agent-deck config file.
 
 **Global source registry:**
 - `~/.agent-deck/skills/sources.toml`
@@ -477,6 +572,25 @@ agent-deck skill source list
 agent-deck skill source add team ~/src/team-skills
 agent-deck skill source remove team
 ```
+
+**Declarative per-group/per-conductor loadout:** `[groups.X.claude].skills`,
+`.plugins`, and `.mcps` (and the conductor mirror) list entries that agent-deck attaches
+automatically — at session create (`add` / `launch`) and re-asserted before
+every start/restart — through this same registry and attach machinery,
+exactly as if `skill attach` / `mcp attach` had been run by hand. The
+loadout is an attach-only floor:
+
+- already attached and healthy → no-op; a deleted symlink re-materializes
+- a real directory or foreign symlink at the target → skip + warning,
+  never clobbered (a human-placed dir beats config)
+- an entry missing from the registry / `[mcps.*]` catalog → skip + warning
+- removing an entry from config does NOT detach — subtraction is a
+  deliberate `skill detach`
+
+Skill-store entries may be plain directory skills (`SKILL.md`) or full Claude
+Code plugins (`.claude-plugin/plugin.json`); both materialize as project
+skills. SSH sessions are skipped (no local project path). See
+[Per-group / per-conductor Claude overrides](#per-group--per-conductor-claude-overrides).
 
 ## [mcp_pool] Section
 

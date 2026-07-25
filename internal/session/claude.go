@@ -294,7 +294,7 @@ func getMCPInfoUncached(projectPath string) *MCPInfo {
 
 // resolveOpts selects which priority chain resolveClaudeConfigDir walks.
 //   - inst != nil  → instance chain: conductor > group > env > profile > global > default
-//   - inst == nil  → group chain:    env > group > profile > global > default
+//   - inst == nil  → group chain:    group > env > profile > global > default (#1508)
 //
 // groupPath is consulted in both chains; for the instance chain it falls
 // back to inst.GroupPath when not set explicitly.
@@ -320,7 +320,9 @@ type resolveOpts struct {
 //
 // On the instance chain Account is the most-specific level (beats
 // conductor/group/env). Conductor and group beat env (the #881 fix); see
-// GetClaudeConfigDirForInstance doc for the rationale.
+// GetClaudeConfigDirForInstance doc for the rationale. On the group chain a
+// group config_dir also beats env (#1508) so both chains agree that a
+// config.toml-scoped group override wins over a shell-wide CLAUDE_CONFIG_DIR.
 func resolveClaudeConfigDir(opts resolveOpts) (path, source string) {
 	userConfig, _ := LoadUserConfig()
 
@@ -355,14 +357,21 @@ func resolveClaudeConfigDir(opts resolveOpts) (path, source string) {
 			return envDir, "env"
 		}
 	} else {
-		// Group chain: env wins.
-		if envDir := envClaudeConfigDirIgnoringScratchLeak(); envDir != "" {
-			return envDir, "env"
-		}
+		// Group chain: group beats env (#1508). A
+		// [groups."<groupPath>".claude].config_dir is a config.toml-scoped
+		// override and is strictly more specific than a shell-wide
+		// CLAUDE_CONFIG_DIR (which dev shells commonly export via aliases).
+		// This mirrors the instance chain so a grouped child launched from a
+		// shell exporting a stale ambient account still resolves to its
+		// group's configured account. Env still wins when the group has no
+		// config_dir to assert.
 		if userConfig != nil {
 			if groupDir := userConfig.GetGroupClaudeConfigDir(groupPath); groupDir != "" {
 				return groupDir, "group"
 			}
+		}
+		if envDir := envClaudeConfigDirIgnoringScratchLeak(); envDir != "" {
+			return envDir, "env"
 		}
 	}
 
@@ -504,6 +513,65 @@ func IsClaudeConfigDirExplicitForInstance(inst *Instance) bool {
 // CLAUDE_CONFIG_DIR automatically, avoiding the need for config_dir setting
 func GetClaudeCommand() string {
 	return GetToolCommand("claude")
+}
+
+// GetClaudeCommandForInstance returns the Claude command for this Instance,
+// extending GetClaudeCommand with the per-conductor / per-group levels.
+// Priority (most-specific → least-specific, same order as the config_dir
+// chain, CFG-08 mirror semantics):
+//
+//  1. [conductors.<name>.claude].command — conductor sessions only
+//  2. [groups."<group>".claude].command — ancestor-walking
+//  3. [claude].command (global)
+//  4. "claude"
+//
+// An instance-level custom command (a non-"claude" command string stored on
+// the session, e.g. from `add -c <wrapper>`) never reaches this resolver —
+// the spawn builders only consult it when the stored command is the default
+// "claude", so the explicit per-session command stays the strongest level.
+func GetClaudeCommandForInstance(inst *Instance) string {
+	if userConfig, _ := LoadUserConfig(); userConfig != nil && inst != nil {
+		if name := conductorNameFromInstance(inst); name != "" {
+			if cmd := userConfig.GetConductorClaudeCommand(name); cmd != "" {
+				return cmd
+			}
+		}
+		if cmd := userConfig.GetGroupClaudeCommand(inst.GroupPath); cmd != "" {
+			return cmd
+		}
+	}
+	return GetClaudeCommand()
+}
+
+// resolveClaudeLaunchModel returns the --model value for a claude spawn.
+// Priority:
+//
+//  1. explicit per-session model (CLI --model / new-session dialog,
+//     persisted on ClaudeOptions — passed in as optsModel)
+//  2. [conductors.<name>.claude].model — conductor sessions only
+//  3. [groups."<group>".claude].model — ancestor-walking
+//  4. "" — no flag; Claude Code's own default
+//
+// Resolved at command-build time (not baked in at create) so a config edit
+// takes effect on the next start/restart without re-creating the session —
+// matching how config_dir and env_file resolve. The global
+// [claude].default_model deliberately stays a new-session-dialog prefill
+// (#1172) and is NOT applied here, so behavior without group/conductor
+// blocks is unchanged.
+func (i *Instance) resolveClaudeLaunchModel(optsModel string) string {
+	if optsModel != "" {
+		return optsModel
+	}
+	userConfig, _ := LoadUserConfig()
+	if userConfig == nil {
+		return ""
+	}
+	if name := conductorNameFromInstance(i); name != "" {
+		if m := userConfig.GetConductorClaudeModel(name); m != "" {
+			return m
+		}
+	}
+	return userConfig.GetGroupClaudeModel(i.GroupPath)
 }
 
 // GetClaudeSessionID returns the ACTIVE session ID for a project path

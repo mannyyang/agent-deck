@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -37,7 +38,7 @@ import (
 	"github.com/asheshgoplani/agent-deck/internal/web"
 )
 
-var Version = "1.9.74" // overridden at build time via -ldflags "-X main.Version=..."
+var Version = "1.10.10" // overridden at build time via -ldflags "-X main.Version=..."
 
 // Table column widths for list command output
 const (
@@ -208,6 +209,12 @@ func initColorProfile() {
 }
 
 func main() {
+	// Make bare `tmux` invocations resolve even when launched from a minimal
+	// environment (notably a `terminal-notifier -execute` notification click,
+	// whose launchd PATH omits Homebrew's /opt/homebrew/bin). Must run before any
+	// tmux probe below. No-op when tmux is already on PATH.
+	ensureTmuxOnPath()
+
 	// Extract global -p/--profile flag before subcommand dispatch
 	profile, args := extractProfileFlag(os.Args[1:])
 	if profile != "" {
@@ -498,6 +505,7 @@ func main() {
 		}
 		if db := statedb.GetGlobal(); db != nil {
 			_ = db.ResignPrimary()
+			_ = db.ReleaseAllClaims()
 			_ = db.UnregisterInstance()
 		}
 		os.Exit(0)
@@ -841,6 +849,33 @@ func main() {
 	ui.EnableModifyOtherKeys(os.Stdout)
 	defer ui.DisableModifyOtherKeys(os.Stdout)
 
+	// Check for atuin pty-proxy incompatibility (#1558).
+	// Atuin pty-proxy intercepts PTY I/O and breaks Bubble Tea's TUI rendering.
+	// The alternate screen, mouse tracking, and raw-mode interactions all fail
+	// because os.Stdin/os.Stdout are proxied pipes, not direct terminal FDs.
+	if tmux.IsAtuinPTYProxy() {
+		fmt.Fprint(os.Stderr, "WARNING: Agent Deck's TUI is incompatible with atuin pty-proxy.\n"+
+			"The TUI may appear blank or fail to render.\n"+
+			"\n"+
+			"To fix this, replace the pty-proxy init with the normal init in your shell config:\n"+
+			"  - zsh:   replace 'eval \"$(atuin pty-proxy init zsh)\"' with 'eval \"$(atuin init zsh)\"' in .zshrc\n"+
+			"  - bash:  replace 'eval \"$(atuin pty-proxy init bash)\"' with 'eval \"$(atuin init bash)\"' in .bashrc\n"+
+			"  - fish:  replace 'atuin pty-proxy init fish | source' with 'atuin init fish | source' in config.fish\n"+
+			"\n"+
+			"Atuin pty-proxy is only needed for the atuin TUI overlay feature,\n"+
+			"and is not required for normal atuin shell history functionality.\n")
+	}
+
+	// Reap orphaned control-mode clients left behind by prior crashed /
+	// SIGKILL'd / OOM-killed TUIs before this process starts connecting its
+	// own pipes. killStaleControlClients only sweeps per-session on Connect(),
+	// so orphans for sessions this TUI never reopens would otherwise pile up
+	// until they exhaust the pty table (observed: 176 orphaned `tmux -C`
+	// clients vs the macOS kern.tty.ptmx_max=511 cap, blocking all new
+	// terminals). This server-wide sweep clears the whole backlog once at
+	// startup; live sibling TUIs (allow_multiple=true) are preserved.
+	tmux.SweepStaleControlClients(tmux.DefaultSocketName())
+
 	p := tea.NewProgram(
 		homeModel,
 		tea.WithAltScreen(),
@@ -861,13 +896,48 @@ func main() {
 	}
 }
 
-// extractProfileFlag extracts -p or --profile from args, returning the profile and remaining args
+// globalFlagSubcommands lists every token that main()'s dispatch switch treats
+// as a subcommand. extractProfileFlag stops honoring the global -p/--profile
+// flag once it reaches one of these, so a subcommand that defines its own -p
+// (launch/add --parent, group move --position) is not shadowed by the global
+// profile flag. KEEP IN SYNC with the switch in main().
+var globalFlagSubcommands = map[string]bool{
+	"add": true, "list": true, "ls": true, "remove": true, "rm": true,
+	"rename": true, "mv": true, "status": true, "profile": true, "update": true,
+	"session": true, "mcp": true, "plugin": true, "skill": true, "mcp-proxy": true,
+	"group": true, "try": true, "launch": true, "conductor": true,
+	"telegram-doctor": true, "watcher": true, "openclaw": true, "oc": true,
+	"remote": true, "worktree": true, "wt": true, "costs": true, "web": true,
+	"uninstall": true, "migrate-paths": true, "hook-handler": true,
+	"codex-notify": true, "hooks": true, "codex-hooks": true, "gemini-hooks": true,
+	"hermes-hooks": true, "cursor-hooks": true, "notify-daemon": true,
+	"run-task": true, "inbox": true, "feedback": true, "creds-refresh": true,
+	"debug-dump": true, "version": true, "help": true,
+}
+
+// extractProfileFlag extracts the global -p or --profile flag from args,
+// returning the profile and remaining args.
+//
+// The global flag is only honored BEFORE the subcommand token. Without this
+// boundary, `agent-deck launch . -p <parent>` had its -p swallowed here as a
+// profile: handleLaunch then opened profiles/<parent>/state.db (a phantom
+// per-id profile DB, invisible to the default-profile TUI) and the launch
+// subcommand's own --parent went unset, so the child was never linked. The
+// same collision affected `add -p <parent>` and `group move -p <position>`.
+// The long-form --parent was unaffected because it is not matched here.
 func extractProfileFlag(args []string) (string, []string) {
 	var profile string
 	var remaining []string
 
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
+
+		// Reached the subcommand: global flag parsing is over. Everything from
+		// here belongs to the subcommand, which may define its own -p.
+		if globalFlagSubcommands[arg] {
+			remaining = append(remaining, args[i:]...)
+			return profile, remaining
+		}
 
 		// Check for -p=value or --profile=value
 		if strings.HasPrefix(arg, "-p=") {
@@ -980,7 +1050,7 @@ func reorderArgsForFlagParsing(args []string) []string {
 		"t": true, "title": true,
 		"g": true, "group": true,
 		"c": true, "cmd": true,
-		"m": true, "message": true,
+		"m": true, "message": true, "message-file": true,
 		"p": true, "parent": true,
 		"mcp":            true,
 		"channel":        true,
@@ -1140,6 +1210,13 @@ func resolveGroupPathForAdd(groupTree *session.GroupTree, groupSelector string) 
 	return groupSelector
 }
 
+// shouldLockTitle is the #1615-class chokepoint deciding whether a new CLI
+// session's title is locked against Claude's folder-name sync. An explicit
+// user title locks, as do the explicit lock flags.
+func shouldLockTitle(userProvidedTitle, titleLockFlag, noTitleSyncFlag bool) bool {
+	return userProvidedTitle || titleLockFlag || noTitleSyncFlag
+}
+
 // handleAdd adds a new session from CLI
 func handleAdd(profile string, args []string) {
 	fs := flag.NewFlagSet("add", flag.ExitOnError)
@@ -1168,6 +1245,7 @@ func handleAdd(profile string, args []string) {
 	jsonOutput := fs.Bool("json", false, "Output as JSON")
 	quiet := fs.Bool("quiet", false, "Minimal output")
 	quietShort := fs.Bool("q", false, "Minimal output (short)")
+	attach := fs.Bool("attach", false, "Start and attach to the session immediately after creating it (requires an interactive terminal; not supported with --ssh)")
 
 	// Worktree flags
 	worktreeBranch := fs.String("w", "", "Create session in git worktree for branch")
@@ -1178,7 +1256,7 @@ func handleAdd(profile string, args []string) {
 
 	// MCP flag - can be specified multiple times
 	var mcpFlags []string
-	fs.Func("mcp", "MCP to attach (can specify multiple times)", func(s string) error {
+	fs.Func("mcp", "MCP to attach (can specify multiple times; Codex writes $CODEX_HOME/config.toml)", func(s string) error {
 		mcpFlags = append(mcpFlags, s)
 		return nil
 	})
@@ -1264,6 +1342,7 @@ func handleAdd(profile string, args []string) {
 		fmt.Println("  agent-deck -p work add               # Add to 'work' profile")
 		fmt.Println("  agent-deck add -t \"Sub-task\" --parent \"Main Project\"  # Create sub-session")
 		fmt.Println("  agent-deck add -t \"Research\" -c claude --mcp memory --mcp sequential-thinking /tmp/x")
+		fmt.Println("  agent-deck add -c codex --mcp memory .  # writes to Codex config.toml")
 		fmt.Println("  agent-deck add -t \"Bot\" -c claude --channel plugin:telegram@user/repo .  # subscribe to plugin channel")
 		fmt.Println("  agent-deck add -c opencode --wrapper \"nvim +'terminal {command}' +'startinsert'\" .")
 		fmt.Println("  agent-deck add -c \"codex --dangerously-bypass-approvals-and-sandbox\" .")
@@ -1369,11 +1448,11 @@ func handleAdd(profile string, args []string) {
 		// cwd-derived group is not available here. Passing "" preserves
 		// handleAdd's existing behavior; the #972 cwd-over-parent priority
 		// is wired into `launch` where path is already known at this point.
-		sessionGroup = resolveGroupSelection(sessionGroup, "", parentInstance.GroupPath, explicitGroupProvided)
+		sessionGroup = resolveGroupSelection(sessionGroup, "", parentInstance.GroupPath, explicitGroupProvided, false)
 	} else if !*noParent {
 		parentInstance = resolveAutoParentInstance(instances)
 		if parentInstance != nil && !parentInstance.IsSubSession() {
-			sessionGroup = resolveGroupSelection(sessionGroup, "", parentInstance.GroupPath, explicitGroupProvided)
+			sessionGroup = resolveGroupSelection(sessionGroup, "", parentInstance.GroupPath, explicitGroupProvided, false)
 		} else {
 			parentInstance = nil
 		}
@@ -1572,8 +1651,11 @@ func handleAdd(profile string, args []string) {
 		newInstance.NoTransitionNotify = true
 	}
 
-	// #697: title-lock blocks Claude's session-name sync. Either flag triggers it.
-	if *titleLock || *noTitleSync {
+	// #697/#1615: title-lock blocks Claude's session-name sync. An explicit
+	// user title (-t/--title) locks too — otherwise Claude's folder-name sync
+	// silently clobbers it (the #1615 class), matching the TUI dialog and
+	// `launch` paths.
+	if shouldLockTitle(userProvidedTitle, *titleLock, *noTitleSync) {
 		newInstance.TitleLocked = true
 	}
 
@@ -1688,11 +1770,20 @@ func handleAdd(profile string, args []string) {
 		os.Exit(1)
 	}
 
+	// Materialize the declarative per-group/per-conductor skill+mcp loadout
+	// at create time (ProjectPath, group, and tool are final here), so the
+	// floor exists even before first start. Start/Restart re-assert.
+	for _, w := range session.ApplyConfiguredLoadout(newInstance) {
+		fmt.Fprintf(os.Stderr, "Warning: loadout: %s\n", w)
+	}
+
 	// Add to instances
 	instances = append(instances, newInstance)
 
 	// Rebuild group tree and save
 	groupTree = session.NewGroupTreeWithGroups(instances, groups)
+	mainCfg, _ := session.LoadUserConfig()
+	groupTree.DefaultMaxConcurrent = mainCfg.GroupDefaults.MaxConcurrent
 	// Ensure the session's group exists
 	if newInstance.GroupPath != "" {
 		groupTree.CreateGroupPath(newInstance.GroupPath)
@@ -1718,8 +1809,8 @@ func handleAdd(profile string, args []string) {
 			}
 		}
 
-		// Write MCPs to .mcp.json
-		if err := session.WriteMCPJsonFromConfig(path, mcpFlags); err != nil {
+		// Write MCPs to the selected tool's MCP store.
+		if err := newInstance.WriteLocalMCPConfig(mcpFlags); err != nil {
 			fmt.Printf("Error: failed to write MCPs: %v\n", err)
 			os.Exit(1)
 		}
@@ -1727,6 +1818,40 @@ func handleAdd(profile string, args []string) {
 
 	quietMode := *quiet || *quietShort
 	out := NewCLIOutput(*jsonOutput, quietMode)
+
+	// --attach: create → start → attach, so `add --attach` "instantly opens"
+	// the new session in one step. Refused loudly (never silently) under
+	// --json or without an interactive terminal; the session is left created
+	// and started in those cases. Remote (ssh) sessions use a different attach
+	// path and are out of scope here.
+	if *attach {
+		if *jsonOutput {
+			out.Error("--attach cannot be combined with --json; session was created", ErrCodeInvalidOperation)
+			os.Exit(3)
+		}
+		if *sshHost != "" {
+			out.Error("--attach is not supported with --ssh (remote sessions); session was created", ErrCodeInvalidOperation)
+			os.Exit(3)
+		}
+		if err := newInstance.Start(); err != nil {
+			out.Error(fmt.Sprintf("failed to start session: %v", err), ErrCodeInvalidOperation)
+			os.Exit(1)
+		}
+		newInstance.PostStartSync(3 * time.Second)
+		if err := storage.SaveWithGroups(instances, groupTree); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: failed to save session state: %v\n", err)
+			os.Exit(1)
+		}
+		if err := attachInstanceInteractive(newInstance); err != nil {
+			if errors.Is(err, errAttachNoTTY) {
+				fmt.Fprintf(os.Stderr, "Error: %v; session was created and started\n", err)
+				os.Exit(3)
+			}
+			fmt.Fprintf(os.Stderr, "Error: failed to attach: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
 
 	// Build human-readable output
 	var humanLines []string
@@ -1914,6 +2039,8 @@ func handleList(profile string, args []string) {
 			Channels      []string  `json:"channels,omitempty"`
 			ExtraArgs     []string  `json:"extra_args,omitempty"`
 			Color         string    `json:"color,omitempty"` // issue #391
+			Archived      bool      `json:"archived"`
+			ArchivedAt    time.Time `json:"archived_at,omitempty"`
 		}
 		// Warm tmux pane-title cache + load hook statuses so the CLI
 		// reports the same Status the TUI and /api/menu do (issue #610).
@@ -1937,6 +2064,8 @@ func handleList(profile string, args []string) {
 				Channels:      inst.Channels,
 				ExtraArgs:     inst.ExtraArgs,
 				Color:         inst.Color,
+				Archived:      inst.IsArchived(),
+				ArchivedAt:    inst.ArchivedAt,
 			}
 			if tmuxSess := inst.GetTmuxSession(); tmuxSess != nil {
 				sj.TmuxSession = tmuxSess.Name
@@ -3166,6 +3295,15 @@ func printHelp() {
 	fmt.Println("Environment Variables:")
 	fmt.Println("  AGENTDECK_PROFILE    Default profile to use")
 	fmt.Println("  AGENTDECK_COLOR      Color mode: truecolor, 256, 16, none")
+	fmt.Println()
+	fmt.Println("Configuration:")
+	if configPath, err := session.GetUserConfigPath(); err == nil {
+		fmt.Printf("  Config file: %s\n", configPath)
+	} else {
+		fmt.Println("  Config file: $XDG_CONFIG_HOME/agent-deck/config.toml (default ~/.config/agent-deck/config.toml)")
+	}
+	fmt.Println("  Since v1.9.49 config lives under the XDG base dirs, not ~/.agent-deck.")
+	fmt.Println("  Run 'agent-deck migrate-paths' to copy legacy ~/.agent-deck files across.")
 	fmt.Println()
 	fmt.Println("Keyboard shortcuts (in TUI):")
 	fmt.Println("  n          New session")
