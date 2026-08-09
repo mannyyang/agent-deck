@@ -35,13 +35,13 @@ func applyAssertDone(message string, enabled bool) string {
 // It creates a new session, starts it, and optionally sends an initial message.
 func handleLaunch(profile string, args []string) {
 	fs := flag.NewFlagSet("launch", flag.ExitOnError)
-	title := fs.String("title", "", "Session title (defaults to folder name)")
+	title := fs.String("title", "", "Session title (defaults to folder name; an explicit title is locked against Claude's session-name sync)")
 	titleShort := fs.String("t", "", "Session title (short)")
 	group := fs.String("group", "", "Group path (defaults to parent folder)")
 	groupShort := fs.String("g", "", "Group path (short)")
 	command := fs.String("cmd", "", "Tool/command to run (e.g., 'claude' or 'codex --dangerously-bypass-approvals-and-sandbox')")
 	commandShort := fs.String("c", "", "Tool/command to run (short)")
-	wrapper := fs.String("wrapper", "", "Wrapper command (use {command} to include tool command; auto-generated when --cmd includes extra args)")
+	wrapper := fs.String("wrapper", "", "Wrapper command (use {command} to include tool command; auto-generated when --cmd includes extra flags; a known claude/codex subcommand in --cmd runs as-is with no wrapper instead)")
 	message := fs.String("message", "", "Initial message to send once agent is ready")
 	messageShort := fs.String("m", "", "Initial message to send (short)")
 	messageFile := fs.String("message-file", "", "Read the initial message from a file ('-' for stdin); avoids shell quoting of long prompts")
@@ -59,8 +59,9 @@ func handleLaunch(profile string, args []string) {
 	inheritGroup := fs.Bool("inherit-group", false, "Place the child in the parent session's group instead of the cwd-derived group (auto-applied for git worktree children; use this to force it for non-worktree paths)")
 	noTransitionNotify := fs.Bool("no-transition-notify", false, "Suppress transition event notifications to parent session")
 	// #697: conductor-friendly title lock. Prevents Claude's session name
-	// from overwriting the agent-deck title.
-	titleLock := fs.Bool("title-lock", false, "Lock session title so Claude's session name never overrides it (#697)")
+	// from overwriting the agent-deck title. An explicit -t/--title already
+	// locks (#1715); these flags also lock an auto-named session.
+	titleLock := fs.Bool("title-lock", false, "Lock session title so Claude's session name never overrides it; implied by an explicit -t/--title (#697)")
 	noTitleSync := fs.Bool("no-title-sync", false, "Alias for --title-lock")
 	// #1133: opt-in to inherit the conductor's TELEGRAM_* env vars in the
 	// child. Off by default — a child inheriting TELEGRAM_STATE_DIR /
@@ -190,7 +191,11 @@ func handleLaunch(profile string, args []string) {
 	sessionGroup := mergeFlags(*group, *groupShort)
 	explicitGroupProvided := strings.TrimSpace(sessionGroup) != ""
 	sessionCommandInput := mergeFlags(*command, *commandShort)
-	sessionCommandTool, sessionCommandResolved, sessionWrapperResolved, sessionCommandNote := resolveSessionCommand(sessionCommandInput, *wrapper)
+	sessionCommandTool, sessionCommandResolved, sessionWrapperResolved, sessionCommandNote, sessionCommandIsPassthrough, cmdErr := resolveSessionCommand(sessionCommandInput, *wrapper)
+	if cmdErr != nil {
+		out.Error(cmdErr.Error(), ErrCodeInvalidOperation)
+		os.Exit(1)
+	}
 	sessionParent := mergeFlags(*parent, *parentShort)
 	if sessionParent != "" && *noParent {
 		out.Error("--parent and --no-parent cannot be used together", ErrCodeInvalidOperation)
@@ -228,6 +233,18 @@ func handleLaunch(profile string, args []string) {
 		tool := firstNonEmpty(sessionCommandTool, detectTool(sessionCommandInput))
 		if tool != "claude" {
 			out.Error("--resume-session only works with Claude sessions (-c claude)", ErrCodeInvalidOperation)
+			os.Exit(1)
+		}
+		// #1815 (Codex review on #1830): the value below is passed to
+		// MarkClaudeSessionIDVerified — it becomes a VOUCHED ownership
+		// declaration — and is then interpolated into `--session-id "%s"`,
+		// a double-quoted shell context where $(...) still substitutes.
+		// "Operator-named" has to mean the operator named an actual
+		// conversation id, so refuse anything that is not a bare UUID
+		// rather than vouching for it or silently continuing unverified.
+		if !session.IsBareClaudeSessionUUID(*resumeSession) {
+			out.Error("--resume-session must be a bare Claude conversation UUID "+
+				"(8-4-4-4-12 lowercase hex, e.g. 91fd7978-1a2b-3c4d-5e6f-7a8b9c0d1e2f)", ErrCodeInvalidOperation)
 			os.Exit(1)
 		}
 	}
@@ -285,7 +302,11 @@ func handleLaunch(profile string, args []string) {
 				os.Exit(1)
 			}
 
-			setupErr, err := createWorktreeWithSetup(backend, worktreePath, wtBranch, os.Stdout, os.Stderr, session.GetWorktreeSettings().SetupTimeout())
+			// Sparse state is inherited from `path` (the directory the user
+			// launched from), never from backend.RepoDir() — see #1708.
+			setupErr, err := createWorktreeWithSetup(backend, worktreePath, wtBranch,
+				git.SparseInheritOptions(wtSettings.InheritSparseCheckout(), path),
+				os.Stdout, os.Stderr, session.GetWorktreeSettings().SetupTimeout())
 			if err != nil {
 				out.Error(fmt.Sprintf("failed to create worktree: %v", err), ErrCodeInvalidOperation)
 				os.Exit(1)
@@ -390,8 +411,15 @@ func handleLaunch(profile string, args []string) {
 		newInstance.NoTransitionNotify = true
 	}
 
-	// #697: title-lock blocks Claude's session-name sync.
-	if *titleLock || *noTitleSync {
+	// #697/#1715: title-lock blocks Claude's session-name sync. An explicit
+	// -t/--title is deliberate human or orchestrator intent, so it locks by
+	// default here too — otherwise Claude's session-name sync renames the
+	// session and every later `session send <original-title>` misses its
+	// target. Auto-derived folder-name titles stay unlocked so the
+	// descriptive sync keeps its value. Same chokepoint as `add` and the TUI
+	// New Session dialog; --no-title-sync/--title-lock remain the explicit
+	// opt-outs for auto-named sessions.
+	if shouldLockTitle(userProvidedTitle, *titleLock, *noTitleSync) {
 		newInstance.TitleLocked = true
 	}
 
@@ -403,6 +431,7 @@ func handleLaunch(profile string, args []string) {
 	if sessionCommandInput != "" {
 		newInstance.Tool = firstNonEmpty(sessionCommandTool, detectTool(sessionCommandInput))
 		newInstance.Command = sessionCommandResolved
+		newInstance.SubcommandPassthrough = sessionCommandIsPassthrough
 	}
 
 	// Apply --channel flags (claude only — channels is a Claude Code CLI flag).
@@ -470,6 +499,10 @@ func handleLaunch(profile string, args []string) {
 
 	if *resumeSession != "" {
 		newInstance.ClaudeSessionID = *resumeSession
+		// #1815: the operator named this conversation for this session —
+		// explicit ownership, so vouch for it (ownership is positive state;
+		// an unvouched id is refused at resume time).
+		session.MarkClaudeSessionIDVerified(newInstance)
 		newInstance.ClaudeDetectedAt = time.Now()
 
 		opts := newInstance.GetClaudeOptions()
@@ -623,6 +656,12 @@ func handleLaunch(profile string, args []string) {
 			if _, err := sendWithRetryTarget(tmuxSess, initialMessage, skipClaudeDeliveryVerify(newInstance.Tool), sendRetryOptions{
 				maxRetries: 8,
 				checkDelay: 150 * time.Millisecond,
+				// #1777 provenance probe: a freshly launched session has an
+				// empty composer, so a "[Pasted text …]" marker appearing
+				// during verification is this prompt's own collapse and the
+				// Enter nudge stays attributable. If the probe cannot confirm
+				// that, the gate withholds the nudge.
+				composerPasteFreeBeforeSend: composerPasteFree(tmuxSess),
 			}); err != nil {
 				out.Error(fmt.Sprintf("failed to send initial message: %v", err), ErrCodeInvalidOperation)
 				os.Exit(1)
