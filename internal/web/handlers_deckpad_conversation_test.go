@@ -187,3 +187,41 @@ func TestDeckpadSuggestionIgnoresRealDraftsMenusAndEmptyPrompts(t *testing.T) {
 		}
 	}
 }
+
+func convKinds(items []deckpadConversationItem) string {
+	var got []string
+	for _, it := range items {
+		got = append(got, it.Kind+"|"+it.Text)
+	}
+	return strings.Join(got, "\n")
+}
+
+// Esc before any reply takes the prompt back in the terminal; the phone must not show it as sent.
+func TestDeckpadConversationItemsDropsPromptCancelledBeforeAnyReply(t *testing.T) {
+	rows := []query.Row{
+		{ID: "1", Kind: "user", Body: "first question"},
+		{ID: "2", Kind: "assistant", Body: "first answer"},
+		{ID: "3", Kind: "user", Body: "never mind this one"},
+		{ID: "4", Kind: "user", Body: "[Request interrupted by user]"},
+		{ID: "5", Kind: "user", Body: "the real question"},
+	}
+	items, _ := deckpadConversationItems(rows, 50)
+	want := "user|first question\nassistant|first answer\nuser|the real question"
+	if got := convKinds(items); got != want {
+		t.Fatalf("got:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+// Esc after the agent started working leaves the prompt in place, as the terminal does.
+func TestDeckpadConversationItemsKeepsPromptInterruptedMidReply(t *testing.T) {
+	rows := []query.Row{
+		{ID: "1", Kind: "user", Body: "do the thing"},
+		{ID: "2", Kind: "assistant", Body: "Starting on it."},
+		{ID: "3", Kind: "user", Body: "[Request interrupted by user for tool use]"},
+	}
+	items, _ := deckpadConversationItems(rows, 50)
+	want := "user|do the thing\nassistant|Starting on it.\nuser|Interrupted"
+	if got := convKinds(items); got != want {
+		t.Fatalf("got:\n%s\nwant:\n%s", got, want)
+	}
+}

@@ -75,6 +75,11 @@ var deckpadNoisePrefixes = []string{
 	"<task-notification>", "<user-prompt-submit-hook>", "Caveat: The messages below",
 }
 
+const (
+	deckpadInterruptPrefix  = "[Request interrupted by user"
+	deckpadInterruptedLabel = "Interrupted"
+)
+
 func deckpadTruncate(s string, max int) string {
 	r := []rune(s)
 	if len(r) <= max {
@@ -104,6 +109,15 @@ func deckpadConversationItems(rows []query.Row, limit int) ([]deckpadConversatio
 				}
 				if noise {
 					continue
+				}
+				// Esc in the terminal. With no reply yet, the terminal takes the
+				// prompt back into the input box, so it was never really sent.
+				if strings.HasPrefix(text, deckpadInterruptPrefix) {
+					if n := len(items); n > 0 && items[n-1].Kind == "user" && items[n-1].Text != deckpadInterruptedLabel {
+						items = items[:n-1]
+						continue
+					}
+					text = deckpadInterruptedLabel
 				}
 			}
 			items = append(items, deckpadConversationItem{ID: r.ID, Kind: r.Kind, Text: deckpadTruncate(text, deckpadConversationTextRunes), TS: r.TS})
