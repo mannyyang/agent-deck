@@ -59,6 +59,9 @@ type deckpadConversationSource struct {
 	Rows       []query.Row
 	Screen     string
 	StatusLine string
+	// ScreenIsDialog is true when the pane shows a prompt waiting for an
+	// answer; only then is Screen sent to the phone.
+	ScreenIsDialog bool
 }
 
 // Harness-injected user records that are not something the person typed.
@@ -182,6 +185,37 @@ func deckpadStatusLine(raw string) string {
 	return deckpadTruncate(strings.Join(keep, "\n"), 240)
 }
 
+var deckpadDialogMarkers = []string{
+	"enter to select", "esc to cancel", "do you want to", "(y/n)", "[y/n]", "[y/n/", "(yes/no)",
+	"press enter to continue", "allow this", "would you like to",
+}
+
+// deckpadHasDialog reports whether the bottom of the pane is a prompt that
+// needs an answer: a permission or choice dialog, or a y/n question.
+func deckpadHasDialog(raw string) bool {
+	lines := strings.Split(raw, "\n")
+	if len(lines) > 30 {
+		lines = lines[len(lines)-30:]
+	}
+	for _, l := range lines {
+		low := strings.ToLower(l)
+		for _, m := range deckpadDialogMarkers {
+			if strings.Contains(low, m) {
+				return true
+			}
+		}
+		// A numbered menu with the cursor on an option: "❯ 1. Yes".
+		t := strings.TrimSpace(l)
+		if strings.HasPrefix(t, "❯") {
+			rest := strings.TrimSpace(strings.TrimPrefix(t, "❯"))
+			if len(rest) > 2 && rest[0] >= '1' && rest[0] <= '9' && rest[1] == '.' {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // deckpadScreenTail strips colour codes and keeps the last non-blank lines.
 func deckpadScreenTail(raw string) string {
 	lines := strings.Split(tmux.StripANSI(raw), "\n")
@@ -271,6 +305,7 @@ var loadDeckpadConversation = func(profile, id string) (*deckpadConversationSour
 	if ts := inst.GetTmuxSession(); ts != nil {
 		if raw, err := ts.CapturePane(); err == nil {
 			src.Screen = deckpadScreenTail(raw)
+			src.ScreenIsDialog = deckpadHasDialog(src.Screen)
 			src.StatusLine = deckpadStatusLine(tmux.StripANSI(raw))
 		}
 	}
@@ -298,6 +333,9 @@ func (s *Server) handleDeckpadConversation(w http.ResponseWriter, r *http.Reques
 	if err != nil {
 		writeAPIError(w, http.StatusInternalServerError, ErrCodeInternalError, "failed to load conversation")
 		return
+	}
+	if !src.ScreenIsDialog {
+		src.Screen = ""
 	}
 	items, truncated := deckpadConversationItems(src.Rows, limit)
 	h := sha1.New()

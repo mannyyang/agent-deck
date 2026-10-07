@@ -70,7 +70,7 @@ func TestDeckpadConversationEndpointServesItemsScreenAndVersion(t *testing.T) {
 		if id != "child-1" {
 			return nil, errDeckpadSessionNotFound
 		}
-		return &deckpadConversationSource{Tool: "claude", Rows: convRows(), Screen: "Do you want to proceed?\n 1. Yes"}, nil
+		return &deckpadConversationSource{Tool: "claude", Rows: convRows(), Screen: "Do you want to proceed?\n 1. Yes", ScreenIsDialog: true}, nil
 	})
 	srv := deckpadServer(t, false)
 	rr := getConversation(srv, "child-1", "")
@@ -121,5 +121,41 @@ func TestDeckpadStatusLineIsEmptyForDialogsAndBarePanes(t *testing.T) {
 	}
 	if got := deckpadStatusLine(""); got != "" {
 		t.Fatalf("empty pane: %q", got)
+	}
+}
+
+func TestDeckpadHasDialogRecognisesPromptsAndIgnoresIdlePanes(t *testing.T) {
+	yes := []string{
+		"Do you want to proceed?\n ❯ 1. Yes\n   2. No\n\nEsc to cancel",
+		"❯ 1. Yes, update the SSM parameter\n  2. No\nEnter to select · ↑/↓ to navigate · Esc to cancel",
+		"Allow this command to run? (y/n)",
+		"Overwrite file? [Y/n]",
+		"Do you want to make this edit to foo.go?\n 1. Yes\n 2. Yes, allow all edits during this session\n 3. No",
+	}
+	for _, p := range yes {
+		if !deckpadHasDialog(p) {
+			t.Errorf("expected a dialog in:\n%s", p)
+		}
+	}
+	if deckpadHasDialog(deckpadIdlePane) {
+		t.Error("idle prompt box is not a dialog")
+	}
+	if deckpadHasDialog("I fixed it.\nShould I run the tests?\n❯ \n") {
+		t.Error("a question in prose is not a dialog")
+	}
+	if deckpadHasDialog("") {
+		t.Error("empty pane is not a dialog")
+	}
+}
+
+func TestDeckpadConversationOmitsScreenWithoutADialog(t *testing.T) {
+	stubConversation(t, func(profile, id string) (*deckpadConversationSource, error) {
+		return &deckpadConversationSource{Tool: "claude", Rows: convRows(), Screen: "just the idle prompt", ScreenIsDialog: false}, nil
+	})
+	rr := getConversation(deckpadServer(t, false), "child-1", "")
+	var resp deckpadConversationResponse
+	_ = json.Unmarshal(rr.Body.Bytes(), &resp)
+	if resp.Screen != "" {
+		t.Fatalf("screen should be empty without a dialog, got %q", resp.Screen)
 	}
 }
