@@ -68,6 +68,11 @@ func decodeCLIEnvelope(out []byte, exitCode int, runErr error) (map[string]any, 
 	if ok, _ := m["success"].(bool); ok {
 		return m, nil
 	}
+	// Some CLI commands (session send-status) print a raw record with no
+	// "success" key; exit 0 plus parseable JSON is a success.
+	if _, has := m["success"]; !has && exitCode == 0 {
+		return m, nil
+	}
 	code, _ := m["code"].(string)
 	msg, _ := m["error"].(string)
 	if msg == "" {
@@ -76,7 +81,6 @@ func decodeCLIEnvelope(out []byte, exitCode int, runErr error) (map[string]any, 
 	if strings.Contains(code, "NOT_FOUND") {
 		return nil, &deckpadCLIError{404, ErrCodeNotFound, msg}
 	}
-	_ = exitCode
 	return nil, &deckpadCLIError{502, "CLI_FAILED", msg}
 }
 

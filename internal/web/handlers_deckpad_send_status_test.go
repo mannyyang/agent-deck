@@ -66,3 +66,18 @@ func TestDeckpadSendStatusRejectsBadSendID(t *testing.T) {
 		t.Fatalf("expected 400, got %d", rr.Code)
 	}
 }
+
+// `session send-status --json` prints the raw queue record, which has no
+// "success" key; exit 0 with parseable JSON must count as success.
+func TestDeckpadSendStatusAcceptsRecordWithoutSuccessKey(t *testing.T) {
+	stubCLI(t, func(context.Context, string, ...string) ([]byte, int, error) {
+		return []byte(`{"send_id":"snd-1","state":"landed","verdict":"delivered","reason":"","settled":false,"landed_at":"2026-10-07T18:39:46Z"}`), 0, nil
+	})
+	rr := getSendStatus(deckpadServer(t, false), "child-1", "snd-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), `"state":"landed"`) {
+		t.Fatalf("expected landed, got %s", rr.Body.String())
+	}
+}
