@@ -50,7 +50,7 @@ func TestDeckpadSendQueuesViaCLI(t *testing.T) {
 	if resp["sendId"] != "snd-1" || resp["state"] != "queued" {
 		t.Fatalf("unexpected body: %s", rr.Body.String())
 	}
-	want := []string{"personal", "session", "send", "child-1", "yes continue", "--queue", "--json"}
+	want := []string{"personal", "session", "send", "--queue", "--json", "--", "child-1", "yes continue"}
 	if strings.Join(gotArgs, " ") != strings.Join(want, " ") {
 		t.Fatalf("args = %v, want %v", gotArgs, want)
 	}
@@ -128,5 +128,37 @@ func TestDeckpadSendMapsNonJSONOutput(t *testing.T) {
 	rr := postSend(deckpadServer(t, true), "child-1", `{"text":"hi"}`)
 	if rr.Code != http.StatusBadGateway {
 		t.Fatalf("expected 502, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+// Review finding: agent-deck's normalizeArgs treats any argv element that
+// starts with '-' as a flag wherever it appears, so dictated text like "-1"
+// or "--wait" must be fenced behind "--".
+func TestDeckpadSendFencesLeadingDashTextBehindDoubleDash(t *testing.T) {
+	var gotArgs []string
+	stubCLI(t, func(ctx context.Context, profile string, args ...string) ([]byte, int, error) {
+		gotArgs = args
+		return []byte(`{"success":true,"send_id":"snd-2","state":"queued","verdict":"queued"}`), 0, nil
+	})
+	rr := postSend(deckpadServer(t, true), "child-1", `{"text":"--wait"}`)
+	if rr.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d: %s", rr.Code, rr.Body.String())
+	}
+	want := "session send --queue --json -- child-1 --wait"
+	if strings.Join(gotArgs, " ") != want {
+		t.Fatalf("args = %q, want %q", strings.Join(gotArgs, " "), want)
+	}
+}
+
+// enter=false (draft, not submitted) has no send id to follow; until the
+// phone needs drafts it is refused rather than answered with empty fields.
+func TestDeckpadSendRejectsEnterFalse(t *testing.T) {
+	stubCLI(t, func(context.Context, string, ...string) ([]byte, int, error) {
+		t.Fatal("CLI must not run for enter=false")
+		return nil, 0, nil
+	})
+	rr := postSend(deckpadServer(t, true), "child-1", `{"text":"hi","enter":false}`)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", rr.Code, rr.Body.String())
 	}
 }

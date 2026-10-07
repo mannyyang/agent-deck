@@ -45,13 +45,16 @@ func (s *Server) handleDeckpadSend(w http.ResponseWriter, r *http.Request, sessi
 		writeAPIError(w, http.StatusBadRequest, ErrCodeBadRequest, "text is required")
 		return
 	}
-	// `session send` submits the message; enter=false asks for a draft
-	// (pre-filled, not submitted), which the CLI exposes as --draft and
-	// which is incompatible with --queue.
-	args := []string{"session", "send", sessionID, text, "--queue", "--json"}
+	// enter=false would be a draft (--draft, pre-filled and not submitted),
+	// which yields no send id to follow. Refuse until the phone needs it.
 	if req.Enter != nil && !*req.Enter {
-		args = []string{"session", "send", sessionID, text, "--draft", "--json"}
+		writeAPIError(w, http.StatusBadRequest, ErrCodeBadRequest, "enter=false (draft) is not supported")
+		return
 	}
+	// Flags first, then "--": agent-deck's normalizeArgs treats any argv
+	// element starting with '-' as a flag wherever it sits, so dictated text
+	// such as "-1" or "--wait" must be fenced off from flag parsing.
+	args := []string{"session", "send", "--queue", "--json", "--", sessionID, text}
 	ctx, cancel := context.WithTimeout(r.Context(), deckpadCLITimeout)
 	defer cancel()
 	out, code, runErr := runAgentDeckCLI(ctx, s.cfg.Profile, args...)
