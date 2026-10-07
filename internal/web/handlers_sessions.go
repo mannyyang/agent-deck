@@ -131,6 +131,10 @@ func (s *Server) handleSessionByAction(w http.ResponseWriter, r *http.Request) {
 		s.handleDeckpadSend(w, r, sessionID)
 		return
 	}
+	if strings.HasPrefix(action, "send-status/") {
+		s.handleDeckpadSendStatus(w, r, sessionID, strings.TrimPrefix(action, "send-status/"))
+		return
+	}
 
 	// Worktree sub-route: POST /api/sessions/{id}/worktree/finish
 	// (issue #1126 — closes the "Finish worktree" MISSING row in
