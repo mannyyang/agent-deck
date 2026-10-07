@@ -185,26 +185,42 @@ func deckpadStatusLine(raw string) string {
 	return deckpadTruncate(strings.Join(keep, "\n"), 240)
 }
 
-var deckpadDialogMarkers = []string{
-	"enter to select", "esc to cancel", "do you want to", "(y/n)", "[y/n]", "[y/n/", "(yes/no)",
-	"press enter to continue", "allow this", "would you like to",
-}
+// Footer lines a harness prints under a dialog.
+var deckpadDialogFooters = []string{"enter to select", "esc to cancel", "press enter to continue"}
 
-// deckpadHasDialog reports whether the bottom of the pane is a prompt that
-// needs an answer: a permission or choice dialog, or a y/n question.
+// Inline question suffixes on the last line.
+var deckpadDialogSuffixes = []string{"(y/n)", "[y/n]", "[y/n/", "(yes/no)", "[yes/no]"}
+
+// deckpadHasDialog reports whether the very bottom of the pane is a prompt
+// that needs an answer: a permission or choice dialog, or a y/n question.
+// Dialog wording earlier in the pane is just conversation and is ignored.
 func deckpadHasDialog(raw string) bool {
-	lines := strings.Split(raw, "\n")
-	if len(lines) > 30 {
-		lines = lines[len(lines)-30:]
+	var lines []string
+	for _, l := range strings.Split(raw, "\n") {
+		if strings.TrimSpace(l) != "" {
+			lines = append(lines, l)
+		}
 	}
-	for _, l := range lines {
+	n := len(lines)
+	if n == 0 {
+		return false
+	}
+	for _, l := range lines[max(0, n-3):] {
 		low := strings.ToLower(l)
-		for _, m := range deckpadDialogMarkers {
-			if strings.Contains(low, m) {
+		for _, f := range deckpadDialogFooters {
+			if strings.Contains(low, f) {
 				return true
 			}
 		}
-		// A numbered menu with the cursor on an option: "❯ 1. Yes".
+	}
+	lastLow := strings.ToLower(lines[n-1])
+	for _, sfx := range deckpadDialogSuffixes {
+		if strings.Contains(lastLow, sfx) {
+			return true
+		}
+	}
+	// A numbered menu with the cursor on an option: "❯ 1. Yes".
+	for _, l := range lines[max(0, n-12):] {
 		t := strings.TrimSpace(l)
 		if strings.HasPrefix(t, "❯") {
 			rest := strings.TrimSpace(strings.TrimPrefix(t, "❯"))

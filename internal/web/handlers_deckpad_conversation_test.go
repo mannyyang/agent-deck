@@ -130,7 +130,7 @@ func TestDeckpadHasDialogRecognisesPromptsAndIgnoresIdlePanes(t *testing.T) {
 		"❯ 1. Yes, update the SSM parameter\n  2. No\nEnter to select · ↑/↓ to navigate · Esc to cancel",
 		"Allow this command to run? (y/n)",
 		"Overwrite file? [Y/n]",
-		"Do you want to make this edit to foo.go?\n 1. Yes\n 2. Yes, allow all edits during this session\n 3. No",
+		"Do you want to make this edit to foo.go?\n ❯ 1. Yes\n   2. Yes, allow all edits during this session\n   3. No",
 	}
 	for _, p := range yes {
 		if !deckpadHasDialog(p) {
@@ -157,5 +157,12 @@ func TestDeckpadConversationOmitsScreenWithoutADialog(t *testing.T) {
 	_ = json.Unmarshal(rr.Body.Bytes(), &resp)
 	if resp.Screen != "" {
 		t.Fatalf("screen should be empty without a dialog, got %q", resp.Screen)
+	}
+}
+
+func TestDeckpadHasDialogIgnoresDialogWordsInConversationAboveTheIdlePrompt(t *testing.T) {
+	pane := "⏺ The prompt reads: Do you want to proceed?\n  and it ends with Esc to cancel, Enter to select, (y/n)\n  1. Yes is the first option\n\n" + deckpadIdlePane
+	if deckpadHasDialog(pane) {
+		t.Error("dialog words in earlier output must not count when the idle prompt is at the bottom")
 	}
 }
