@@ -279,6 +279,7 @@ func NewServer(cfg Config) *Server {
 		_ = json.NewEncoder(w).Encode(resp)
 	})
 	mux.HandleFunc("/api/menu", s.handleMenu)
+	mux.HandleFunc("/api/deckpad/previews", s.handleDeckpadPreviews)
 	mux.HandleFunc("/api/session/", s.handleSessionByID)
 	mux.HandleFunc("/api/sessions", s.handleSessionsCollection)
 	mux.HandleFunc("/api/remotes", s.handleRemotes)
