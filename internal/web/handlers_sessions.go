@@ -135,6 +135,10 @@ func (s *Server) handleSessionByAction(w http.ResponseWriter, r *http.Request) {
 		s.handleDeckpadSendStatus(w, r, sessionID, strings.TrimPrefix(action, "send-status/"))
 		return
 	}
+	if action == "conversation" {
+		s.handleDeckpadConversation(w, r, sessionID)
+		return
+	}
 	if action == "output" {
 		s.handleDeckpadOutput(w, r, sessionID)
 		return
