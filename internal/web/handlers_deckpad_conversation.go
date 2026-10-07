@@ -46,15 +46,19 @@ type deckpadConversationResponse struct {
 	Tool      string                    `json:"tool,omitempty"`
 	Items     []deckpadConversationItem `json:"items"`
 	Screen    string                    `json:"screen"`
-	Version   string                    `json:"version"`
-	Unchanged bool                      `json:"unchanged"`
-	Truncated bool                      `json:"truncated"`
+	// StatusLine is the harness's own status line, as printed under the
+	// prompt box (folder, branch, model, context, spend), or "".
+	StatusLine string `json:"statusLine"`
+	Version    string `json:"version"`
+	Unchanged  bool   `json:"unchanged"`
+	Truncated  bool   `json:"truncated"`
 }
 
 type deckpadConversationSource struct {
-	Tool   string
-	Rows   []query.Row
-	Screen string
+	Tool       string
+	Rows       []query.Row
+	Screen     string
+	StatusLine string
 }
 
 // Harness-injected user records that are not something the person typed.
@@ -117,6 +121,65 @@ func deckpadConversationItems(rows []query.Row, limit int) ([]deckpadConversatio
 		return items[len(items)-limit:], true
 	}
 	return items, false
+}
+
+// Lines under the prompt box that are key hints or dialog chrome, not a status line.
+var deckpadHintMarkers = []string{
+	"shift+tab", "bypass permissions", "? for shortcuts", "esc to interrupt", "ctrl+",
+	"enter to select", "esc to cancel", "accept edits", "plan mode", "auto-accept",
+}
+
+func deckpadIsRule(line string) bool {
+	t := strings.TrimSpace(line)
+	if len([]rune(t)) < 10 {
+		return false
+	}
+	runes := 0
+	for _, r := range t {
+		if r == '─' || r == '━' || r == '-' || r == '═' {
+			runes++
+		}
+	}
+	return runes*10 >= len([]rune(t))*6
+}
+
+// deckpadStatusLine finds the harness's status line: the first line under
+// the last horizontal rule that is not the prompt or a key hint. Empty when
+// the pane shows a dialog or has no rule.
+func deckpadStatusLine(raw string) string {
+	lines := strings.Split(raw, "\n")
+	last := -1
+	for i, l := range lines {
+		if deckpadIsRule(l) {
+			last = i
+		}
+	}
+	if last < 0 {
+		return ""
+	}
+	var keep []string
+	for _, l := range lines[last+1:] {
+		t := strings.TrimSpace(tmux.StripANSI(l))
+		if t == "" || strings.HasPrefix(t, "❯") || strings.HasPrefix(t, ">") || strings.HasPrefix(t, "⏵") || strings.HasPrefix(t, "⏸") {
+			continue
+		}
+		low := strings.ToLower(t)
+		hint := false
+		for _, m := range deckpadHintMarkers {
+			if strings.Contains(low, m) {
+				hint = true
+				break
+			}
+		}
+		if hint {
+			return "" // a dialog or mode hint sits here, so this is not a status line
+		}
+		keep = append(keep, t)
+	}
+	if len(keep) == 0 || len(keep) > 2 {
+		return ""
+	}
+	return deckpadTruncate(strings.Join(keep, "\n"), 240)
 }
 
 // deckpadScreenTail strips colour codes and keeps the last non-blank lines.
@@ -208,6 +271,7 @@ var loadDeckpadConversation = func(profile, id string) (*deckpadConversationSour
 	if ts := inst.GetTmuxSession(); ts != nil {
 		if raw, err := ts.CapturePane(); err == nil {
 			src.Screen = deckpadScreenTail(raw)
+			src.StatusLine = deckpadStatusLine(tmux.StripANSI(raw))
 		}
 	}
 	return src, nil
@@ -242,8 +306,9 @@ func (s *Server) handleDeckpadConversation(w http.ResponseWriter, r *http.Reques
 		fmt.Fprintf(h, "%s|%s|%d|", items[0].ID, items[n-1].ID, len(items[n-1].Text))
 	}
 	h.Write([]byte(src.Screen))
+	h.Write([]byte(src.StatusLine))
 	version := hex.EncodeToString(h.Sum(nil))[:16]
-	resp := deckpadConversationResponse{SessionID: sessionID, Tool: src.Tool, Items: items, Screen: src.Screen, Version: version, Truncated: truncated}
+	resp := deckpadConversationResponse{SessionID: sessionID, Tool: src.Tool, Items: items, Screen: src.Screen, StatusLine: src.StatusLine, Version: version, Truncated: truncated}
 	if v := r.URL.Query().Get("ifVersion"); v != "" && v == version {
 		resp.Items, resp.Screen, resp.Unchanged = []deckpadConversationItem{}, "", true
 	}

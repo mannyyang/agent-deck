@@ -94,3 +94,32 @@ func TestDeckpadConversationEndpointServesItemsScreenAndVersion(t *testing.T) {
 		t.Fatalf("expected 404, got %d", rr.Code)
 	}
 }
+
+const deckpadIdlePane = `  some earlier output
+────────────────────────────────────────────────────────────────────────────────────── deckpad ─
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────
+  ~/git/deckpad | main | Opus 5.5 | 16% ctx (164.1k/1000k) | 3h 31m
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents
+`
+
+func TestDeckpadStatusLineTakesTheLineBelowThePromptBox(t *testing.T) {
+	got := deckpadStatusLine(deckpadIdlePane)
+	want := "~/git/deckpad | main | Opus 5.5 | 16% ctx (164.1k/1000k) | 3h 31m"
+	if got != want {
+		t.Fatalf("got %q want %q", got, want)
+	}
+}
+
+func TestDeckpadStatusLineIsEmptyForDialogsAndBarePanes(t *testing.T) {
+	dialog := "❯ 1. Yes\n   2. No\n────────────────────────────────────────────────────────────\n  Chat about this\n\nEnter to select · ↑/↓ to navigate · Esc to cancel\n"
+	if got := deckpadStatusLine(dialog); got != "" {
+		t.Fatalf("dialog should give no status line, got %q", got)
+	}
+	if got := deckpadStatusLine("just a shell prompt $ \n"); got != "" {
+		t.Fatalf("no rule should give no status line, got %q", got)
+	}
+	if got := deckpadStatusLine(""); got != "" {
+		t.Fatalf("empty pane: %q", got)
+	}
+}
