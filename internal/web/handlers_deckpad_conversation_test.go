@@ -166,3 +166,24 @@ func TestDeckpadHasDialogIgnoresDialogWordsInConversationAboveTheIdlePrompt(t *t
 		t.Error("dialog words in earlier output must not count when the idle prompt is at the bottom")
 	}
 }
+
+func TestDeckpadSuggestionReadsTheDimGhostTextInThePromptBox(t *testing.T) {
+	raw := "some output\n────────────────────────────────────────────────────────────\n❯ \x1b[2mrun the tests again\x1b[0m\n────────────────────────────────────────────────────────────\n  ~/git/x | main | Opus 5.5 | 3% ctx\n"
+	if got := deckpadSuggestion(raw); got != "run the tests again" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func TestDeckpadSuggestionIgnoresRealDraftsMenusAndEmptyPrompts(t *testing.T) {
+	cases := map[string]string{
+		"typed draft":  "────────────────────────────────────────────────────────────\n❯ run the tests again\n────────────────────────────────────────────────────────────\n",
+		"empty prompt": "────────────────────────────────────────────────────────────\n❯ \n────────────────────────────────────────────────────────────\n",
+		"menu":         "Do you want to proceed?\n\x1b[2m❯ 1. Yes\x1b[0m\n  2. No\n",
+		"none":         "plain output\n",
+	}
+	for name, raw := range cases {
+		if got := deckpadSuggestion(raw); got != "" {
+			t.Errorf("%s: expected no suggestion, got %q", name, got)
+		}
+	}
+}

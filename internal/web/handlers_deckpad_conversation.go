@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/asheshgoplani/agent-deck/internal/recall/query"
+	"github.com/asheshgoplani/agent-deck/internal/send"
 	"github.com/asheshgoplani/agent-deck/internal/session"
 	"github.com/asheshgoplani/agent-deck/internal/tmux"
 )
@@ -49,6 +50,9 @@ type deckpadConversationResponse struct {
 	// StatusLine is the harness's own status line, as printed under the
 	// prompt box (folder, branch, model, context, spend), or "".
 	StatusLine string `json:"statusLine"`
+	// Suggestion is the ghost text Claude offers in the prompt box (what Tab
+	// would accept), or "".
+	Suggestion string `json:"suggestion"`
 	Version    string `json:"version"`
 	Unchanged  bool   `json:"unchanged"`
 	Truncated  bool   `json:"truncated"`
@@ -59,6 +63,7 @@ type deckpadConversationSource struct {
 	Rows       []query.Row
 	Screen     string
 	StatusLine string
+	Suggestion string
 	// ScreenIsDialog is true when the pane shows a prompt waiting for an
 	// answer; only then is Screen sent to the phone.
 	ScreenIsDialog bool
@@ -232,6 +237,28 @@ func deckpadHasDialog(raw string) bool {
 	return false
 }
 
+// deckpadSuggestion returns Claude's prompt suggestion from a raw
+// (ANSI-bearing) pane capture. The ghost text is the dim text after the
+// prompt glyph; typed drafts, option menus and empty prompts give "".
+func deckpadSuggestion(raw string) string {
+	if !send.ComposerBodyIsSuggestion(raw) {
+		return ""
+	}
+	lines := strings.Split(raw, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		plain := strings.TrimSpace(tmux.StripANSI(lines[i]))
+		if !strings.HasPrefix(plain, "❯") {
+			continue
+		}
+		body := strings.TrimSpace(strings.TrimPrefix(plain, "❯"))
+		if body == "" || (len(body) > 1 && body[0] >= '1' && body[0] <= '9' && body[1] == '.') {
+			return ""
+		}
+		return deckpadTruncate(body, 400)
+	}
+	return ""
+}
+
 // deckpadScreenTail strips colour codes and keeps the last non-blank lines.
 func deckpadScreenTail(raw string) string {
 	lines := strings.Split(tmux.StripANSI(raw), "\n")
@@ -319,6 +346,9 @@ var loadDeckpadConversation = func(profile, id string) (*deckpadConversationSour
 		}
 	}
 	if ts := inst.GetTmuxSession(); ts != nil {
+		if fresh, err := ts.CapturePaneFresh(); err == nil {
+			src.Suggestion = deckpadSuggestion(fresh)
+		}
 		if raw, err := ts.CapturePane(); err == nil {
 			src.Screen = deckpadScreenTail(raw)
 			src.ScreenIsDialog = deckpadHasDialog(src.Screen)
@@ -361,8 +391,9 @@ func (s *Server) handleDeckpadConversation(w http.ResponseWriter, r *http.Reques
 	}
 	h.Write([]byte(src.Screen))
 	h.Write([]byte(src.StatusLine))
+	h.Write([]byte(src.Suggestion))
 	version := hex.EncodeToString(h.Sum(nil))[:16]
-	resp := deckpadConversationResponse{SessionID: sessionID, Tool: src.Tool, Items: items, Screen: src.Screen, StatusLine: src.StatusLine, Version: version, Truncated: truncated}
+	resp := deckpadConversationResponse{SessionID: sessionID, Tool: src.Tool, Items: items, Screen: src.Screen, StatusLine: src.StatusLine, Suggestion: src.Suggestion, Version: version, Truncated: truncated}
 	if v := r.URL.Query().Get("ifVersion"); v != "" && v == version {
 		resp.Items, resp.Screen, resp.Unchanged = []deckpadConversationItem{}, "", true
 	}
