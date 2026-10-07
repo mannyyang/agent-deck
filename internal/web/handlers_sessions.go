@@ -126,6 +126,12 @@ func (s *Server) handleSessionByAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Deckpad sub-routes (phone control surface): send, send-status, output.
+	if action == "send" {
+		s.handleDeckpadSend(w, r, sessionID)
+		return
+	}
+
 	// Worktree sub-route: POST /api/sessions/{id}/worktree/finish
 	// (issue #1126 — closes the "Finish worktree" MISSING row in
 	// tests/web/PARITY_MATRIX.md, mirrors TUI W/shift+w + CLI
